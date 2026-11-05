@@ -11,9 +11,12 @@ The independent checker validates original-model witnesses and rational LP bound
 
 See [numerical scaling and refinement](docs/MILESTONE-2D.md) and
 [the integer-search contract](docs/MILESTONE-2BC.md).
-The [40-case MILP report](results/mip-native-v2/report.html) and
-[MIPLIB smoke report](results/miplib-smoke-2s-v1/runs/summary.html) preserve
-successful witnesses, numerical failures and capacity limits.
+The [numerical ablations](results/numerics-roots-v1/report.html),
+[40-case MILP crosscheck](results/mip-native-v3/summary.json), and
+[MIPLIB smoke report](results/miplib-smoke-2s-v2/runs/summary.html) preserve
+successful witnesses, numerical failures and capacity limits. The earlier
+[MILP report](results/mip-native-v2/report.html) and
+[MIPLIB smoke](results/miplib-smoke-2s-v1/runs/summary.html) remain available.
 
 Milestone 2A is preserved in [the original LP engine contract](docs/LP-ENGINE.md),
 [the lab's LP report](results/lp-native-v2/lab/summary.html), and

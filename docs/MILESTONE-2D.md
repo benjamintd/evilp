@@ -113,3 +113,54 @@ only the independent rational checker establishes the scope of a certificate.
 
 Earlier raw campaigns and evaluator tags remain unchanged. Future performance
 work should confirm any gains on additional model families and longer budgets.
+
+## Recorded results
+
+The evaluator is frozen at `28aae81` (`milestone-2d-evaluator`). Both source
+snapshots around the controlled root campaign are clean and identical. Binary
+hashes, model hashes, commands, raw solutions and checker records accompany the
+results; this documentation checkpoint does not change the evaluated engine.
+
+- [Release and sanitizer evidence](../results/milestone-2d-contracts-v1/summary.json):
+  all eleven suites pass in both builds, with zero skipped or failed tests.
+- [Paired numerical oracle evidence](../results/numerics-oracles-v1/summary.json):
+  the old frozen binary has 42 explicit numerical failures across the four
+  shared numerical test methods. The new build passes all eight methods,
+  including those same assertions. The original checker tolerances are unchanged.
+- [Controlled root report](../results/numerics-roots-v1/report.html):
+  eighteen runs cover three models, the old binary, four new configurations
+  and HiGHS 1.15.1. All six intended numerical failures are retained.
+- [Native MILP crosscheck](../results/mip-native-v3/summary.json):
+  all forty reference outcomes match across HiGHS, SCIP, Cbc, warm lab search
+  and cold lab search. All 35 feasible candidates pass independent checking.
+
+For `mas74` and `mas76`, both the old binary and the new build without
+refinement fail the basis-residual guard. Refinement alone and the default
+combination finish the root LP, pass original-model primal checking and obtain
+valid independent rational LP bounds. Scaling alone still fails. The default
+root objectives are approximately 10482.7952803312 and 38893.9036405226,
+respectively, agreeing with independently checked HiGHS solutions within 2e-11.
+The checker does not certify exact optimality: its conservative lower bounds
+leave gaps of approximately 1.5e-5 and 5.4e-5 to the checked candidate objectives.
+
+The default `gen-ip054` root also passes primal checking and agrees with HiGHS
+within 2e-11, but its independent dual-bound result is unavailable. Its later
+Phase I sign uncertainty remains unresolved. A successful root solve does not
+establish the integer model's optimum or the validity of every subsequent node.
+
+The [twelve-instance MIPLIB smoke](../results/miplib-smoke-2s-v2/runs/summary.html)
+uses the same two-second budget, seed and configured size cap as the earlier
+campaign. It retains three independently checked incumbents (`mas74`, `mas76`,
+`pk1`), with no invalid candidates or reference contradictions. Six instances
+exceed the size cap, four hit their time limit and two terminate numerically.
+`mas74` retains an incumbent before a later loss of basis primal feasibility;
+`gen-ip054` still encounters the conservative Phase I sign guard. No pinned
+reference optimum is reached. The earlier `neos5` incumbent is absent at this
+budget, so these results do not establish a uniform search improvement or a
+speed advantage over the native baselines.
+
+The next numerical work is stable ratio and pivot selection for the later
+primal-feasibility loss, followed by checked Phase I infeasibility witnesses or
+exact reconstruction for uncertain signs. Larger models still require removing
+the standard-form capacity bottleneck. These remain separate from search
+heuristics, cutting planes and independently checkable tree proofs.
