@@ -12,7 +12,9 @@ typedef struct {
      * The sparse transpose index mirrors these entries; it is not counted twice.
      * For dense reference storage, peak_nnz is the allocated n*n capacity. */
     size_t factor_nnz, peak_nnz;
+    size_t core_dimension, eliminated_singletons;
     int sparse, valid;
+    int core_refinement;
 } LabFactor;
 int lab_factorize(LabFactor *f, const double *matrix, size_t n);
 /* CSC input may contain unsorted rows and duplicate entries. Duplicate values

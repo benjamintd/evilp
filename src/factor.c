@@ -5,6 +5,9 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(__clang__)
+#pragma STDC FP_CONTRACT OFF
+#endif
 
 typedef struct {
     size_t column;
@@ -18,11 +21,20 @@ typedef struct {
     SparseRow *row;
     size_t *col_start, *row_index;
     double *value, *diagonal;
+    /* Structural singleton elimination keeps the original sparse matrix and
+     * factors only its coupled core. No numerical coefficient is dropped. */
+    LabFactor core;
+    size_t core_n, steps;
+    size_t *core_row, *core_col, *step_row, *step_col;
+    unsigned char *step_kind, *row_kind, *col_kind;
+    double *step_pivot;
+    size_t *core_start, *core_index;
+    double *core_value;
 } SparseFactor;
 
 /* Both limits are independent of LP/model resource policy. There is no
  * silently selected dense fallback when fill exhausts the sparse budget. */
-enum { SPARSE_FILL_BUDGET = 20000000, SPARSE_DIMENSION_LIMIT = 1000000 };
+enum { SPARSE_FILL_BUDGET = 64000000, SPARSE_DIMENSION_LIMIT = 8000000 };
 
 static void sparse_free(SparseFactor *s, size_t n) {
     if (!s)
@@ -35,6 +47,11 @@ static void sparse_free(SparseFactor *s, size_t n) {
     free(s->row_index);
     free(s->value);
     free(s->diagonal);
+    lab_factor_free(&s->core);
+    free(s->core_row); free(s->core_col);
+    free(s->step_row); free(s->step_col); free(s->step_kind); free(s->step_pivot);
+    free(s->row_kind); free(s->col_kind);
+    free(s->core_start); free(s->core_index); free(s->core_value);
     free(s);
 }
 void lab_factor_free(LabFactor *f) {
@@ -48,6 +65,8 @@ int lab_factorize(LabFactor *f, const double *matrix, size_t n) {
     if ((n && !matrix) || (n && (n > SIZE_MAX / n || n * n > SIZE_MAX / sizeof(double))))
         return -1;
     f->n = n;
+    f->core_dimension = n;
+    f->core_refinement = 1;
     f->lu = lab_alloc(n * n, sizeof(double));
     f->pivot = lab_alloc(n, sizeof(size_t));
     if (n)
@@ -228,6 +247,161 @@ static int sparse_transpose(SparseFactor *s, size_t n, size_t nnz) {
     free(cursor);
     return 0;
 }
+static double smallest_pivot(const LabFactor *f) {
+    if (!f->n)
+        return INFINITY;
+    const SparseFactor *s = f->sparse_data;
+    double smallest = INFINITY;
+    if (s->steps) {
+        for (size_t k = 0; k < s->steps; k++)
+            smallest = fmin(smallest, fabs(s->step_pivot[k]));
+        return fmin(smallest, smallest_pivot(&s->core));
+    }
+    for (size_t i = 0; i < f->n; i++)
+        smallest = fmin(smallest, fabs(s->diagonal[i]));
+    return smallest;
+}
+/* 1: peeled factor ready; 0: no structural reduction; -1: failure.
+ * Singleton rows fix a variable; singleton columns defer one equation. Their
+ * removal produces no fill, and reverse substitution recovers deferred values. */
+static int peel_factor(LabFactor *f, size_t total, double norm) {
+    SparseFactor *s = f->sparse_data;
+    size_t n = f->n;
+    if (!n)
+        return 0;
+    size_t *rd = lab_alloc(n, sizeof(size_t)), *cd = lab_alloc(n, sizeof(size_t));
+    size_t *start = lab_alloc(n + 1, sizeof(size_t));
+    size_t *ri = lab_alloc(total, sizeof(size_t)), *cursor = lab_alloc(n, sizeof(size_t));
+    size_t *queue = lab_alloc(2 * n, sizeof(size_t));
+    unsigned char *active_r = lab_alloc(n, 1), *active_c = lab_alloc(n, 1);
+    for (size_t i = 0; i < n; i++) {
+        active_r[i] = active_c[i] = 1;
+        rd[i] = s->row[i].count;
+        for (size_t k = 0; k < s->row[i].count; k++)
+            start[s->row[i].entry[k].column + 1]++;
+    }
+    for (size_t j = 0; j < n; j++) {
+        cd[j] = start[j + 1];
+        start[j + 1] += start[j];
+        cursor[j] = start[j];
+    }
+    for (size_t i = 0; i < n; i++)
+        for (size_t k = 0; k < s->row[i].count; k++)
+            ri[cursor[s->row[i].entry[k].column]++] = i;
+    s->step_row = lab_alloc(n, sizeof(size_t));
+    s->step_col = lab_alloc(n, sizeof(size_t));
+    s->step_kind = lab_alloc(n, 1);
+    s->step_pivot = lab_alloc(n, sizeof(double));
+    s->row_kind = lab_alloc(n, 1);
+    s->col_kind = lab_alloc(n, 1);
+    size_t head = 0, tail = 0;
+    for (size_t j = 0; j < n; j++)
+        if (cd[j] == 1)
+            queue[tail++] = n + j;
+    for (size_t i = 0; i < n; i++)
+        if (rd[i] == 1)
+            queue[tail++] = i;
+    while (head < tail) {
+        size_t token = queue[head++], r = SIZE_MAX, c = SIZE_MAX;
+        unsigned char kind = token < n ? 1 : 2;
+        if (kind == 1) {
+            r = token;
+            if (!active_r[r] || rd[r] != 1)
+                continue;
+            for (size_t k = 0; k < s->row[r].count; k++)
+                if (active_c[s->row[r].entry[k].column]) {
+                    c = s->row[r].entry[k].column;
+                    break;
+                }
+        } else {
+            c = token - n;
+            if (!active_c[c] || cd[c] != 1)
+                continue;
+            for (size_t k = start[c]; k < start[c + 1]; k++)
+                if (active_r[ri[k]]) {
+                    r = ri[k];
+                    break;
+                }
+        }
+        if (r == SIZE_MAX || c == SIZE_MAX)
+            continue;
+        size_t at = s->steps++;
+        s->step_row[at] = r; s->step_col[at] = c; s->step_kind[at] = kind;
+        s->step_pivot[at] = sparse_get(&s->row[r], c);
+        s->row_kind[r] = s->col_kind[c] = kind;
+        active_r[r] = active_c[c] = 0;
+        for (size_t k = 0; k < s->row[r].count; k++) {
+            size_t j = s->row[r].entry[k].column;
+            if (active_c[j] && --cd[j] == 1)
+                queue[tail++] = n + j;
+        }
+        for (size_t k = start[c]; k < start[c + 1]; k++) {
+            size_t i = ri[k];
+            if (active_r[i] && --rd[i] == 1)
+                queue[tail++] = i;
+        }
+    }
+    int outcome = 0;
+    if (s->steps) {
+        s->core_n = n - s->steps;
+        s->core_row = lab_alloc(s->core_n, sizeof(size_t));
+        s->core_col = lab_alloc(s->core_n, sizeof(size_t));
+        size_t *row_map = lab_alloc(n, sizeof(size_t));
+        size_t rcount = 0, ccount = 0, cnz = 0;
+        for (size_t i = 0; i < n; i++) {
+            row_map[i] = SIZE_MAX;
+            if (active_r[i]) {
+                row_map[i] = rcount;
+                s->core_row[rcount++] = i;
+            }
+            if (active_c[i])
+                s->core_col[ccount++] = i;
+        }
+        size_t *cs = lab_alloc(s->core_n + 1, sizeof(size_t));
+        size_t *cr = lab_alloc(total, sizeof(size_t));
+        double *cv = lab_alloc(total, sizeof(double));
+        for (size_t j = 0; j < s->core_n; j++) {
+            size_t original = s->core_col[j];
+            cs[j] = cnz;
+            for (size_t k = start[original]; k < start[original + 1]; k++) {
+                size_t i = ri[k];
+                if (active_r[i]) {
+                    cr[cnz] = row_map[i];
+                    cv[cnz++] = sparse_get(&s->row[i], original);
+                }
+            }
+        }
+        cs[s->core_n] = cnz;
+        outcome = -1;
+        if (rcount == s->core_n && ccount == s->core_n &&
+            !lab_factorize_sparse(&s->core, s->core_n, cs, cr, cv) &&
+            fmin(smallest_pivot(&s->core), smallest_pivot(f)) >
+                fmax(DBL_MIN, 16 * DBL_EPSILON * norm) &&
+            s->core.peak_nnz <= SPARSE_FILL_BUDGET - total) {
+            /* Build an original CSC mirror for forward/transpose substitution.
+             * Unlike the ordinary LU mirror, no original diagonal is needed. */
+            s->col_start = start; start = NULL;
+            s->row_index = ri; ri = NULL;
+            s->value = lab_alloc(total, sizeof(double));
+            for (size_t j = 0; j < n; j++)
+                for (size_t k = s->col_start[j]; k < s->col_start[j + 1]; k++)
+                    s->value[k] = sparse_get(&s->row[s->row_index[k]], j);
+            f->factor_nnz = total + s->core.factor_nnz;
+            f->peak_nnz = total + s->core.peak_nnz;
+            f->core_dimension = s->core.core_dimension;
+            f->eliminated_singletons = s->steps + s->core.eliminated_singletons;
+            f->valid = 1;
+            s->core_start = cs; cs = NULL;
+            s->core_index = cr; cr = NULL;
+            s->core_value = cv; cv = NULL;
+            outcome = 1;
+        }
+        free(row_map); free(cs); free(cr); free(cv);
+    }
+    free(rd); free(cd); free(start); free(ri); free(cursor); free(queue);
+    free(active_r); free(active_c);
+    return outcome;
+}
 int lab_factorize_sparse(LabFactor *f, size_t n, const size_t *col_start, const size_t *row_index,
                          const double *value) {
     lab_factor_free(f);
@@ -238,6 +412,8 @@ int lab_factorize_sparse(LabFactor *f, size_t n, const size_t *col_start, const 
         if (col_start[j] > col_start[j + 1])
             return -1;
     f->n = n;
+    f->core_dimension = n;
+    f->core_refinement = 1;
     f->sparse = 1;
     SparseFactor *s = calloc(1, sizeof *s);
     if (!s)
@@ -274,6 +450,9 @@ int lab_factorize_sparse(LabFactor *f, size_t n, const size_t *col_start, const 
         for (size_t e = 0; e < s->row[i].count; e++)
             norm = fmax(norm, fabs(s->row[i].entry[e].value));
     }
+    int peeled = peel_factor(f, total, norm);
+    if (peeled)
+        return peeled > 0 ? 0 : -1;
     for (size_t k = 0; k < n; k++) {
         size_t p = k;
         double largest = fabs(sparse_get(&s->row[k], k));
@@ -309,9 +488,136 @@ int lab_factorize_sparse(LabFactor *f, size_t n, const size_t *col_start, const 
     f->valid = 1;
     return 0;
 }
+static int compensated_add(double *high, double *low, double term) {
+    double next = *high + term;
+    double virtual_term = next - *high;
+    double error = (*high - (next - virtual_term)) + (term - virtual_term);
+    *low += error;
+    *high = next;
+    return !isfinite(next) || !isfinite(*low) ? -1 : 0;
+}
+static int core_residual(const SparseFactor *s, const double *b, const double *x, double *r,
+                          int transpose, double *error) {
+    size_t n = s->core_n;
+    double *low = lab_alloc(n, sizeof(double));
+    memcpy(r, b, n * sizeof(double));
+    int bad = 0;
+    for (size_t j = 0; j < n && !bad; j++)
+        for (size_t k = s->core_start[j]; k < s->core_start[j + 1]; k++) {
+            size_t i = s->core_index[k], destination = transpose ? j : i;
+            double a = s->core_value[k], v = x[transpose ? i : j], product = a * v;
+            double tail = fma(a, v, -product);
+            if (!isfinite(product) || !isfinite(tail) ||
+                compensated_add(&r[destination], &low[destination], -product) ||
+                compensated_add(&r[destination], &low[destination], -tail)) {
+                bad = 1;
+                break;
+            }
+        }
+    *error = 0;
+    for (size_t i = 0; i < n && !bad; i++) {
+        r[i] += low[i];
+        if (!isfinite(r[i]))
+            bad = 1;
+        *error = fmax(*error, fabs(r[i]));
+    }
+    free(low);
+    return bad ? -1 : 0;
+}
+static int peeled_solve(const LabFactor *f, const double *rhs, double *x, int transpose) {
+    const SparseFactor *s = f->sparse_data;
+    size_t n = f->n;
+    double *work = lab_alloc(n, sizeof(double));
+    memcpy(work, rhs, n * sizeof(double));
+    memset(x, 0, n * sizeof(double));
+    for (size_t k = 0; k < s->steps; k++) {
+        if (s->step_kind[k] != (transpose ? 2 : 1))
+            continue;
+        size_t r = s->step_row[k], c = s->step_col[k];
+        double v = work[transpose ? c : r] / s->step_pivot[k];
+        if (!isfinite(v)) {
+            free(work);
+            return -1;
+        }
+        x[transpose ? r : c] = v;
+        if (!transpose) {
+            for (size_t e = s->col_start[c]; e < s->col_start[c + 1]; e++) {
+                size_t i = s->row_index[e];
+                if (i != r)
+                    work[i] = fma(-s->value[e], v, work[i]);
+            }
+        } else {
+            for (size_t e = 0; e < s->row[r].count; e++) {
+                SparseEntry a = s->row[r].entry[e];
+                if (a.column != c)
+                    work[a.column] = fma(-a.value, v, work[a.column]);
+            }
+        }
+    }
+    double *b = lab_alloc(s->core_n, sizeof(double));
+    double *solution = lab_alloc(s->core_n, sizeof(double));
+    for (size_t i = 0; i < s->core_n; i++)
+        b[i] = work[transpose ? s->core_col[i] : s->core_row[i]];
+    int bad = s->core_n && lab_factor_solve(&s->core, b, solution, transpose);
+    /* Eliminating exact unit equations can hide forward error in a small
+     * ill-conditioned core even when whole-basis backward error is tiny.
+     * Correct that core using compensated residuals before recovering slacks. */
+    if (!bad && s->core_n && f->core_refinement) {
+        double *r = lab_alloc(s->core_n, sizeof(double));
+        double *next_r = lab_alloc(s->core_n, sizeof(double));
+        double *delta = lab_alloc(s->core_n, sizeof(double));
+        double *trial = lab_alloc(s->core_n, sizeof(double));
+        double error;
+        bad = core_residual(s, b, solution, r, transpose, &error);
+        for (size_t pass = 0; pass < 2 && !bad && error > 0; pass++) {
+            if (lab_factor_solve(&s->core, r, delta, transpose))
+                break;
+            for (size_t i = 0; i < s->core_n; i++)
+                trial[i] = solution[i] + delta[i];
+            double next_error;
+            if (core_residual(s, b, trial, next_r, transpose, &next_error) || next_error >= error)
+                break;
+            memcpy(solution, trial, s->core_n * sizeof(double));
+            memcpy(r, next_r, s->core_n * sizeof(double));
+            error = next_error;
+        }
+        free(r); free(next_r); free(delta); free(trial);
+    }
+    if (!bad)
+        for (size_t i = 0; i < s->core_n; i++)
+            x[transpose ? s->core_row[i] : s->core_col[i]] = solution[i];
+    for (size_t k = s->steps; k-- > 0 && !bad;) {
+        if (s->step_kind[k] != (transpose ? 1 : 2))
+            continue;
+        size_t r = s->step_row[k], c = s->step_col[k];
+        double v = work[transpose ? c : r];
+        if (!transpose) {
+            for (size_t e = 0; e < s->row[r].count; e++) {
+                SparseEntry a = s->row[r].entry[e];
+                if (a.column != c && s->col_kind[a.column] != 1)
+                    v = fma(-a.value, x[a.column], v);
+            }
+        } else {
+            for (size_t e = s->col_start[c]; e < s->col_start[c + 1]; e++) {
+                size_t i = s->row_index[e];
+                if (i != r && s->row_kind[i] != 2)
+                    v = fma(-s->value[e], x[i], v);
+            }
+        }
+        v /= s->step_pivot[k];
+        if (!isfinite(v))
+            bad = 1;
+        else
+            x[transpose ? r : c] = v;
+    }
+    free(work); free(b); free(solution);
+    return bad ? -1 : 0;
+}
 static int sparse_solve(const LabFactor *f, const double *rhs, double *x, int transpose) {
     const SparseFactor *s = f->sparse_data;
     size_t n = f->n;
+    if (s->steps)
+        return peeled_solve(f, rhs, x, transpose);
     if (!transpose) {
         for (size_t k = 0; k < n; k++) {
             size_t p = f->pivot[k];
@@ -372,7 +678,8 @@ int lab_factor_solve(const LabFactor *f, const double *rhs, double *x, int trans
     if (n)
         memmove(x, rhs, n * sizeof(double));
     if (f->sparse) {
-        sparse_solve(f, rhs, x, transpose);
+        if (sparse_solve(f, rhs, x, transpose))
+            return -1;
     } else if (!transpose) {
         for (size_t k = 0; k < n; k++) {
             size_t p = f->pivot[k];

@@ -255,9 +255,54 @@ static int large_banded_case(void) {
     free(x);
     return 0;
 }
+static int large_singleton_core_case(void) {
+    const size_t n = 100000;
+    size_t *start = calloc(n + 1, sizeof(size_t));
+    size_t *row = malloc((2 * n + 9) * sizeof(size_t));
+    double *value = malloc((2 * n + 9) * sizeof(double));
+    double *truth = malloc(n * sizeof(double)), *b = calloc(n, sizeof(double));
+    double *bt = calloc(n, sizeof(double)), *x = malloc(n * sizeof(double));
+    CHECK(start && row && value && truth && b && bt && x);
+    const double core[] = {4, 1, .5, 1, 5, -.5, .5, -.5, 6};
+    for (size_t i = 0; i < n; i++)
+        truth[i] = ((double)(i % 9) - 4) / 4;
+    size_t at = 0;
+    for (size_t j = 0; j < n; j++) {
+        start[j] = at;
+        if (j < 3) {
+            for (size_t i = 0; i < 3; i++) {
+                row[at] = i; value[at++] = core[3 * i + j];
+            }
+            for (size_t i = 3; i < n; i++)
+                if (i % 3 == j) {
+                    row[at] = i; value[at++] = -.5;
+                }
+        } else {
+            row[at] = j; value[at++] = 1;
+        }
+        for (size_t k = start[j]; k < at; k++) {
+            b[row[k]] += value[k] * truth[j];
+            bt[j] += value[k] * truth[row[k]];
+        }
+    }
+    start[n] = at;
+    LabFactor f = {0};
+    CHECK(!lab_factorize_sparse(&f, n, start, row, value));
+    CHECK(f.core_dimension == 3 && f.eliminated_singletons == n - 3 && !f.lu);
+    CHECK(f.peak_nnz < 4 * n);
+    CHECK(!lab_factor_solve(&f, b, x, 0) && close_vector(x, truth, n));
+    CHECK(!lab_factor_solve(&f, bt, x, 1) && close_vector(x, truth, n));
+    CHECK(!lab_factor_solve(&f, b, b, 0) && close_vector(b, truth, n));
+    CHECK(!lab_factor_solve(&f, bt, bt, 1) && close_vector(bt, truth, n));
+    printf("Sparse singleton basis: dimension=%zu, coupled core=%zu, stored entries=%zu\n",
+           n, f.core_dimension, f.factor_nnz);
+    lab_factor_free(&f);
+    free(start); free(row); free(value); free(truth); free(b); free(bt); free(x);
+    return 0;
+}
 int main(void) {
     if (randomized_permuted_cases() || cancellation_and_pivot_cases() || fill_case() ||
-        invalid_and_singular_cases() || large_banded_case())
+        invalid_and_singular_cases() || large_banded_case() || large_singleton_core_case())
         return 1;
     puts("Sparse/dense LU contracts passed: 200 random permuted matrices, transpose/in-place "
          "solves, "
