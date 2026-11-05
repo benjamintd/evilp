@@ -154,6 +154,10 @@ static int exponent_for(double smallest, double largest) {
     return exponent;
 }
 static int exact_scale(double input, int exponent, double *output) {
+    if (exponent == 0 && isfinite(input)) {
+        *output = input;
+        return 0;
+    }
     double value = scalbn(input, exponent);
     if (!isfinite(value) || (input != 0 && value == 0) || scalbn(value, -exponent) != input)
         return -1;
@@ -346,7 +350,7 @@ static int base_solve(LabLinear *s, const double *rhs, double *x, int transpose)
         bad = 1;
     for (size_t i = 0; i < n && !bad; i++) {
         int exponent = transpose ? s->row_exponent[i] : s->col_exponent[i];
-        x[i] = scalbn(y[i], exponent);
+        x[i] = exponent == 0 ? y[i] : scalbn(y[i], exponent);
         if (!isfinite(x[i]) || (y[i] != 0 && x[i] == 0))
             bad = 1;
     }
