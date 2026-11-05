@@ -1,0 +1,34 @@
+{
+  "coinbrew_commit": "f624b48e996831ea98d6c40cfa3efeb980dc3b0b",
+  "cbc_tag": "releases/2.10.13",
+  "repositories": {
+    "Cbc": {
+      "url": "https://github.com/coin-or/Cbc",
+      "commit": "8e898d0a4ab7bb5b202c2ebbf3f2d2c0823c1e9d"
+    },
+    "Cgl": {
+      "url": "https://github.com/coin-or/Cgl",
+      "commit": "1a63715dbb33997701b896f62afec7651a2b3cac"
+    },
+    "Clp": {
+      "url": "https://github.com/coin-or/Clp",
+      "commit": "9310c186d546e21d482be3455166ee6fb4cd6302"
+    },
+    "CoinUtils": {
+      "url": "https://github.com/coin-or/CoinUtils",
+      "commit": "1f3484e0578944a506452e1e35360c09e1490315"
+    },
+    "Data/Sample": {
+      "url": "https://github.com/coin-or-tools/Data-Sample",
+      "commit": "a68d09af1fb04311e49f661f9fe92d99434c2156"
+    },
+    "Data/miplib3": {
+      "url": "https://github.com/coin-or-tools/Data-miplib3",
+      "commit": "868431290899d97e6fe88f500676239812e34a52"
+    },
+    "Osi": {
+      "url": "https://github.com/coin-or/Osi",
+      "commit": "b3dbb7c910a9992717b1107542606262296a0e7e"
+    }
+  }
+}

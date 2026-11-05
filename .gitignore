@@ -1,0 +1,9 @@
+/build*/
+/data/
+/tools/
+/work/
+/results/*/
+__pycache__/
+*.pyc
+.DS_Store
+/Highs.log

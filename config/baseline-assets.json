@@ -1,0 +1,20 @@
+{
+  "platform": "Darwin-arm64",
+  "solvers": {
+    "highs": {
+      "version": "v1.15.1",
+      "url": "https://github.com/ERGO-Code/HiGHS/releases/download/v1.15.1/highs-1.15.1-arm-apple-static-mit.tar.gz",
+      "sha256": "eb3ce11352ad977bb59d970ee81e864de525c827ea2511b2295bd8074af056b7"
+    },
+    "scip": {
+      "version": "v10.1.0",
+      "url": "https://github.com/scipopt/scip/releases/download/v10.1.0/scipoptsuite-10.1.0-macos13-arm64.tgz",
+      "sha256": "62a2dc8eea45ede50a1f2aad6ad8f4bc1dfff8fe19521c8d145745c95aa90559"
+    },
+    "cbc": {
+      "version": "releases/2.10.13",
+      "url": "https://github.com/coin-or/Cbc/releases/download/releases/2.10.13/Cbc-releases.2.10.13-arm64-macos14-gcc1340.tar.gz",
+      "sha256": "aa5c643222c6fe45c8c11448a5f4d9d5d788e0fbe23c730442bf7c61adffc479"
+    }
+  }
+}

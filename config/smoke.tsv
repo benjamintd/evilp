@@ -1,0 +1,13 @@
+id	path	sha256	reference_status	reference_objective
+50v-10	data/miplib2017/instances/50v-10.mps.gz	9e64ce8962b8152e48b617cf7ec9e1abd8efeee8dcb317d4c06d817e5644192c	=opt=	3311.1799841
+air05	data/miplib2017/instances/air05.mps.gz	8e03d2b90834dc1fe15c908247fdd8baf76e208aa310508caa0734e5245692cc	=opt=	26374
+enlight_hard	data/miplib2017/instances/enlight_hard.mps.gz	942168c2126a2a91ae3ec1ededea59bc1af0cad55f94223edf4c03d20e831f66	=opt=	37
+ex9	data/miplib2017/instances/ex9.mps.gz	9c7758e2a75cb9270f9b09cbd05a7918acf69a4cba1a6ebc6234cf9bff89164c	=opt=	81
+gen-ip054	data/miplib2017/instances/gen-ip054.mps.gz	b5089ebc97c43bd583fcadf30955b8800861044d632d747c0b7ac73f19b9e6f3	=opt=	6840.96564179
+lotsize	data/miplib2017/instances/lotsize.mps.gz	14702c1793474b78a30b91512a12917790ba860f7abe765b01b296fb86835902	=opt=	1480195
+mas74	data/miplib2017/instances/mas74.mps.gz	019a9ca2dac800342a887cd07e326526b463dca9646ba16ad955a16fa4b6ecc1	=opt=	11801.18572
+mas76	data/miplib2017/instances/mas76.mps.gz	91f624659e181538020e0c627910f02ffa6b355d6df708ef324e697a69485a74	=opt=	40005.05398999999
+n2seq36q	data/miplib2017/instances/n2seq36q.mps.gz	7c2be13e461ecfbd03ceb20e3745ba4f24ad007fe1b34df8c2a5e02e89ead3d5	=opt=	52200
+neos5	data/miplib2017/instances/neos5.mps.gz	2888e9aeb10a4cf16d3b9ad221302fd3de815ce1454b31e660ebd060589c1072	=opt=	15
+pk1	data/miplib2017/instances/pk1.mps.gz	6c64530538b254a8ae648f8f8f188847366ae52da560fdec0ad290c642973ba0	=opt=	11
+seymour1	data/miplib2017/instances/seymour1.mps.gz	fbcef8581c27234abf5816cbd1ddd5b6b6fdc3764b57d36d85c517d9fd3e9bac	=opt=	410.76370139
