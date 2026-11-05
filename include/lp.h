@@ -23,11 +23,14 @@ typedef struct {
     size_t dual_iterations, cold_fallbacks, factor_nnz_peak, standard_nnz;
     size_t refinement_steps, scaled_rows, scaled_columns;
     double initial_backward_error, max_backward_error;
-    /* Exact original-row Farkas candidate; external checking is separate.
-     * Bound overlays are part of the LP to which this candidate applies. */
+    /* Rational original-row Farkas candidate; external checking is separate.
+     * Bound overlays are part of the LP to which this candidate applies.
+     * The margin is exact unless farkas_margin_is_lower_bound is set. */
     char **farkas;
     char *farkas_margin;
     size_t farkas_rows, exact_attempts, exact_infeasibilities;
+    int farkas_margin_is_lower_bound;
+    size_t source_infeasibility_attempts, source_infeasibilities;
     size_t rejected_pivots, harris_rescues;
     size_t primal_repairs, primal_repair_iterations;
     size_t exact_primal_attempts, exact_primal_recoveries;

@@ -24,6 +24,7 @@ typedef struct {
     size_t refinement_steps, scaled_rows, scaled_columns;
     double initial_backward_error, max_backward_error;
     size_t exact_attempts, exact_infeasibilities;
+    size_t source_infeasibility_attempts, source_infeasibilities;
     size_t rejected_pivots, harris_rescues;
     size_t primal_repairs, primal_repair_iterations;
     size_t exact_primal_attempts, exact_primal_recoveries;

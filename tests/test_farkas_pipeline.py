@@ -17,6 +17,77 @@ REPLAY = pathlib.Path(__file__).resolve().parents[1] / 'scripts/check_trace_cert
 
 
 class FarkasPipeline(unittest.TestCase):
+    def test_large_source_enclosure_export_and_typed_trace_margin(self):
+        # Original-decimal .1*x>=.3 and .1*x<=.2 contradict each other.
+        # Additional fixed rows exceed retained small-model provenance and
+        # dense reconstruction limits without changing that independent fact.
+        lines = ['NAME ENCLOSED', 'ROWS', ' N O', ' G A', ' L B']
+        lines += [f' E F{i}' for i in range(127)]
+        lines += ['COLUMNS', ' x O 0 A .1', ' x B .1']
+        lines += [f' z{i} O 0 F{i} 1' for i in range(127)]
+        lines += ['RHS', ' b A .3 B .2', 'BOUNDS', ' UP b x 3']
+        lines += [f' FX b z{i} 0' for i in range(127)]
+        model = '\n'.join(lines + ['ENDATA', ''])
+        with tempfile.TemporaryDirectory() as td:
+            root = pathlib.Path(td)
+            path, cert, trace = root/'model.mps', root/'proof.farkas', root/'trace.jsonl'
+            path.write_text(model)
+            p = subprocess.run([SOLVER, str(path), '--relax', '--farkas', str(cert)],
+                               text=True, capture_output=True, timeout=30)
+            self.assertEqual(p.returncode, 0, (p.stdout, p.stderr))
+            result = json.loads(p.stdout)
+            self.assertEqual(result['status'], 'infeasible', result)
+            self.assertFalse(result['exact_model_available'], result)
+            self.assertEqual(result['exact_infeasibilities'], 0, result)
+            self.assertEqual(result['source_infeasibilities'], 1, result)
+            self.assertEqual(result['farkas_margin_kind'], 'source_enclosure')
+            self.assertFalse(result['certifies_infeasibility'])
+            q = subprocess.run([CHECKER, '--model', str(path), '--farkas', str(cert)],
+                               text=True, capture_output=True, timeout=30)
+            self.assertEqual(q.returncode, 0, (q.stdout, q.stderr))
+            actual = F(json.loads(q.stdout)['contradiction_margin'])
+            self.assertGreater(actual, 0)
+            p = subprocess.run([SOLVER, str(path), '--mip', '--no-presolve', '--trace', str(trace)],
+                               text=True, capture_output=True, timeout=30)
+            self.assertEqual(p.returncode, 0, (p.stdout, p.stderr))
+            self.assertEqual(json.loads(p.stdout)['source_infeasibilities'], 1)
+            events = [json.loads(line) for line in trace.read_text().splitlines()]
+            proofs = [e for e in events if e['event'] == 'lp_infeasibility_certificate']
+            self.assertEqual(len(proofs), 1)
+            event = proofs[0]
+            self.assertEqual(event['margin_kind'], 'source_enclosure')
+            self.assertNotIn('contradiction_margin', event)
+            lower = F(event['contradiction_margin_lower_bound'])
+            self.assertGreater(lower, 0)
+            self.assertLess(lower, actual)
+            for i, variant in enumerate(['valid', 'too_large', 'zero', 'ambiguous', 'unknown']):
+                changed = copy.deepcopy(event)
+                if variant == 'too_large':
+                    changed['contradiction_margin_lower_bound'] = str(actual + 1)
+                elif variant == 'zero':
+                    changed['contradiction_margin_lower_bound'] = '0'
+                elif variant == 'ambiguous':
+                    changed['contradiction_margin'] = str(actual)
+                elif variant == 'unknown':
+                    changed['margin_kind'] = 'unknown'
+                replay_trace = root/f'replay-{i}.jsonl'
+                replay_trace.write_text(json.dumps(changed)+'\n')
+                p = subprocess.run([sys.executable, str(REPLAY), '--model', str(path),
+                                    '--trace', str(replay_trace), '--checker', CHECKER,
+                                    '--out', str(root/f'replay-{i}')],
+                                   text=True, capture_output=True, timeout=60)
+                self.assertEqual(p.returncode, 0 if variant == 'valid' else 1,
+                                 (variant, p.stdout, p.stderr))
+                if variant == 'valid':
+                    summary = json.loads(p.stdout)
+                    self.assertTrue(summary['proofs'][0]['margin_lower_bound_valid'])
+                    self.assertFalse(summary['proofs'][0]['margin_matches'])
+            disabled = subprocess.run([SOLVER, str(path), '--relax', '--no-exact'],
+                                      text=True, capture_output=True, timeout=30)
+            result = json.loads(disabled.stdout)
+            self.assertEqual(result['source_infeasibility_attempts'], 0, result)
+            self.assertFalse(result['has_farkas_candidate'], result)
+
     @staticmethod
     def free_model(a='3', b='7', lower='3', upper='1', duplicate=False):
         columns = (' x O 0 A .1\n x A .2 B .3\n' if duplicate else

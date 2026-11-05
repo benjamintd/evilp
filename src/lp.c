@@ -4,6 +4,7 @@
 #include "exact.h"
 #include "rational.h"
 #include "pivot.h"
+#include "farkas_candidate.h"
 #include <float.h>
 #include <math.h>
 #include <stdint.h>
@@ -38,8 +39,20 @@ typedef struct {
     const LabModel *model;
     LabLpResult *result;
     double started;
+    size_t source_negative_position, source_negative_column;
+    int source_negative_active;
 } Work;
 static int factor_basis(Work *w);
+static void clear_source_negative(Work *w) {
+    w->source_negative_active = 0;
+}
+static size_t source_negative(Work *w) {
+    if (w->source_negative_active && w->source_negative_position < w->m &&
+        w->basis[w->source_negative_position] == w->source_negative_column)
+        return w->source_negative_position;
+    clear_source_negative(w);
+    return SIZE_MAX;
+}
 static void put(Work *w, size_t row, size_t col, double value) {
     if (value == 0)
         return;
@@ -229,6 +242,7 @@ static int is_basic(const Work *w, size_t j) {
     return w->basic[j] != 0;
 }
 static void change_basis(Work *w, size_t position, size_t column) {
+    clear_source_negative(w);
     w->basic[w->basis[position]] = 0;
     w->basis[position] = column;
     w->basic[column] = 1;
@@ -369,6 +383,7 @@ static void exact_rhs(const Work *w, mpq_t *rhs) {
  * elimination removes the many trivial bound/slack rows before the bounded
  * dense exact core. A genuinely negative basic value requires a basis repair. */
 static int exact_primal(Work *w, double *point) {
+    clear_source_negative(w);
     const LabModel *m = w->model;
     if (w->options->no_exact || !exact_source(m))
         return 0;
@@ -409,11 +424,25 @@ static int exact_primal(Work *w, double *point) {
     }
     start[n] = at;
     exact_rhs(w, rhs);
-    if (valid && lab_rational_sparse_solve(n, start, row, value, rhs, z, deadline))
+    int solved = valid && !lab_rational_sparse_solve(n, start, row, value, rhs, z, deadline);
+    if (!solved)
         valid = 0;
-    for (size_t i = 0; i < n && valid; i++)
-        if (w->artificial[w->basis[i]] || mpq_sgn(z[i]) < 0)
-            valid = 0;
+    else {
+        /* A completed source solve can establish a negative sign that binary
+         * arithmetic rounds to zero. Keep the strict rejection and retain one
+         * Bland-ordered row for a real basis change, never a synthetic RHS. */
+        for (size_t i = 0; i < n; i++) {
+            size_t j = w->basis[i];
+            if (w->artificial[j] || mpq_sgn(z[i]) < 0)
+                valid = 0;
+            if (!w->artificial[j] && mpq_sgn(z[i]) < 0 &&
+                (!w->source_negative_active || j < w->source_negative_column)) {
+                w->source_negative_position = i;
+                w->source_negative_column = j;
+                w->source_negative_active = 1;
+            }
+        }
+    }
     mpq_t term, bound;
     mpq_inits(term, bound, NULL);
     for (size_t j = 0; j < m->cols; j++)
@@ -455,8 +484,10 @@ static int exact_primal(Work *w, double *point) {
                 valid = 0;
         }
     }
-    if (lab_now() >= deadline)
+    if (lab_now() >= deadline) {
+        clear_source_negative(w);
         valid = 0;
+    }
     double *candidate = lab_alloc(m->cols, sizeof(double));
     for (size_t j = 0; j < m->cols && valid; j++) {
         if (lab_exact_nearest(x[j], &candidate[j]) ||
@@ -605,6 +636,30 @@ static int phase_one_certificate(Work *w) {
     mpq_clears(value, multiplier, margin, q, side, NULL);
     return valid;
 }
+/* A numerical dual supplies a candidate only. Source enclosures must establish
+ * a strict positive contradiction lower bound before it can be accepted. */
+static int source_phase_one_certificate(Work *w) {
+    if (w->options->no_exact)
+        return 0;
+    w->result->source_infeasibility_attempts++;
+    double deadline = fmin(w->started + w->options->time_limit, lab_now() + 1);
+    LabFarkasCandidate candidate;
+    int accepted = lab_farkas_candidate(w->model, w->m, w->source_row, w->row_scale,
+                                        w->pi, deadline, &candidate);
+    if (accepted == 1) {
+        LabLpResult *r = w->result;
+        r->farkas = candidate.multiplier;
+        r->farkas_rows = candidate.rows;
+        r->farkas_margin = candidate.margin_lower_bound;
+        r->farkas_margin_is_lower_bound = 1;
+        r->source_infeasibilities++;
+        candidate.multiplier = NULL;
+        candidate.rows = 0;
+        candidate.margin_lower_bound = NULL;
+    }
+    lab_farkas_candidate_free(&candidate);
+    return accepted == 1;
+}
 /* 0 optimum, 1 unbounded, -1 explicit failure/limit. Bland's normal leaving
  * order is preserved. A rejected basis can retry a validated Harris pivot. */
 static int simplex(Work *w, int phase_one) {
@@ -657,6 +712,10 @@ static int simplex(Work *w, int phase_one) {
                 if (artificial_value > 1e-8) {
                     if (phase_one_certificate(w)) {
                         message(w, "infeasible", "Exact original-model Farkas contradiction reconstructed");
+                        return -1;
+                    }
+                    if (source_phase_one_certificate(w)) {
+                        message(w, "infeasible", "Strict original-source Farkas contradiction lower bound");
                         return -1;
                     }
                     if (budget(w))
@@ -723,6 +782,7 @@ static int simplex(Work *w, int phase_one) {
     }
 }
 static void remove_row(Work *w, size_t row, size_t basis_position) {
+    clear_source_negative(w);
     w->basic[w->basis[basis_position]] = 0;
     for (size_t j = 0; j < w->n; j++) {
         Column *c = &w->a[j];
@@ -1174,6 +1234,7 @@ static int build(Work *w, const LabModel *m) {
     return 0;
 }
 static int load_basis(Work *w) {
+    clear_source_negative(w);
     if (!w->options->basis_in)
         return 0;
     FILE *f = fopen(w->options->basis_in, "r");
@@ -1470,19 +1531,66 @@ static int dual_simplex(Work *w, int original_units);
 static int restore_primal(Work *w, const LabModel *m) {
     if (recover(w, m) == 0)
         return 0;
-    if (w->options->no_primal_repair ||
-        (!w->result->primal_repair_required && !(w->result->primal_residual > 1e-7)))
-        return -1;
-    free(w->result->primal);
-    free(w->result->dual);
-    w->result->primal = w->result->dual = NULL;
-    w->result->primal_repairs++;
-    size_t before = w->result->dual_iterations;
-    int status = dual_simplex(w, 1);
-    w->result->primal_repair_iterations += w->result->dual_iterations - before;
-    if (status)
-        return -1;
-    return recover(w, m);
+    enum { MAX_SOURCE_REPAIRS = 32 };
+    size_t *seen = NULL, seen_count = 0;
+    int outcome = -1;
+    for (size_t attempt = 0; attempt < MAX_SOURCE_REPAIRS; attempt++) {
+        if (w->options->no_primal_repair || budget(w) ||
+            (!w->result->primal_repair_required && !(w->result->primal_residual > 1e-7)))
+            break;
+        size_t hinted = source_negative(w);
+        if (attempt && hinted == SIZE_MAX) {
+            message(w, "numerical_failure", "Primal restoration has no proven source-negative basic");
+            break;
+        }
+        if (hinted != SIZE_MAX) {
+            /* Only bounded exact_primal can produce a hint, so storing exact
+             * basis histories here costs at most 32*1024 indices. */
+            if (w->m > 1024) {
+                message(w, "numerical_failure", "Source-sign repair dimension limit exceeded");
+                break;
+            }
+            if (!seen)
+                seen = lab_alloc(MAX_SOURCE_REPAIRS * w->m, sizeof(size_t));
+            int repeated = 0;
+            for (size_t k = 0; k < seen_count; k++)
+                if (!memcmp(seen + k * w->m, w->basis, w->m * sizeof(size_t)))
+                    repeated = 1;
+            if (repeated) {
+                message(w, "numerical_failure", "Source-sign repair repeated a basis");
+                break;
+            }
+            memcpy(seen + seen_count * w->m, w->basis, w->m * sizeof(size_t));
+            seen_count++;
+        }
+        free(w->result->primal);
+        free(w->result->dual);
+        w->result->primal = w->result->dual = NULL;
+        w->result->has_primal = 0;
+        w->result->primal_repairs++;
+        size_t before = w->result->dual_iterations;
+        int status = dual_simplex(w, 1);
+        size_t pivots = w->result->dual_iterations - before;
+        w->result->primal_repair_iterations += pivots;
+        if (status)
+            break;
+        if (!recover(w, m)) {
+            outcome = 0;
+            break;
+        }
+        if (budget(w))
+            break;
+        if (!pivots) {
+            message(w, "numerical_failure", "Primal restoration made no basis progress");
+            break;
+        }
+        if (attempt + 1 == MAX_SOURCE_REPAIRS)
+            message(w, "numerical_failure", "Source-sign repair attempt limit exceeded");
+    }
+    free(seen);
+    if (outcome)
+        clear_source_negative(w);
+    return outcome;
 }
 static int cold_solve(Work *w, const LabModel *m) {
     w->model = m;
@@ -1517,6 +1625,8 @@ static int cold_solve(Work *w, const LabModel *m) {
 static int dual_simplex(Work *w, int original_units) {
     double *reduced = lab_alloc(w->n, sizeof(double));
     int outcome = -1;
+    int source_step = original_units && source_negative(w) != SIZE_MAX;
+    int source_pivot_done = 0;
     int factor_ready = !w->options->no_updates && w->linear.valid && w->linear.n == w->m &&
                        !basis_values(w, 0);
     for (;;) {
@@ -1553,7 +1663,13 @@ static int dual_simplex(Work *w, int original_units) {
             message(w, "numerical_failure", "Warm basis lost dual feasibility");
             break;
         }
-        size_t leaving = SIZE_MAX;
+        /* A source hint authorizes just one ordinary pivot. Recompute the new
+         * factor/dual as usual, then reconstruct source signs before another. */
+        if (source_step && source_pivot_done) {
+            outcome = 0;
+            break;
+        }
+        size_t leaving = original_units ? source_negative(w) : SIZE_MAX;
         for (size_t i = 0; i < w->m; i++)
             if (w->xb[i] < -(original_units ? original_basic_tolerance(w, i) : 1e-8) &&
                 (leaving == SIZE_MAX || w->basis[i] < w->basis[leaving]))
@@ -1615,7 +1731,7 @@ static int dual_simplex(Work *w, int original_units) {
             break;
         }
         if (entering == SIZE_MAX) {
-            if (ambiguous)
+            if (ambiguous || original_units)
                 message(w, "numerical_failure", "No stable dual ratio pivot");
             else {
                 message(w, "infeasible", "Dual repair found no eligible column (numerical claim)");
@@ -1626,6 +1742,7 @@ static int dual_simplex(Work *w, int original_units) {
         change_basis(w, leaving, entering);
         w->result->iterations++;
         w->result->dual_iterations++;
+        source_pivot_done = 1;
         if (!w->options->no_updates) {
             if (update_basis(w, leaving, NULL, 0))
                 break;
@@ -1671,6 +1788,7 @@ int lab_lp_session_set_bounds(LabLpSession *s, size_t j, double lower, double up
 }
 static int update_rhs(LabLpSession *s) {
     Work *w = &s->work;
+    clear_source_negative(w);
     const LabModel *m = &s->model;
     for (size_t j = 0; j < m->cols; j++) {
         double lo = m->col_lower[j], hi = m->col_upper[j];

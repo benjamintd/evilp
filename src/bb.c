@@ -184,6 +184,8 @@ static int call_lp(Search *s, const double *lower, const double *upper, LabLpRes
     s->result->cold_fallbacks += lp->cold_fallbacks;
     s->result->exact_attempts += lp->exact_attempts;
     s->result->exact_infeasibilities += lp->exact_infeasibilities;
+    s->result->source_infeasibility_attempts += lp->source_infeasibility_attempts;
+    s->result->source_infeasibilities += lp->source_infeasibilities;
     s->result->rejected_pivots += lp->rejected_pivots;
     s->result->harris_rescues += lp->harris_rescues;
     s->result->primal_repairs += lp->primal_repairs;
@@ -249,7 +251,9 @@ static int call_lp(Search *s, const double *lower, const double *upper, LabLpRes
             fputc(':', s->trace);
             lab_json_string(s->trace, lp->farkas[i]);
         }
-        fputs("},\"contradiction_margin\":", s->trace);
+        fputs(lp->farkas_margin_is_lower_bound
+                  ? "},\"margin_kind\":\"source_enclosure\",\"contradiction_margin_lower_bound\":"
+                  : "},\"contradiction_margin\":", s->trace);
         lab_json_string(s->trace, lp->farkas_margin);
         fputs("}\n", s->trace);
     }

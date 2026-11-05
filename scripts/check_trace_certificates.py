@@ -210,12 +210,24 @@ def run(args, summary):
         record = {'trace_line': line_number, 'lp_solve': event.get('lp_solve'),
                   'directory': directory.name, 'independently_valid': False,
                   'claimed_margin': event.get('contradiction_margin'), 'checked_margin': None,
-                  'margin_matches': False, 'error': None}
+                  'margin_kind': event.get('margin_kind', 'exact'),
+                  'claimed_margin_lower_bound': event.get('contradiction_margin_lower_bound'),
+                  'margin_matches': False, 'margin_lower_bound_valid': False, 'error': None}
         summary['proofs'].append(record)
         try:
             model = local_model(prefix, columns, event.get('bounds'))
             certificate = certificate_text(event.get('multipliers'))
-            claimed = rational(event.get('contradiction_margin'))
+            kind = record['margin_kind']
+            if kind not in ('exact', 'source_enclosure'):
+                raise ValueError('unknown contradiction margin kind')
+            if kind == 'source_enclosure':
+                if 'contradiction_margin' in event:
+                    raise ValueError('source enclosure cannot claim an exact margin')
+                claimed = rational(event.get('contradiction_margin_lower_bound'))
+            else:
+                if 'contradiction_margin_lower_bound' in event:
+                    raise ValueError('exact margin cannot carry an untyped lower bound')
+                claimed = rational(event.get('contradiction_margin'))
             (directory / 'model.mps').write_text(model)
             (directory / 'certificate.farkas').write_text(certificate)
             record['model_sha256'] = digest(directory / 'model.mps')
@@ -227,12 +239,15 @@ def run(args, summary):
             record['checked_margin'] = checked.get('contradiction_margin')
             margin = (rational(record['checked_margin'])
                       if record['checked_margin'] is not None else None)
-            record['margin_matches'] = margin == claimed
+            record['margin_matches'] = kind == 'exact' and margin == claimed
+            record['margin_lower_bound_valid'] = (kind == 'source_enclosure' and
+                                                  margin is not None and 0 < claimed <= margin)
+            valid_comparison = record['margin_matches'] or record['margin_lower_bound_valid']
             record['independently_valid'] = (code == 0 and checked.get('certificate_status') == 'valid'
                 and checked.get('certifies_infeasibility') is True and margin is not None
-                and margin > 0 and record['margin_matches'])
+                and margin > 0 and valid_comparison)
             if not record['independently_valid']:
-                record['error'] = 'independent proof rejected or exact margin differs from trace'
+                record['error'] = 'independent proof rejected or contradiction margin claim is invalid'
         except (ValueError, OSError) as error:
             record['error'] = str(error)
     if not summary['proofs'] and not args.allow_empty:
