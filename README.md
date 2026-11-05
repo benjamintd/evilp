@@ -11,6 +11,11 @@ Small uncertain Phase I solves can reconstruct exact original-decimal
 infeasibility witnesses; guarded pivots can retry a stronger leaving choice.
 Small-model primal recovery reconstructs original decimal arithmetic and can
 restore infeasible bases using feasibility thresholds in original units.
+Version 0.7 peels structural singleton rows and columns before factoring the
+remaining coupled core. Guarded basis updates reuse that factorization across
+pivots, and a membership bitmap avoids repeatedly scanning the basis during
+pricing. Integer search adds conservative source-aware root propagation and
+deterministic reliability-based pseudocost selection.
 The independent checker validates original-model witnesses, rational LP bounds
 and exact infeasibility certificates.
 
@@ -29,6 +34,21 @@ successful witnesses, numerical failures and capacity limits. The earlier
 
 The [autoresearch protocol](docs/AUTORESEARCH.md) starts only after every MILP
 problem in the existing benchmarks passes. That gate is not yet complete.
+The [full 240-instance v1 inventory](results/miplib-candidate-v1/inventory.json)
+records 209 unsupported cases, 31 time limits, seven independently checked
+incumbents and zero correctly completed instances. It is a development failure
+inventory, not a comparable timing campaign or evidence of a speed advantage.
+The [gate result](results/miplib-candidate-v1/gate.json) remains closed. The
+subsequent performance target is at least 120 strict paired wins against HiGHS
+over the fixed 240-instance denominator under matched conditions.
+
+The current [Release contract log](results/milestone-2g-contracts-v1/release-ctest.log)
+passes all 22 suites. These retain the previous 18 suites and add presolve,
+branch selection, benchmark-gate and scalability contracts. All 22 suites also
+pass in the [sanitizer run](results/milestone-2g-contracts-v1/sanitizer-ctest.log).
+The tested engine is committed at `82c1355`; the earlier
+[18-suite Release and sanitizer evidence](results/primal-regressions-v1/final-validation.json)
+remains frozen and unchanged.
 
 Milestone 2A is preserved in [the original LP engine contract](docs/LP-ENGINE.md),
 [the lab's LP report](results/lp-native-v2/lab/summary.html), and
@@ -98,11 +118,20 @@ The separate checker certifies this example's exact LP optimum. In general,
 floating-point solutions are tolerance-accepted and their dual bounds can be
 unavailable; inspect both statuses. Output files must be new. `--relax` is
 required so fractional LP solutions cannot silently be presented as MILP results.
-Sparse LU is the default. The expanded standard-form dimension limit is 4096
-by default (up to 32768 for sparse mode); `--backend dense` selects the reference
-backend, whose dimension ceiling is 4096.
+Sparse LU is the default. The standard-form capacity guard defaults to
+16,000,000, with a separate sparse basis ceiling of 8,000,000. Entry and fill
+budgets remain finite. `--max-dimension` selects a smaller standard-form guard;
+`--backend dense` selects the reference backend and defaults to its hard 4096
+limit. Large remaining coupled cores can still be expensive after singleton
+peeling; capacity limits do not promise successful completion or sufficient
+memory for every model.
 Scaling and refinement are enabled by default. `--no-scaling` and
 `--no-refinement` select controlled ablations; the residual guard still applies.
+Basis updates are also enabled by default. At most 32 eta columns and 4,000,000
+eta entries are retained before full refactorization. Weak, inaccurate or
+nonfinite updates also fall back to refactorization. `--no-updates` provides
+the full-refactor control. See [the current engine contract](docs/LP-ENGINE.md)
+for storage and validation details.
 
 ~~~sh
 build/milpsolve tests/fixtures/tiny.mps --relax --read-basis work/tiny-lp.basis
@@ -127,7 +156,13 @@ python3 tests/test_live_mip.py --out results/my-live-mip
 
 The tiny integer optimum is 8.03. Search defaults to warm LP sessions; `--cold`
 rebuilds each LP for comparison. Use `--node-limit` and `--time-limit` to bound
-search. Limits retain any incumbent found so far. Search statuses and global
+search. Root presolve receives at most 32 propagation passes and a budget of
+`min(2 seconds, 5% of the remaining MILP budget)`. It uses source-aware bounds
+and redundant-row masks without changing the model checked independently.
+`--no-presolve` disables it. Learned branch scores use solved-child observations;
+incomplete history falls back deterministically, and `--first-fractional`
+restores the original branch-selection control. These two flags are MILP-only.
+Limits retain any incumbent found so far. Search statuses and global
 bounds remain numerical claims: complete tree proof logging is not implemented.
 An unbounded LP relaxation returns `lp_unbounded`, without asserting MILP
 unboundedness. `--mip` and `--relax` are explicit, exclusive modes.
@@ -172,7 +207,9 @@ and 3. Inspect all validation failures before accepting performance changes.
 - src/common.c: allocation, JSON escaping, monotonic timing and SHA-256.
 - src/model.c: independent optimizer MPS reader and sparse CSC model.
 - src/lp.c, src/factor.c, src/solve.c: LP engine, LU backend and command line.
-- src/linear.c: equilibrated basis solves, compensated residuals and refinement.
+- src/linear.c: guarded eta updates, equilibrated solves and compensated refinement.
+- src/presolve.c: source-aware root bound propagation and redundant-row masks.
+- src/search.c: deterministic reliability-based pseudocost branch ranking.
 - src/exact.c, src/rational.c: original decimals and bounded exact reconstruction.
 - src/pivot.c: deterministic ratio choices for validated pivot retries.
 - src/bb.c: branch-and-bound, integer repair, limits and deterministic traces.

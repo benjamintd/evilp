@@ -1,15 +1,120 @@
-# Milestone 2A: first native C LP engine
+# Native C LP engine
 
-This document describes the frozen milestone-2A checkpoint. The current
-[sparse engine, reoptimization and MILP contract](MILESTONE-2BC.md) supersedes
-its backend defaults and limitations. Original validation records are preserved.
+The current implementation is version 0.7. The frozen milestone-2A contract
+and its original validation records are preserved below. Later numerical and
+witness policies are described in [milestone 2D](MILESTONE-2D.md),
+[milestone 2E](MILESTONE-2E.md) and [milestone 2F](MILESTONE-2F.md).
+
+## Current 0.7 implementation
+
+The optimizer and independent checker remain separate C17 programs with
+separate model readers. The numerical engine uses sparse CSC storage and
+bounded GMP reconstruction where original-decimal provenance is retained.
+`milpcheck` evaluates original, unpresolved models; optimizer presolve,
+branch scores and numerical stopping statuses do not replace that check.
+
+The sparse factor backend first removes structural singleton rows and columns.
+A singleton row fixes a variable; a singleton column defers an equation for
+reverse substitution. These steps introduce no fill. Only the remaining
+coupled core is factored, while original coefficients are retained for forward
+and transpose substitution. Up to two guarded compensated core corrections
+precede recovery of deferred variables. A large sparse basis with many bound
+and slack identities can therefore have a small core. A large remaining
+coupled core can still require expensive elimination and fill; structural
+peeling does not make every large MIPLIB model cheap to solve.
+
+Guarded product-form eta updates reuse a base LU factorization across column
+replacements. Normal and transpose solves apply the update chain in the
+appropriate order. The current original-unit basis CSC remains available for
+compensated residuals and iterative refinement. The unchanged componentwise
+backward-error guard is `1e-10`, with a refinement target of `1e-14`; published
+primal points retain the original `1e-7` feasibility policy.
+
+An update with a weak pivot, nonfinite arithmetic or an inaccurate direction
+is rejected without changing the old linear basis. The LP driver then factors
+the complete new basis. Updated solves that fail their residual checks also
+retry through full refactorization. Rejected primal pivot trials refactor the
+alternative basis before continuing. At most 32 eta columns and 4,000,000 eta
+entries are retained; reaching either guard requests refactorization. Storage
+is proportional to sparse entries, elimination fill and retained eta entries,
+with no dense fallback in the sparse path. `--no-updates` selects the
+full-refactor ablation. A maintained membership bitmap makes each pricing
+membership lookup constant-time; pricing still examines candidate columns.
+
+### Capacity and controls
+
+The sparse standard-form guard defaults to 16,000,000 and the sparse basis
+dimension ceiling is 8,000,000. For transformed structural count `z` and
+expanded equation count `r`, the standard form reserves `z + 2r` columns.
+`--max-dimension` controls that finite standard-form guard. Entry and fill
+budgets can also stop a solve explicitly. These are resource limits, not
+claims that all problems below them fit memory or complete within a budget.
+
+`--backend dense` remains an explicitly selected reference backend. It defaults
+to a 4096 standard-form limit and refuses larger requested limits before dense
+allocation. Increasing sparse capacity does not increase the dense ceiling.
+Scaling and refinement remain separately controlled by `--no-scaling` and
+`--no-refinement`; none of these flags relaxes original-model validation.
+
+MILP search applies source-aware root bound propagation before opening LP
+sessions. It uses retained exact decimals or conservative outward source
+envelopes, integer bound rounding, and redundant-row masks for the returned
+box. Reductions require trustworthy source information. The original model
+stays immutable, and retained candidates are checked against its unpresolved
+rows. Presolve receives at most 32 passes and a budget of
+`min(2 seconds, 5% of the remaining MILP budget)`, within the cumulative solve
+budget. `--no-presolve` disables it. Presolve statuses remain optimizer claims;
+this module does not emit an independent infeasibility certificate.
+
+Branch selection uses deterministic reliability-based pseudocosts learned from
+solved children. Two valid observations per direction qualify a learned
+estimate; incomplete history uses fallback statistics or most fractionality.
+Scores rank eligible fractional integer variables and never establish a bound,
+feasibility or a pruning justification. `--first-fractional` restores the
+original selection control. Both search controls are MILP-only. `--cold`
+continues to rebuild LPs instead of reusing saved sessions.
+
+JSON exposes update acceptance/rejection counts, refactorizations, peak core
+dimension and singleton eliminations, alongside presolve and branch-observation
+diagnostics. These are work counters and numerical diagnostics, not speed
+results or independent certificates.
+
+### Current validation and completion gate
+
+The current [Release contract run](../results/milestone-2g-contracts-v1/release-ctest.log)
+passes all 22 suites. The previous 18 remain, with additive presolve, branch
+selection, benchmark-gate and scalability contracts. The generated scalability
+tests check 2,500-variable LPs with 5,003 basis rows and a three-variable core,
+known original-model points and objectives, explicit dense/sparse limits, and
+refactor-count reduction against `--no-updates`; they assert no timing ranking.
+The [full sanitizer run](../results/milestone-2g-contracts-v1/sanitizer-ctest.log)
+also passes all 22 suites at engine checkpoint `82c1355`. The
+[contract summary](../results/milestone-2g-contracts-v1/summary.json) records the
+matching source/test hashes. The frozen
+[18-suite milestone-2F evidence](../results/primal-regressions-v1/final-validation.json)
+continues to describe its own Release and sanitizer builds.
+
+The [full 240-instance v1 inventory](../results/miplib-candidate-v1/inventory.json)
+records 209 unsupported cases, 31 time limits, seven independently checked
+incumbents and zero correctly completed problems. It used the earlier candidate
+at a two-second budget and is explicitly not a fair timing campaign. The
+[completion and paired-speed gate](../results/miplib-candidate-v1/gate.json)
+remains closed. Capacity guards and a large coupled core are separate blockers;
+new engineering requires a fresh versioned campaign, not edits to that inventory.
+No performance advantage over HiGHS or other solvers is established.
+
+## Frozen milestone-2A contract
+
+The remainder describes the original milestone-2A checkpoint, including its
+historical defaults, limitations and next gate. Subsequent sparse storage,
+reoptimization and MILP work is preserved in [milestone 2B/C](MILESTONE-2BC.md).
 
 `milpsolve MODEL --relax` solves the continuous relaxation using project-owned
 C17 code. It does not call HiGHS, SCIP, Cbc or another optimizer. GMP belongs
 to the separate checker; the numerical solve uses floating-point arithmetic.
 This is a correctness-focused reference engine, not a competitive MIP solver.
 
-## Model and numerical architecture
+### Model and numerical architecture
 
 `src/model.c` implements the optimizer's own plain/gzip MPS reader. It preserves
 original row/column names, ranged row bounds, column bounds, integrality,
@@ -48,7 +153,7 @@ safeguards, not formal certificates. Singular/unstable bases, overflow and
 ambiguous cleanup have explicit failure paths. There is no advanced scaling,
 perturbation, iterative refinement, presolve, cutting plane or integer search.
 
-## Command and artifact contract
+### Command and artifact contract
 
 ```sh
 build/milpsolve MODEL --relax \
@@ -93,7 +198,7 @@ Suite references for LP runs must be LP objectives, never MIPLIB's integer
 reference objectives. Reports mark relaxation mode and separate checked bounds,
 reference agreement and exact certificates.
 
-## Independent rational bounds and exact witnesses
+### Independent rational bounds and exact witnesses
 
 ```sh
 build/milpcheck --model MODEL --relax --solution NEW.sol --dual NEW.dual
@@ -132,7 +237,7 @@ can require exact basis reconstruction, which this engine does not implement.
 Unavailable certificates stay visible. Farkas infeasibility certificates,
 unbounded-ray verification and complete MILP proof logging are not implemented.
 
-## Validation and next gate
+### Validation and next gate
 
 Completed validation at clean source revision `f94761e`:
 
