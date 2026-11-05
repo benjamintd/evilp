@@ -4,6 +4,8 @@
 #include <fenv.h>
 #include <float.h>
 #include <math.h>
+#include <stdint.h>
+#include <errno.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -353,4 +355,141 @@ int lab_exact_evaluate(const LabModel *m, const double *x, double *objective,
         *max_violation = INFINITY;
     }
     return failed;
+}
+
+static LabInterval whole_interval(void) {
+    return (LabInterval){-INFINITY, INFINITY};
+}
+static LabInterval scalar_sum_interval(double a, double b) {
+    if (isinf(a) || isinf(b)) {
+        double sum = a + b;
+        return isnan(sum) ? whole_interval() : (LabInterval){sum, sum};
+    }
+    double sum, error;
+    if (two_sum(a, b, &sum, &error)) {
+        sum = a + b;
+        if (isinf(sum))
+            return sum > 0 ? (LabInterval){DBL_MAX, INFINITY}
+                           : (LabInterval){-INFINITY, -DBL_MAX};
+        return whole_interval();
+    }
+    return (LabInterval){error < 0 ? nextafter(sum, -INFINITY) : sum,
+                         error > 0 ? nextafter(sum, INFINITY) : sum};
+}
+LabInterval lab_interval_add(LabInterval a, LabInterval b) {
+    if (fegetround() != FE_TONEAREST || isnan(a.lower) || isnan(a.upper) ||
+        isnan(b.lower) || isnan(b.upper) || a.lower > a.upper || b.lower > b.upper)
+        return whole_interval();
+    LabInterval lo = scalar_sum_interval(a.lower, b.lower);
+    LabInterval hi = scalar_sum_interval(a.upper, b.upper);
+    return (LabInterval){lo.lower, hi.upper};
+}
+LabInterval lab_interval_subtract(LabInterval a, LabInterval b) {
+    return lab_interval_add(a, (LabInterval){-b.upper, -b.lower});
+}
+static LabInterval scalar_product_interval(double a, double b) {
+    if (a == 0 || b == 0)
+        return (LabInterval){0, 0};
+    double p = a * b;
+    if (isinf(a) || isinf(b))
+        return (LabInterval){p, p};
+    if (isinf(p))
+        return p > 0 ? (LabInterval){DBL_MAX, INFINITY}
+                     : (LabInterval){-INFINITY, -DBL_MAX};
+    double error = fma(a, b, -p);
+    if (!isfinite(error))
+        return whole_interval();
+    int tiny = fabs(p) < scalbn(DBL_MIN, DBL_MANT_DIG);
+    return (LabInterval){error < 0 || tiny ? nextafter(p, -INFINITY) : p,
+                         error > 0 || tiny ? nextafter(p, INFINITY) : p};
+}
+LabInterval lab_interval_multiply(LabInterval a, LabInterval b) {
+    if (fegetround() != FE_TONEAREST || isnan(a.lower) || isnan(a.upper) ||
+        isnan(b.lower) || isnan(b.upper) || a.lower > a.upper || b.lower > b.upper)
+        return whole_interval();
+    LabInterval result = {INFINITY, -INFINITY};
+    double av[] = {a.lower, a.upper}, bv[] = {b.lower, b.upper};
+    for (size_t i = 0; i < 2; i++)
+        for (size_t j = 0; j < 2; j++) {
+            LabInterval p = scalar_product_interval(av[i], bv[j]);
+            result.lower = fmin(result.lower, p.lower);
+            result.upper = fmax(result.upper, p.upper);
+        }
+    return result;
+}
+static LabInterval reciprocal_interval(double value) {
+    if (isinf(value))
+        return (LabInterval){0, 0};
+    double r = 1 / value;
+    if (isinf(r))
+        return r > 0 ? (LabInterval){DBL_MAX, INFINITY}
+                     : (LabInterval){-INFINITY, -DBL_MAX};
+    /* Adjacent doubles enclose correctly rounded division even when an FMA
+     * residual would itself underflow and lose its direction. */
+    return (LabInterval){nextafter(r, -INFINITY), nextafter(r, INFINITY)};
+}
+LabInterval lab_interval_divide(LabInterval a, LabInterval b) {
+    if (isnan(b.lower) || isnan(b.upper) || b.lower > b.upper ||
+        (b.lower <= 0 && b.upper >= 0))
+        return whole_interval();
+    LabInterval lo = reciprocal_interval(b.upper), hi = reciprocal_interval(b.lower);
+    return lab_interval_multiply(a, (LabInterval){lo.lower, hi.upper});
+}
+LabInterval lab_source_number_interval(const char *text, double rounded) {
+    if (!text || !isfinite(rounded))
+        return whole_interval();
+    int nonzero = 0, integer = 1;
+    const char *s = text;
+    if (*s == '+' || *s == '-')
+        s++;
+    const char *digits = s;
+    for (; *s; s++) {
+        if (*s == 'e' || *s == 'E' || *s == 'd' || *s == 'D') {
+            integer = 0;
+            break;
+        }
+        if (*s == '.')
+            integer = 0;
+        else if (*s >= '1' && *s <= '9')
+            nonzero = 1;
+    }
+    if (!nonzero)
+        return (LabInterval){0, 0};
+    if (integer && strlen(digits) <= 20) {
+        errno = 0;
+        char *end;
+        unsigned long long magnitude = strtoull(digits, &end, 10);
+        double absolute = fabs(rounded);
+        if (!errno && !*end && absolute < 0x1p64 &&
+            (unsigned long long)absolute == magnitude)
+            return (LabInterval){rounded, rounded};
+    }
+    return (LabInterval){nextafter(rounded, -INFINITY), nextafter(rounded, INFINITY)};
+}
+LabSourceEnvelope *lab_source_envelope_new(size_t rows, size_t cols, size_t nnz) {
+    LabSourceEnvelope *s = lab_alloc(1, sizeof *s);
+    s->rows = rows;
+    s->cols = cols;
+    s->nnz = nnz;
+    s->value = lab_alloc(nnz, sizeof(LabInterval));
+    s->row_lower = lab_alloc(rows, sizeof(LabInterval));
+    s->row_upper = lab_alloc(rows, sizeof(LabInterval));
+    s->col_lower = lab_alloc(cols, sizeof(LabInterval));
+    s->col_upper = lab_alloc(cols, sizeof(LabInterval));
+    s->col_lower_source = lab_alloc(cols, sizeof(double));
+    s->col_upper_source = lab_alloc(cols, sizeof(double));
+    s->complete = 1;
+    return s;
+}
+void lab_source_envelope_free(LabSourceEnvelope *s) {
+    if (!s)
+        return;
+    free(s->value);
+    free(s->row_lower);
+    free(s->row_upper);
+    free(s->col_lower);
+    free(s->col_upper);
+    free(s->col_lower_source);
+    free(s->col_upper_source);
+    free(s);
 }

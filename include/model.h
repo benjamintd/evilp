@@ -3,6 +3,7 @@
 
 #include <stddef.h>
 typedef struct LabExactModel LabExactModel;
+typedef struct LabSourceEnvelope LabSourceEnvelope;
 
 /* Original (unscaled) bounded-row model. The matrix is compressed by column.
  * Bounds use +/-INFINITY; every stored coefficient and objective is finite.
@@ -22,6 +23,9 @@ typedef struct {
      * sessions borrow it; manually constructed models leave both fields zero. */
     LabExactModel *exact;
     int parsed_decimal;
+    /* Outward source-decimal enclosures, independent of the exact-size cap.
+     * Session views borrow them; this model owns the allocation. */
+    LabSourceEnvelope *envelope;
 } LabModel;
 
 /* Start from a zero-initialized model. On failure the diagnostic stays in

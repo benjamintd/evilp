@@ -4,6 +4,26 @@
 #include <stddef.h>
 #include "model.h"
 
+typedef struct {
+    double lower, upper;
+} LabInterval;
+typedef struct LabSourceEnvelope {
+    size_t rows, cols, nnz;
+    LabInterval *value, *row_lower, *row_upper, *col_lower, *col_upper;
+    double *col_lower_source, *col_upper_source;
+    int complete;
+} LabSourceEnvelope;
+/* Outward binary64 interval operations. A denominator containing zero gives
+ * the whole real line; indeterminate extended operations never narrow it. */
+LabInterval lab_interval_add(LabInterval a, LabInterval b);
+LabInterval lab_interval_subtract(LabInterval a, LabInterval b);
+LabInterval lab_interval_multiply(LabInterval a, LabInterval b);
+LabInterval lab_interval_divide(LabInterval a, LabInterval b);
+/* text has already passed the optimizer's finite decimal grammar/conversion. */
+LabInterval lab_source_number_interval(const char *text, double rounded);
+LabSourceEnvelope *lab_source_envelope_new(size_t rows, size_t cols, size_t nnz);
+void lab_source_envelope_free(LabSourceEnvelope *source);
+
 /* Immutable original-decimal feasibility data. CSC values align with LabModel.
  * Infinite bounds have a zero placeholder; consult the model's finite sides. */
 typedef struct LabExactModel {

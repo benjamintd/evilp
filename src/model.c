@@ -26,6 +26,7 @@ typedef struct {
     char *name;
     double rhs, range;
     char *rhs_text, *range_text;
+    LabInterval rhs_envelope, range_envelope;
     char kind;
     unsigned rhs_seen : 1, range_seen : 1;
 } InputRow;
@@ -33,6 +34,7 @@ typedef struct {
     char *name;
     double lower, upper;
     char *lower_text, *upper_text;
+    LabInterval lower_envelope, upper_envelope;
     unsigned integer : 1, marker : 1, marker_seen : 1;
     unsigned bound_seen : 1, explicit_lower : 1;
 } InputCol;
@@ -40,6 +42,7 @@ typedef struct {
     size_t column, row;
     double value;
     char *text;
+    LabInterval envelope;
 } Entry;
 typedef struct {
     LabModel *output;
@@ -240,6 +243,8 @@ static size_t get_column(Reader *p, const char *name, int marker) {
     col->name = lab_strdup(name);
     col->lower = 0;
     col->upper = marker > 0 ? 1 : INFINITY;
+    col->lower_envelope = (LabInterval){0, 0};
+    col->upper_envelope = (LabInterval){col->upper, col->upper};
     col->integer = marker > 0;
     col->marker = marker > 0;
     col->marker_seen = marker >= 0;
@@ -287,7 +292,8 @@ static int add_values(Reader *p, size_t column, size_t start, size_t n, char **f
         if (p->ne >= 20000)
             disable_exact(p);
         char *text = capture(p, field[i + 1]);
-        p->entries[p->ne++] = (Entry){column, row, number, text};
+        p->entries[p->ne++] = (Entry){column, row, number, text,
+                                      lab_source_number_interval(field[i + 1], number)};
     }
     return 0;
 }
@@ -310,10 +316,12 @@ static int row_side(Reader *p, size_t n, char **field, int ranges) {
             r->range = value;
             r->range_seen = 1;
             r->range_text = capture(p, field[k + 1]);
+            r->range_envelope = lab_source_number_interval(field[k + 1], value);
         } else {
             r->rhs = value;
             r->rhs_seen = 1;
             r->rhs_text = capture(p, field[k + 1]);
+            r->rhs_envelope = lab_source_number_interval(field[k + 1], value);
         }
     }
     return 0;
@@ -344,26 +352,32 @@ static int bound(Reader *p, size_t n, char **field) {
         if (c->integer)
             c->upper = INFINITY;
         if (c->integer)
+            c->upper_envelope = (LabInterval){INFINITY, INFINITY};
+        if (c->integer)
             bound_text(p, &c->upper_text, NULL);
         c->bound_seen = 1;
     }
     if (!strcmp(kind, "LO") || !strcmp(kind, "LI")) {
         c->lower = value;
+        c->lower_envelope = lab_source_number_interval(field[3], value);
         bound_text(p, &c->lower_text, field[3]);
         c->explicit_lower = 1;
         if (!strcmp(kind, "LI"))
             c->integer = 1;
     } else if (!strcmp(kind, "UP") || !strcmp(kind, "UI")) {
         c->upper = value;
+        c->upper_envelope = lab_source_number_interval(field[3], value);
         bound_text(p, &c->upper_text, field[3]);
         if (!c->explicit_lower && value < 0) {
             c->lower = -INFINITY;
+            c->lower_envelope = (LabInterval){-INFINITY, -INFINITY};
             bound_text(p, &c->lower_text, NULL);
         }
         if (!strcmp(kind, "UI"))
             c->integer = 1;
     } else if (!strcmp(kind, "FX")) {
         c->lower = c->upper = value;
+        c->lower_envelope = c->upper_envelope = lab_source_number_interval(field[3], value);
         bound_text(p, &c->lower_text, field[3]);
         bound_text(p, &c->upper_text, field[3]);
         c->explicit_lower = 1;
@@ -371,21 +385,27 @@ static int bound(Reader *p, size_t n, char **field) {
         c->integer = 1;
         c->lower = 0;
         c->upper = 1;
+        c->lower_envelope = (LabInterval){0, 0};
+        c->upper_envelope = (LabInterval){1, 1};
         bound_text(p, &c->lower_text, "0");
         bound_text(p, &c->upper_text, "1");
         c->explicit_lower = 1;
     } else if (!strcmp(kind, "FR")) {
         c->lower = -INFINITY;
         c->upper = INFINITY;
+        c->lower_envelope = (LabInterval){-INFINITY, -INFINITY};
+        c->upper_envelope = (LabInterval){INFINITY, INFINITY};
         bound_text(p, &c->lower_text, NULL);
         bound_text(p, &c->upper_text, NULL);
         c->explicit_lower = 1;
     } else if (!strcmp(kind, "MI")) {
         c->lower = -INFINITY;
+        c->lower_envelope = (LabInterval){-INFINITY, -INFINITY};
         bound_text(p, &c->lower_text, NULL);
         c->explicit_lower = 1;
     } else if (!strcmp(kind, "PL")) {
         c->upper = INFINITY;
+        c->upper_envelope = (LabInterval){INFINITY, INFINITY};
         bound_text(p, &c->upper_text, NULL);
     }
     return 0;
@@ -456,6 +476,41 @@ static void discard_exact(LabModel *m) {
     lab_exact_model_free(m->exact);
     m->exact = NULL;
 }
+static LabInterval absolute_interval(LabInterval x) {
+    if (x.lower >= 0)
+        return x;
+    if (x.upper <= 0)
+        return (LabInterval){-x.upper, -x.lower};
+    return (LabInterval){0, fmax(-x.lower, x.upper)};
+}
+static LabSourceEnvelope *prepare_envelope(Reader *p, const size_t *index) {
+    LabModel *m = p->output;
+    LabSourceEnvelope *s = lab_source_envelope_new(m->rows, m->cols, p->ne);
+    for (size_t i = 0; i < p->nr; i++) {
+        if (index[i] == SIZE_MAX)
+            continue;
+        const InputRow *r = &p->rows[i];
+        size_t k = index[i];
+        s->row_lower[k] = r->kind == 'L' ? (LabInterval){-INFINITY, -INFINITY}
+                                        : r->rhs_envelope;
+        s->row_upper[k] = r->kind == 'G' ? (LabInterval){INFINITY, INFINITY}
+                                        : r->rhs_envelope;
+        if (r->range_seen) {
+            LabInterval range = absolute_interval(r->range_envelope);
+            if (r->kind == 'L' || (r->kind == 'E' && r->range < 0))
+                s->row_lower[k] = lab_interval_subtract(r->rhs_envelope, range);
+            else
+                s->row_upper[k] = lab_interval_add(r->rhs_envelope, range);
+        }
+    }
+    for (size_t j = 0; j < m->cols; j++) {
+        s->col_lower[j] = p->cols[j].lower_envelope;
+        s->col_upper[j] = p->cols[j].upper_envelope;
+        s->col_lower_source[j] = m->col_lower[j];
+        s->col_upper_source[j] = m->col_upper[j];
+    }
+    return s;
+}
 static int finish(Reader *p) {
     LabModel *m = p->output;
     size_t objective = SIZE_MAX;
@@ -513,6 +568,7 @@ static int finish(Reader *p) {
         m->integer[j] = (unsigned char)p->cols[j].integer;
     }
     m->exact = prepare_exact(p, index, objective);
+    m->envelope = prepare_envelope(p, index);
     /* Sorting gives deterministic coalescing even if a writer interleaves
      * column records. Rows within every final CSC column are sorted. */
     if (p->ne)
@@ -532,6 +588,7 @@ static int finish(Reader *p) {
         while (e < p->ne && a.column == p->entries[e].column && a.row == p->entries[e].row) {
             Entry *next = &p->entries[e++];
             a.value += next->value;
+            a.envelope = lab_interval_add(a.envelope, next->envelope);
             if (m->exact && (index[a.row] != SIZE_MAX || a.row == objective)) {
                 if (!next->text || lab_exact_decimal(term, next->text))
                     discard_exact(m);
@@ -561,9 +618,11 @@ static int finish(Reader *p) {
                 }
             }
         }
-        else if (index[a.row] != SIZE_MAX && a.value != 0) {
+        else if (index[a.row] != SIZE_MAX &&
+                 (a.value != 0 || a.envelope.lower != 0 || a.envelope.upper != 0)) {
             if (m->exact)
                 mpq_set(m->exact->value[unique], sum);
+            m->envelope->value[unique] = a.envelope;
             a.row = index[a.row];
             p->entries[unique++] = a;
             ++m->col_start[a.column + 1];
@@ -571,6 +630,7 @@ static int finish(Reader *p) {
     }
     mpq_clears(sum, term, NULL);
     m->nnz = unique;
+    m->envelope->nnz = unique;
     if (m->exact) {
         for (size_t k = unique; k < m->exact->nnz; k++)
             mpq_clear(m->exact->value[k]);
@@ -782,5 +842,6 @@ void lab_model_free(LabModel *model) {
     free(model->row_index);
     free(model->value);
     lab_exact_model_free(model->exact);
+    lab_source_envelope_free(model->envelope);
     memset(model, 0, sizeof *model);
 }

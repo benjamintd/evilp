@@ -286,6 +286,68 @@ static void original_objective_coalescing(void) {
             "nonzero exact objective underflow fails explicitly");
     lab_model_free(&m);
 }
+static void encloses(LabInterval interval, const char *expected, const char *message) {
+    mpq_t q, endpoint;
+    mpq_inits(q, endpoint, NULL);
+    require(!mpq_set_str(q, expected, 10), "test rational syntax");
+    mpq_canonicalize(q);
+    int contained = !isnan(interval.lower) && !isnan(interval.upper) &&
+                    interval.lower <= interval.upper;
+    if (isfinite(interval.lower)) {
+        mpq_set_d(endpoint, interval.lower);
+        contained = contained && mpq_cmp(endpoint, q) <= 0;
+    } else
+        contained = contained && interval.lower == -INFINITY;
+    if (isfinite(interval.upper)) {
+        mpq_set_d(endpoint, interval.upper);
+        contained = contained && mpq_cmp(endpoint, q) >= 0;
+    } else
+        contained = contained && interval.upper == INFINITY;
+    mpq_clears(q, endpoint, NULL);
+    require(contained, message);
+}
+static void source_envelopes(void) {
+    LabInterval n = lab_source_number_interval("1", 1);
+    require(n.lower == 1 && n.upper == 1, "integer literal envelope stays exact");
+    n = lab_source_number_interval("9007199254740993", 9007199254740992.0);
+    encloses(n, "9007199254740993", "rounded large integer is enclosed");
+    n = lab_source_number_interval("18446744073709551615", 0x1p64);
+    encloses(n, "18446744073709551615", "unsigned integer endpoint conversion is safe");
+    n = lab_source_number_interval(".1", .1);
+    encloses(n, "1/10", "decimal literal enclosed independently of binary rounding");
+    n = lab_interval_multiply((LabInterval){1 + 0x1p-27, 1 + 0x1p-27},
+                              (LabInterval){1 - 0x1p-27, 1 - 0x1p-27});
+    encloses(n, "18014398509481983/18014398509481984", "FMA product tail enclosed");
+    n = lab_interval_add((LabInterval){DBL_MAX, DBL_MAX},
+                         (LabInterval){DBL_MAX, DBL_MAX});
+    require(n.lower == DBL_MAX && n.upper == INFINITY, "sum overflow widens outward");
+    n = lab_interval_multiply((LabInterval){0, 0}, (LabInterval){-INFINITY, INFINITY});
+    require(n.lower == 0 && n.upper == 0, "zero coefficient times unbounded box is zero");
+    n = lab_interval_divide((LabInterval){1, 1}, (LabInterval){-1, 1});
+    require(n.lower == -INFINITY && n.upper == INFINITY,
+            "uncertain denominator sign cannot tighten");
+    LabModel m = {0};
+    read_text(&m,
+        "NAME ENVELOPE\nROWS\n N O\n L R\nCOLUMNS\n x O 0 R .1\n x R .2\n"
+        "RHS\n b R .3\nRANGES\n g R -.2\nBOUNDS\n LO b x .1\n UP b x .3\nENDATA\n", 1);
+    require(m.envelope && m.envelope->complete && m.envelope->nnz == m.nnz,
+            "source envelope exists independently of exact provenance");
+    encloses(m.envelope->value[0], "3/10", "coalesced source coefficient enclosed");
+    encloses(m.envelope->row_lower[0], "1/10", "ranged lower source bound enclosed");
+    encloses(m.envelope->row_upper[0], "3/10", "ranged upper source bound enclosed");
+    encloses(m.envelope->col_lower[0], "1/10", "column lower source bound enclosed");
+    require(m.envelope->col_lower_source[0] == m.col_lower[0],
+            "envelope retains parsed bound identity for overlays");
+    lab_model_free(&m);
+    read_text(&m,
+        "NAME HIDDENA\nROWS\n N O\n G R\nCOLUMNS\n"
+        " x O 0 R 10000000000000001\n x R -10000000000000000\n"
+        "RHS\n b R 1\nBOUNDS\n UP b x 1\nENDATA\n", 1);
+    require(!m.exact && m.nnz == 1 && m.value[0] == 0 && m.envelope->complete,
+            "uncertain coalesced zero remains in the source CSC envelope");
+    encloses(m.envelope->value[0], "1", "lost nonzero source coefficient retained");
+    lab_model_free(&m);
+}
 int main(void) {
     decimal_parser();
     source_arithmetic();
@@ -295,6 +357,7 @@ int main(void) {
     original_source_evaluation();
     compensated_binary_evaluation();
     original_objective_coalescing();
+    source_envelopes();
     puts("Original-decimal provenance, exact arithmetic, topology and resource contracts passed.");
     return 0;
 }
