@@ -225,6 +225,10 @@ static int invalid_and_alias_cases(void) {
     LabLinear s = {0};
     CHECK(lab_linear_factorize(&s, 0, empty, NULL, NULL, 0) == 0);
     CHECK(lab_linear_solve(&s, NULL, NULL, 0) == 0);
+    LabLinearCSC empty_copy = {0};
+    CHECK(lab_linear_copy_csc(&s, &empty_copy) == 0);
+    CHECK(empty_copy.n == 0 && empty_copy.nnz == 0 && empty_copy.col_start[0] == 0);
+    lab_linear_csc_free(&empty_copy);
     const size_t start[] = {0, 1, 2}, rows[] = {0, 1};
     const double values[] = {1, 1};
     CHECK(lab_linear_factorize(&s, 2, start, rows, values, 0) == 0);
@@ -309,10 +313,24 @@ static int check_updated_known_point(LabLinear *s, const double *matrix, size_t 
     }
     double *retained = calloc(n * n, sizeof(double));
     CHECK(retained);
-    for (size_t j = 0; j < n; j++)
-        for (size_t k = s->col_start[j]; k < s->col_start[j + 1]; k++)
-            retained[s->row_index[k] * n + j] += s->value[k];
+    LabLinearCSC copy = {0};
+    size_t materializations = s->csc_materializations;
+    CHECK(lab_linear_copy_csc(s, &copy) == 0);
+    CHECK(copy.n == n && copy.nnz == s->nnz);
+    CHECK(s->csc_materializations == materializations + 1);
+    for (size_t j = 0; j < n; j++) {
+        size_t count;
+        const size_t *row;
+        const double *value;
+        CHECK(lab_linear_get_column(s, j, &count, &row, &value) == 0);
+        CHECK(count == copy.col_start[j + 1] - copy.col_start[j]);
+        CHECK(memcmp(row, copy.row_index + copy.col_start[j], count * sizeof(size_t)) == 0);
+        CHECK(memcmp(value, copy.value + copy.col_start[j], count * sizeof(double)) == 0);
+        for (size_t k = 0; k < count; k++)
+            retained[row[k] * n + j] += value[k];
+    }
     CHECK(memcmp(retained, matrix, n * n * sizeof(double)) == 0);
+    lab_linear_csc_free(&copy);
     free(retained);
     free(truth);
     free(rhs);
@@ -347,6 +365,15 @@ static int bounded_update_chains(void) {
                     memcpy(saved_direction, direction, sizeof direction);
                 }
                 size_t before = s.update_count, calls = s.solve_calls;
+                size_t copies = s.csc_materializations, entries = s.column_entries_copied;
+                size_t overlays = s.overlay_count;
+                const size_t *base_start = s.base_col_start, *base_row = s.base_row_index;
+                const double *base_value = s.base_value;
+                size_t new_count = 0;
+                for (size_t i = 0; i < N; i++)
+                    new_count += column[i] != 0;
+                if (step % 2)
+                    new_count = N;
                 int code;
                 if (step % 2) {
                     double reversed[N];
@@ -357,10 +384,14 @@ static int bounded_update_chains(void) {
                 } else
                     code = lab_linear_update_dense(&s, p, column, supplied ? direction : NULL);
                 CHECK(memcmp(copy, column, sizeof copy) == 0);
+                CHECK(s.csc_materializations == copies);
+                CHECK(s.base_col_start == base_start && s.base_row_index == base_row &&
+                      s.base_value == base_value);
                 if (supplied)
                     CHECK(memcmp(saved_direction, direction, sizeof direction) == 0);
                 if (before == LAB_LINEAR_UPDATE_LIMIT) {
                     CHECK(code == 1 && s.update_count == before && s.valid);
+                    CHECK(s.overlay_count == overlays && s.column_entries_copied == entries);
                     CHECK(strstr(s.error, "limit"));
                     CHECK(check_updated_known_point(&s, matrix, N) == 0);
                     for (size_t i = 0; i < N; i++)
@@ -371,6 +402,8 @@ static int bounded_update_chains(void) {
                     rebases++;
                 } else {
                     CHECK(code == 0 && s.update_count == before + 1 && s.valid);
+                    CHECK(s.column_entries_copied == entries + new_count);
+                    CHECK(s.overlay_count <= N && s.overlay_count <= s.update_count);
                     CHECK(s.solve_calls == calls + (size_t)!supplied);
                     CHECK(s.accepted_updates == s.update_count);
                     for (size_t i = 0; i < N; i++)
@@ -440,12 +473,9 @@ static int rejected_updates_preserve_basis(void) {
         CHECK(lab_linear_factorize(&s, 3, start, rows, identity, dense) == 0);
         const double column[] = {1, 1, 0};
         CHECK(lab_linear_update_dense(&s, 0, column, column) == 0);
-        size_t saved_start[4], saved_rows[4];
-        double saved_values[4];
         CHECK(s.nnz == 4);
-        memcpy(saved_start, s.col_start, sizeof saved_start);
-        memcpy(saved_rows, s.row_index, sizeof saved_rows);
-        memcpy(saved_values, s.value, sizeof saved_values);
+        LabLinearCSC saved = {0}, after = {0};
+        CHECK(lab_linear_copy_csc(&s, &saved) == 0);
         const double singular[] = {0, 1, 0}, wrong_direction[] = {2, 0, 0};
         const double weak_column[] = {1e-12, 1 + 1e-12, 0}, weak_direction[] = {1e-12, 1, 0};
         const double nonfinite[] = {NAN, 1, 0}, nonfinite_direction[] = {1, INFINITY, 0};
@@ -464,14 +494,29 @@ static int rejected_updates_preserve_basis(void) {
         int restored = fesetround(saved_round);
         CHECK(restored == 0 && code == -1);
         CHECK(s.valid && s.update_count == 1 && s.rejected_updates == 9);
-        CHECK(memcmp(saved_start, s.col_start, sizeof saved_start) == 0);
-        CHECK(memcmp(saved_rows, s.row_index, sizeof saved_rows) == 0);
-        CHECK(memcmp(saved_values, s.value, sizeof saved_values) == 0);
+        CHECK(lab_linear_copy_csc(&s, &after) == 0);
+        CHECK(after.n == saved.n && after.nnz == saved.nnz);
+        CHECK(memcmp(saved.col_start, after.col_start, 4 * sizeof(size_t)) == 0);
+        CHECK(memcmp(saved.row_index, after.row_index, saved.nnz * sizeof(size_t)) == 0);
+        CHECK(memcmp(saved.value, after.value, saved.nnz * sizeof(double)) == 0);
+        lab_linear_csc_free(&saved);
+        lab_linear_csc_free(&after);
         CHECK(check_updated_known_point(&s, matrix, 3) == 0);
-        /* Aliased sparse input is copied before the retained CSC is replaced. */
-        size_t count = s.col_start[1] - s.col_start[0];
-        CHECK(lab_linear_update(&s, 0, count, s.row_index, s.value, NULL) == 0);
+        /* Current-overlay input is copied before that overlay is replaced. */
+        size_t count;
+        const size_t *current_row;
+        const double *current_value;
+        CHECK(lab_linear_get_column(&s, 0, &count, &current_row, &current_value) == 0);
+        CHECK(lab_linear_update(&s, 0, count, current_row, current_value, NULL) == 0);
+        CHECK(s.overlay_count == 1);
         CHECK(check_updated_known_point(&s, matrix, 3) == 0);
+        /* Base-column alias remains valid across earlier overlays, and can
+         * restore the old column without modifying immutable base storage. */
+        CHECK(lab_linear_update(&s, 0, 1, s.base_row_index, s.base_value, NULL) == 0);
+        const double original[] = {1, 0, 0, 0, 1, 0, 0, 0, 1};
+        CHECK(check_updated_known_point(&s, original, 3) == 0);
+        CHECK(memcmp(s.base_value, identity, sizeof identity) == 0);
+        CHECK(s.overlay_count == 1 && s.nnz == 3);
         lab_linear_free(&s);
     }
     CHECK(lab_linear_update(NULL, 0, 0, NULL, NULL, NULL) == -1);
@@ -499,6 +544,8 @@ static int large_sparse_updates(void) {
         CHECK(lab_linear_update_dense(&s, p, column, NULL) == 0);
         CHECK(s.factor.sparse && s.factor.lu == NULL && s.factor.factor_nnz == n);
         CHECK(s.nnz == n + step + 1);
+        CHECK(s.base_nnz == n && s.column_entries_copied == 2 * (step + 1));
+        CHECK(s.csc_materializations == 0);
         for (int transpose = 0; transpose < 2; transpose++) {
             for (size_t i = 0; i < n; i++)
                 rhs[i] = 1;
@@ -514,7 +561,7 @@ static int large_sparse_updates(void) {
             CHECK(s.max_backward_error <= 1e-10);
         }
     }
-    CHECK(s.update_count == 3);
+    CHECK(s.update_count == 3 && s.csc_materializations == 0);
     lab_linear_free(&s);
     free(start);
     free(rows);
@@ -523,12 +570,102 @@ static int large_sparse_updates(void) {
     free(rhs);
     return 0;
 }
+static int column_overlay_accessors(void) {
+    const size_t start[] = {0, 1, 2, 3}, row[] = {0, 1, 2};
+    const double value[] = {2, 3, 4};
+    const size_t replacement_row[] = {2, 0, 1};
+    const double replacement_value[] = {.5, -.25, 5};
+    const double matrix[] = {2, -.25, 0, 0, 5, 0, 0, .5, 4};
+    for (int dense = 0; dense < 2; dense++) {
+        LabLinear s = {0};
+        CHECK(lab_linear_factorize(&s, 3, start, row, value, dense) == 0);
+        CHECK(lab_linear_update(&s, 1, 3, replacement_row, replacement_value, NULL) == 0);
+        CHECK(s.base_nnz == 3 && s.nnz == 5 && s.overlay_count == 1);
+        CHECK(s.column_entries_copied == 3 && s.csc_materializations == 0);
+        CHECK(memcmp(s.base_col_start, start, sizeof start) == 0);
+        CHECK(memcmp(s.base_row_index, row, sizeof row) == 0);
+        CHECK(memcmp(s.base_value, value, sizeof value) == 0);
+        size_t count;
+        const size_t *indices;
+        const double *coefficients;
+        CHECK(lab_linear_get_column(&s, 1, &count, &indices, &coefficients) == 0);
+        CHECK(count == 3 && indices != replacement_row && coefficients != replacement_value);
+        CHECK(memcmp(indices, replacement_row, sizeof replacement_row) == 0);
+        CHECK(memcmp(coefficients, replacement_value, sizeof replacement_value) == 0);
+        LabLinearCSC copy = {0};
+        CHECK(lab_linear_copy_csc(&s, &copy) == 0);
+        const size_t expected_start[] = {0, 1, 4, 5}, expected_row[] = {0, 2, 0, 1, 2};
+        const double expected_value[] = {2, .5, -.25, 5, 4};
+        CHECK(copy.n == 3 && copy.nnz == 5);
+        CHECK(memcmp(copy.col_start, expected_start, sizeof expected_start) == 0);
+        CHECK(memcmp(copy.row_index, expected_row, sizeof expected_row) == 0);
+        CHECK(memcmp(copy.value, expected_value, sizeof expected_value) == 0);
+        CHECK(s.csc_materializations == 1 && s.csc_materialized_entries == 5);
+        size_t *saved_start = copy.col_start, *saved_row = copy.row_index;
+        double *saved_value = copy.value;
+        CHECK(lab_linear_copy_csc(&s, &copy) == -1);
+        CHECK(copy.col_start == saved_start && copy.row_index == saved_row && copy.value == saved_value);
+        CHECK(s.csc_materializations == 1);
+        copy.value[0] = 99;
+        CHECK(lab_linear_get_column(&s, 0, &count, &indices, &coefficients) == 0);
+        CHECK(count == 1 && coefficients[0] == 2);
+        copy.value[0] = 2;
+        CHECK(lab_linear_get_column(&s, 3, &count, &indices, &coefficients) == -1);
+        CHECK(count == 0 && indices == NULL && coefficients == NULL);
+        CHECK(lab_linear_get_column(&s, 0, NULL, &indices, &coefficients) == -1);
+        CHECK(indices == NULL && coefficients == NULL);
+        CHECK(lab_linear_copy_csc(&s, NULL) == -1);
+        CHECK(lab_linear_get_column(&s, 1, &count, &indices, &coefficients) == 0);
+        CHECK(lab_linear_update(&s, 1, count, indices, coefficients, NULL) == 0);
+        CHECK(s.overlay_count == 1 && s.nnz == 5 && s.column_entries_copied == 6);
+        CHECK(s.csc_materializations == 1);
+        const size_t shorter_row[] = {1, 0};
+        const double shorter_value[] = {6, 0};
+        CHECK(lab_linear_update(&s, 1, 2, shorter_row, shorter_value, NULL) == 0);
+        CHECK(s.overlay_count == 1 && s.nnz == 4 && s.column_entries_copied == 8);
+        CHECK(s.csc_materializations == 1);
+        CHECK(lab_linear_get_column(&s, 1, &count, &indices, &coefficients) == 0);
+        CHECK(count == 2 && indices[0] == 1 && indices[1] == 0);
+        CHECK(coefficients[0] == 6 && coefficients[1] == 0);
+        const double shorter_matrix[] = {2, 0, 0, 0, 6, 0, 0, 0, 4};
+        CHECK(check_updated_known_point(&s, shorter_matrix, 3) == 0);
+        /* An owned copy survives both new overlays and refactorization. */
+        CHECK(memcmp(copy.value, expected_value, sizeof expected_value) == 0);
+        CHECK(lab_linear_factorize(&s, copy.n, copy.col_start, copy.row_index, copy.value, dense) == 0);
+        CHECK(s.overlay_count == 0 && s.update_count == 0 && s.base_nnz == 5);
+        CHECK(check_updated_known_point(&s, matrix, 3) == 0);
+        lab_linear_free(&s);
+        CHECK(memcmp(copy.value, expected_value, sizeof expected_value) == 0);
+        lab_linear_csc_free(&copy);
+        CHECK(!copy.n && !copy.nnz && !copy.col_start && !copy.row_index && !copy.value);
+        lab_linear_csc_free(&copy);
+    }
+    LabLinearCSC copy = {0};
+    CHECK(lab_linear_copy_csc(NULL, &copy) == -1);
+    CHECK(lab_linear_get_column(NULL, 0, NULL, NULL, NULL) == -1);
+    lab_linear_csc_free(NULL);
+    /* Base input still permits unsorted duplicate entries. Accessors and an
+     * owned round-trip retain their order instead of silently coalescing them. */
+    const size_t duplicate_start[] = {0, 3, 4}, duplicate_row[] = {1, 0, 0, 1};
+    const double duplicate_value[] = {.25, 1, 1, 2};
+    const double duplicate_matrix[] = {2, 0, .25, 2};
+    LabLinear s = {0};
+    CHECK(lab_linear_factorize(&s, 2, duplicate_start, duplicate_row, duplicate_value, 0) == 0);
+    CHECK(lab_linear_copy_csc(&s, &copy) == 0);
+    CHECK(copy.nnz == 4);
+    CHECK(memcmp(copy.row_index, duplicate_row, sizeof duplicate_row) == 0);
+    CHECK(memcmp(copy.value, duplicate_value, sizeof duplicate_value) == 0);
+    CHECK(check_updated_known_point(&s, duplicate_matrix, 2) == 0);
+    lab_linear_csc_free(&copy);
+    lab_linear_free(&s);
+    return 0;
+}
 int main(void) {
     if (randomized_scaled_known_solutions() || equilibration_extremes() ||
         genuine_refinement_regression() || invalid_and_alias_cases() ||
         product_roundoff_is_not_an_exact_residual() || rounding_mode_contract() ||
         bounded_update_chains() || scaled_update_units() || rejected_updates_preserve_basis() ||
-        large_sparse_updates())
+        large_sparse_updates() || column_overlay_accessors())
         return 1;
     puts("Linear equilibration/refinement/update contracts passed.");
     return 0;

@@ -35,13 +35,27 @@ static int failure(LabLinear *s, const char *message) {
     snprintf(s->error, sizeof s->error, "%s", message);
     return -1;
 }
+void lab_linear_csc_free(LabLinearCSC *copy) {
+    if (!copy)
+        return;
+    free(copy->col_start);
+    free(copy->row_index);
+    free(copy->value);
+    memset(copy, 0, sizeof *copy);
+}
 void lab_linear_free(LabLinear *s) {
     if (!s)
         return;
     lab_factor_free(&s->factor);
-    free(s->col_start);
-    free(s->row_index);
-    free(s->value);
+    free(s->base_col_start);
+    free(s->base_row_index);
+    free(s->base_value);
+    for (size_t i = 0; i < s->overlay_count; i++) {
+        free(s->overlay[i].row_index);
+        free(s->overlay[i].value);
+    }
+    free(s->overlay);
+    free(s->overlay_slot);
     free(s->row_exponent);
     free(s->col_exponent);
     for (size_t i = 0; i < s->update_count; i++)
@@ -49,6 +63,72 @@ void lab_linear_free(LabLinear *s) {
     free(s->eta_column);
     free(s->eta_value);
     memset(s, 0, sizeof *s);
+}
+static void current_column(const LabLinear *s, size_t column, size_t *count,
+                            const size_t **row, const double **value) {
+    size_t slot = s->overlay_slot ? s->overlay_slot[column] : 0;
+    if (slot) {
+        const LabLinearColumn *c = &s->overlay[slot - 1];
+        *count = c->nnz;
+        *row = c->row_index;
+        *value = c->value;
+    } else {
+        size_t start = s->base_col_start[column];
+        *count = s->base_col_start[column + 1] - start;
+        *row = s->base_row_index + start;
+        *value = s->base_value + start;
+    }
+}
+int lab_linear_get_column(const LabLinear *s, size_t column, size_t *count,
+                          const size_t **row, const double **value) {
+    if (count)
+        *count = 0;
+    if (row)
+        *row = NULL;
+    if (value)
+        *value = NULL;
+    if (!s || !s->valid || column >= s->n || !count || !row || !value)
+        return -1;
+    current_column(s, column, count, row, value);
+    return 0;
+}
+static size_t counter_add(size_t value, size_t increment) {
+    return value > SIZE_MAX - increment ? SIZE_MAX : value + increment;
+}
+int lab_linear_copy_csc(LabLinear *s, LabLinearCSC *copy) {
+    if (!s || !s->valid || !copy || copy->n || copy->nnz || copy->col_start ||
+        copy->row_index || copy->value)
+        return -1;
+    LabLinearCSC result = {.n = s->n, .nnz = s->nnz};
+    result.col_start = lab_alloc(s->n + 1, sizeof(size_t));
+    result.row_index = lab_alloc(s->nnz, sizeof(size_t));
+    result.value = lab_alloc(s->nnz, sizeof(double));
+    size_t at = 0;
+    for (size_t j = 0; j < s->n; j++) {
+        size_t count;
+        const size_t *row;
+        const double *value;
+        current_column(s, j, &count, &row, &value);
+        if (at > s->nnz || count > s->nnz - at) {
+            lab_linear_csc_free(&result);
+            return -1;
+        }
+        result.col_start[j] = at;
+        if (count) {
+            memcpy(result.row_index + at, row, count * sizeof(size_t));
+            memcpy(result.value + at, value, count * sizeof(double));
+        }
+        at += count;
+    }
+    if (at != s->nnz) {
+        lab_linear_csc_free(&result);
+        return -1;
+    }
+    result.col_start[s->n] = at;
+    *copy = result;
+    s->csc_materializations = counter_add(s->csc_materializations, 1);
+    s->csc_materialized_entries = counter_add(s->csc_materialized_entries, at);
+    return 0;
 }
 
 /* Keep a normal input coefficient normal after each scaling stage. This clips
@@ -98,16 +178,16 @@ int lab_linear_factorize_ex(LabLinear *s, size_t n, const size_t *start, const s
         if (row[k] >= n || !isfinite(value[k]))
             return failure(s, "Invalid original basis entry");
     s->n = n;
-    s->nnz = nnz;
-    s->col_start = lab_alloc(n + 1, sizeof(size_t));
-    s->row_index = lab_alloc(nnz, sizeof(size_t));
-    s->value = lab_alloc(nnz, sizeof(double));
+    s->nnz = s->base_nnz = nnz;
+    s->base_col_start = lab_alloc(n + 1, sizeof(size_t));
+    s->base_row_index = lab_alloc(nnz, sizeof(size_t));
+    s->base_value = lab_alloc(nnz, sizeof(double));
     s->row_exponent = lab_alloc(n, sizeof(int));
     s->col_exponent = lab_alloc(n, sizeof(int));
-    memcpy(s->col_start, start, (n + 1) * sizeof(size_t));
+    memcpy(s->base_col_start, start, (n + 1) * sizeof(size_t));
     if (nnz) {
-        memcpy(s->row_index, row, nnz * sizeof(size_t));
-        memcpy(s->value, value, nnz * sizeof(double));
+        memcpy(s->base_row_index, row, nnz * sizeof(size_t));
+        memcpy(s->base_value, value, nnz * sizeof(double));
     }
     double *scaled = lab_alloc(nnz, sizeof(double));
     double *smallest = lab_alloc(n, sizeof(double));
@@ -217,10 +297,14 @@ static int residual(const LabLinear *s, const double *rhs, const double *x, doub
         magnitude_add(&scale[i], &magnitude[i], rhs[i]);
     }
     int bad = 0;
-    for (size_t j = 0; j < n && !bad; j++)
-        for (size_t k = s->col_start[j]; k < s->col_start[j + 1]; k++) {
-            size_t i = s->row_index[k], destination = transpose ? j : i;
-            double a = s->value[k], b = x[transpose ? i : j];
+    for (size_t j = 0; j < n && !bad; j++) {
+        size_t count;
+        const size_t *row;
+        const double *value;
+        current_column(s, j, &count, &row, &value);
+        for (size_t k = 0; k < count; k++) {
+            size_t i = row[k], destination = transpose ? j : i;
+            double a = value[k], b = x[transpose ? i : j];
             double product = a * b;
             double product_error = fma(a, b, -product);
             if (!isfinite(product) || !isfinite(product_error) ||
@@ -231,6 +315,7 @@ static int residual(const LabLinear *s, const double *rhs, const double *x, doub
             }
             magnitude_add(&scale[destination], &magnitude[destination], product);
         }
+    }
     double worst = 0;
     for (size_t i = 0; i < n && !bad; i++) {
         r[i] += lo[i];
@@ -457,32 +542,26 @@ int lab_linear_update(LabLinear *s, size_t column, size_t count, const size_t *r
     for (size_t i = 0; i < n; i++)
         if (!isfinite(d[i] / d[column]))
             goto done;
-    size_t old_count = s->col_start[column + 1] - s->col_start[column];
+    size_t old_count;
+    const size_t *old_row;
+    const double *old_value;
+    current_column(s, column, &old_count, &old_row, &old_value);
     size_t nnz = s->nnz - old_count + count;
     message = "Updated basis storage limit requires refactorization";
     if (nnz > LINEAR_ENTRY_LIMIT)
         goto done;
-    /* Build a complete replacement CSC transactionally. Inputs may alias the
-     * retained old column; no old storage is released until all checks pass. */
-    size_t *start = lab_alloc(n + 1, sizeof(size_t));
-    size_t *rows = lab_alloc(nnz, sizeof(size_t));
-    double *values = lab_alloc(nnz, sizeof(double));
-    for (size_t j = 0; j < n; j++)
-        start[j + 1] = start[j] + (j == column ? count : s->col_start[j + 1] - s->col_start[j]);
-    size_t prefix = s->col_start[column], suffix = s->nnz - s->col_start[column + 1];
-    if (prefix) {
-        memcpy(rows, s->row_index, prefix * sizeof(size_t));
-        memcpy(values, s->value, prefix * sizeof(double));
-    }
+    /* Retain only the replacement column. The base CSC and other overlays
+     * stay untouched. Copy before releasing an old overlay because the input
+     * row/value arrays may be borrowed from either current or base storage. */
+    size_t *rows = lab_alloc(count, sizeof(size_t));
+    double *values = lab_alloc(count, sizeof(double));
     if (count) {
-        memcpy(rows + prefix, row, count * sizeof(size_t));
-        memcpy(values + prefix, value, count * sizeof(double));
+        memcpy(rows, row, count * sizeof(size_t));
+        memcpy(values, value, count * sizeof(double));
     }
-    if (suffix) {
-        memcpy(rows + prefix + count, s->row_index + s->col_start[column + 1],
-               suffix * sizeof(size_t));
-        memcpy(values + prefix + count, s->value + s->col_start[column + 1],
-               suffix * sizeof(double));
+    if (!s->overlay_slot) {
+        s->overlay_slot = lab_alloc(n, sizeof(unsigned char));
+        s->overlay = lab_alloc(LAB_LINEAR_UPDATE_LIMIT, sizeof(LabLinearColumn));
     }
     if (!s->eta_column) {
         s->eta_column = lab_alloc(LAB_LINEAR_UPDATE_LIMIT, sizeof(size_t));
@@ -493,13 +572,20 @@ int lab_linear_update(LabLinear *s, size_t column, size_t count, const size_t *r
     s->update_count++;
     s->accepted_updates++;
     d = NULL;
-    free(s->col_start);
-    free(s->row_index);
-    free(s->value);
-    s->col_start = start;
-    s->row_index = rows;
-    s->value = values;
+    size_t slot = s->overlay_slot[column];
+    if (!slot) {
+        slot = ++s->overlay_count;
+        s->overlay_slot[column] = (unsigned char)slot;
+    }
+    LabLinearColumn *replacement = &s->overlay[slot - 1];
+    free(replacement->row_index);
+    free(replacement->value);
+    replacement->column = column;
+    replacement->nnz = count;
+    replacement->row_index = rows;
+    replacement->value = values;
     s->nnz = nnz;
+    s->column_entries_copied = counter_add(s->column_entries_copied, count);
     s->error[0] = 0;
     status = 0;
 done:
