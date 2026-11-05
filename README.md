@@ -19,7 +19,8 @@ deterministic reliability-based pseudocost selection.
 The independent checker validates original-model witnesses, rational LP bounds
 and exact infeasibility certificates.
 
-See [original-unit primal recovery](docs/MILESTONE-2F.md),
+See [sparse basis updates and full-corpus coverage](docs/MILESTONE-2G.md),
+[original-unit primal recovery](docs/MILESTONE-2F.md),
 [pivot safeguards and infeasibility witnesses](docs/MILESTONE-2E.md),
 [numerical scaling and refinement](docs/MILESTONE-2D.md), and
 [the integer-search contract](docs/MILESTONE-2BC.md).
@@ -34,21 +35,28 @@ successful witnesses, numerical failures and capacity limits. The earlier
 
 The [autoresearch protocol](docs/AUTORESEARCH.md) starts only after every MILP
 problem in the existing benchmarks passes. That gate is not yet complete.
-The [full 240-instance v1 inventory](results/miplib-candidate-v1/inventory.json)
-records 209 unsupported cases, 31 time limits, seven independently checked
-incumbents and zero correctly completed instances. It is a development failure
-inventory, not a comparable timing campaign or evidence of a speed advantage.
-The [gate result](results/miplib-candidate-v1/gate.json) remains closed. The
+The [full 240-instance v2 inventory](results/miplib-candidate-v2/inventory.json)
+records zero unsupported cases, 235 time limits, five numerical stops, nine
+independently checked incumbents and zero correctly completed instances.
+All 240 attempts and all failures are retained. Concurrent engineering makes
+this development coverage evidence unsuitable for a speed ranking.
+The [gate result](results/miplib-candidate-v2/gate.json) remains closed. The
 subsequent performance target is at least 120 strict paired wins against HiGHS
 over the fixed 240-instance denominator under matched conditions.
 
-The current [Release contract log](results/milestone-2g-contracts-v1/release-ctest.log)
+The evaluated [Release contract log](results/milestone-2g-contracts-v1/release-ctest.log)
 passes all 22 suites. These retain the previous 18 suites and add presolve,
 branch selection, benchmark-gate and scalability contracts. All 22 suites also
 pass in the [sanitizer run](results/milestone-2g-contracts-v1/sanitizer-ctest.log).
 The tested engine is committed at `82c1355`; the earlier
 [18-suite Release and sanitizer evidence](results/primal-regressions-v1/final-validation.json)
 remains frozen and unchanged.
+The [fresh eight-model native crosscheck](results/mip-native-v6/summary.json)
+matches all 40 expected outcomes; all 35 feasible candidates pass independent
+checking. Later column-norm caching (`303d9bf`) and transactional column
+overlays (`4c02d7e`) also pass all 22 Release suites and their focused sanitizer
+checks. They were added after the frozen v2 campaign; its results do not
+measure those changes.
 
 Milestone 2A is preserved in [the original LP engine contract](docs/LP-ENGINE.md),
 [the lab's LP report](results/lp-native-v2/lab/summary.html), and

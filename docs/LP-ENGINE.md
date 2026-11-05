@@ -94,13 +94,18 @@ matching source/test hashes. The frozen
 [18-suite milestone-2F evidence](../results/primal-regressions-v1/final-validation.json)
 continues to describe its own Release and sanitizer builds.
 
-The [full 240-instance v1 inventory](../results/miplib-candidate-v1/inventory.json)
-records 209 unsupported cases, 31 time limits, seven independently checked
-incumbents and zero correctly completed problems. It used the earlier candidate
-at a two-second budget and is explicitly not a fair timing campaign. The
-[completion and paired-speed gate](../results/miplib-candidate-v1/gate.json)
-remains closed. Capacity guards and a large coupled core are separate blockers;
-new engineering requires a fresh versioned campaign, not edits to that inventory.
+The [full 240-instance v2 inventory](../results/miplib-candidate-v2/inventory.json)
+records zero unsupported cases, 235 time limits, five numerical stops, nine
+independently checked incumbents and zero correctly completed problems. It used
+frozen source `61a738c` with a two-second budget. Concurrent engineering makes
+it unsuitable for a timing ranking. The
+[completion and paired-speed gate](../results/miplib-candidate-v2/gate.json)
+remains closed. Subsequent structural-norm caching and current-column overlays
+are outside that frozen campaign. Their
+[22-suite Release run](../results/basis-overlays-contracts-v1/release-ctest.log)
+and [focused sanitizer checks](../results/basis-overlays-contracts-v1/sanitizer-ctest.log)
+pass; see [milestone 2G](MILESTONE-2G.md) for their separate validation scope.
+Further engineering requires a fresh versioned campaign.
 No performance advantage over HiGHS or other solvers is established.
 
 ## Frozen milestone-2A contract

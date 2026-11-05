@@ -44,12 +44,12 @@ distinct; individual LP certificates do not constitute a complete MILP tree proo
 Any budget change creates a fresh declared campaign, preserving earlier results.
 
 The gate is currently **not complete**. The frozen
-[full 240-instance v1 inventory](../results/miplib-candidate-v1/inventory.json)
-contains one attempt for every locked instance: 209 `unsupported`, 31
-`time_limit`, seven independently checked incumbents and zero correctly
-completed problems. Its [gate record](../results/miplib-candidate-v1/gate.json)
+[full 240-instance v2 inventory](../results/miplib-candidate-v2/inventory.json)
+contains one attempt for every locked instance: zero `unsupported`, 235
+`time_limit`, five `numerical_failure`, nine independently checked incumbents
+and zero correctly completed problems. Its [gate record](../results/miplib-candidate-v2/gate.json)
 has no missing instances and leaves both completion and speed gates closed.
-The inventory used a two-second budget at source revision `1feea17`, while
+The inventory used a two-second budget at source revision `61a738c`, while
 engineering ran concurrently. It is coverage and failure evidence, explicitly
 not a comparable timing campaign. The `=best=` reference for `supportcase22`
 also remains an unresolved expected-outcome policy; it cannot be promoted to a
@@ -57,7 +57,10 @@ known optimum. Passing unit tests or finding incumbents does not open the gate.
 
 Version 0.7 adds singleton peeling, guarded basis updates, larger finite sparse
 capacity guards, source-aware root propagation and learned branch ranking.
-These ordinary engineering changes require new versioned full-corpus evidence.
+The [earlier v1 inventory](../results/miplib-candidate-v1/inventory.json) retains
+its 209 size-cap stops and 31 time limits. The v2 archive and evaluator hashes
+are unchanged; subsequent column-norm caching and column overlays are outside
+its evaluated source. Every subsequent candidate requires fresh evidence.
 The capacity guard and the cost of factoring a large remaining coupled core
 are separate blockers. Larger allowed dimensions do not establish completion,
 memory feasibility or a speed advantage. The earlier
@@ -72,7 +75,7 @@ correct completion and independently checked candidate witnesses. The
 denominator remains 240: unsupported cases, limits, invalid candidates and
 ties cannot become strict wins or be removed to improve the fraction. An
 unmatched or concurrently disturbed development run cannot satisfy this paired
-speed gate. No speed claim is made by the v1 inventory or the 0.7 contract tests.
+speed gate. No speed claim is made by either inventory or the 0.7 contract tests.
 
 ## One-paper, one-idea cycle after the gate
 
