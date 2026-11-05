@@ -288,11 +288,248 @@ static int rounding_mode_contract(void) {
     CHECK(fegetround() == saved);
     return 0;
 }
+static int check_updated_known_point(LabLinear *s, const double *matrix, size_t n) {
+    double *truth = malloc(n * sizeof(double)), *rhs = malloc(n * sizeof(double));
+    double *x = malloc(n * sizeof(double));
+    CHECK(truth && rhs && x);
+    for (size_t i = 0; i < n; i++)
+        truth[i] = ((double)(i % 9) - 4) / 4;
+    for (int transpose = 0; transpose < 2; transpose++) {
+        for (size_t i = 0; i < n; i++) {
+            rhs[i] = 0;
+            for (size_t j = 0; j < n; j++)
+                rhs[i] += (transpose ? matrix[j * n + i] : matrix[i * n + j]) * truth[j];
+        }
+        CHECK(lab_linear_solve(s, rhs, x, transpose) == 0);
+        CHECK(close_vector(x, truth, n));
+        CHECK(s->max_backward_error <= 1e-10);
+        CHECK(lab_linear_solve(s, rhs, rhs, transpose) == 0);
+        CHECK(close_vector(rhs, truth, n));
+        CHECK(s->max_backward_error <= 1e-10);
+    }
+    double *retained = calloc(n * n, sizeof(double));
+    CHECK(retained);
+    for (size_t j = 0; j < n; j++)
+        for (size_t k = s->col_start[j]; k < s->col_start[j + 1]; k++)
+            retained[s->row_index[k] * n + j] += s->value[k];
+    CHECK(memcmp(retained, matrix, n * n * sizeof(double)) == 0);
+    free(retained);
+    free(truth);
+    free(rhs);
+    free(x);
+    return 0;
+}
+static int bounded_update_chains(void) {
+    enum { N = 7, STEPS = 110 };
+    for (int dense = 0; dense < 2; dense++)
+        for (int scaling = 0; scaling < 2; scaling++) {
+            double matrix[N * N] = {0}, values[N * N], initial[N * N], column[N], copy[N];
+            double direction[N], saved_direction[N];
+            size_t start[N + 1], row[N * N], update_rows[N];
+            for (size_t i = 0; i < N; i++)
+                matrix[i * N + i] = 8;
+            size_t initial_nnz = csc(matrix, N, start, row, values);
+            memcpy(initial, values, initial_nnz * sizeof(double));
+            LabLinear s = {0};
+            CHECK(lab_linear_factorize_ex(&s, N, start, row, values, dense, scaling, 1) == 0);
+            size_t rebases = 0, accepted = 0;
+            for (size_t step = 0; step < STEPS; step++) {
+                size_t p = (step * 3 + 1) % N;
+                for (size_t i = 0; i < N; i++) {
+                    column[i] = i == p ? 8 + (double)(step % 4) / 4
+                                      : ((double)((i + 2 * step) % 5) - 2) / 16;
+                    update_rows[i] = N - 1 - i;
+                }
+                memcpy(copy, column, sizeof copy);
+                int supplied = (step % 3) != 0;
+                if (supplied) {
+                    CHECK(lab_linear_solve(&s, column, direction, 0) == 0);
+                    memcpy(saved_direction, direction, sizeof direction);
+                }
+                size_t before = s.update_count, calls = s.solve_calls;
+                int code;
+                if (step % 2) {
+                    double reversed[N];
+                    for (size_t i = 0; i < N; i++)
+                        reversed[i] = column[update_rows[i]];
+                    code = lab_linear_update(&s, p, N, update_rows, reversed,
+                                             supplied ? direction : NULL);
+                } else
+                    code = lab_linear_update_dense(&s, p, column, supplied ? direction : NULL);
+                CHECK(memcmp(copy, column, sizeof copy) == 0);
+                if (supplied)
+                    CHECK(memcmp(saved_direction, direction, sizeof direction) == 0);
+                if (before == LAB_LINEAR_UPDATE_LIMIT) {
+                    CHECK(code == 1 && s.update_count == before && s.valid);
+                    CHECK(strstr(s.error, "limit"));
+                    CHECK(check_updated_known_point(&s, matrix, N) == 0);
+                    for (size_t i = 0; i < N; i++)
+                        matrix[i * N + p] = column[i];
+                    csc(matrix, N, start, row, values);
+                    CHECK(lab_linear_factorize_ex(&s, N, start, row, values, dense, scaling, 1) == 0);
+                    CHECK(s.update_count == 0);
+                    rebases++;
+                } else {
+                    CHECK(code == 0 && s.update_count == before + 1 && s.valid);
+                    CHECK(s.solve_calls == calls + (size_t)!supplied);
+                    CHECK(s.accepted_updates == s.update_count);
+                    for (size_t i = 0; i < N; i++)
+                        matrix[i * N + p] = column[i];
+                    accepted++;
+                }
+                CHECK(s.factor.sparse == !dense);
+                CHECK(check_updated_known_point(&s, matrix, N) == 0);
+                if (step < LAB_LINEAR_UPDATE_LIMIT)
+                    CHECK(memcmp(initial, values, initial_nnz * sizeof(double)) == 0);
+            }
+            CHECK(rebases == STEPS / (LAB_LINEAR_UPDATE_LIMIT + 1));
+            CHECK(accepted + rebases == STEPS);
+            lab_linear_free(&s);
+        }
+    return 0;
+}
+static int scaled_update_units(void) {
+    enum { N = 3 };
+    const size_t permutation[] = {2, 0, 1};
+    const int exponent[] = {-700, 500, 100};
+    for (int dense = 0; dense < 2; dense++) {
+        double matrix[N * N] = {0}, value[N * N], column[N], rhs[N], expected[N], x[N];
+        size_t start[N + 1], row[N * N];
+        for (size_t j = 0; j < N; j++)
+            matrix[permutation[j] * N + j] = scalbn(1, exponent[j]);
+        csc(matrix, N, start, row, value);
+        LabLinear s = {0};
+        CHECK(lab_linear_factorize(&s, N, start, row, value, dense) == 0);
+        int original_row[N], original_col[N];
+        memcpy(original_row, s.row_exponent, sizeof original_row);
+        memcpy(original_col, s.col_exponent, sizeof original_col);
+        for (size_t step = 0; step < 18; step++) {
+            size_t p = step % N;
+            for (size_t i = 0; i < N; i++)
+                column[i] = matrix[i * N + p] * (step % 2 ? .5 : 2);
+            CHECK(lab_linear_update_dense(&s, p, column, NULL) == 0);
+            for (size_t i = 0; i < N; i++)
+                matrix[i * N + p] = column[i];
+            CHECK(memcmp(original_row, s.row_exponent, sizeof original_row) == 0);
+            CHECK(memcmp(original_col, s.col_exponent, sizeof original_col) == 0);
+            for (int transpose = 0; transpose < 2; transpose++) {
+                const int point_exponent[] = {300, -200, -50};
+                for (size_t i = 0; i < N; i++)
+                    expected[i] = scalbn(i % 2 ? -1 : 1, point_exponent[i]);
+                for (size_t i = 0; i < N; i++) {
+                    rhs[i] = 0;
+                    for (size_t j = 0; j < N; j++)
+                        rhs[i] += (transpose ? matrix[j * N + i] : matrix[i * N + j]) * expected[j];
+                }
+                CHECK(lab_linear_solve(&s, rhs, x, transpose) == 0);
+                CHECK(close_vector(x, expected, N));
+                CHECK(s.max_backward_error <= 1e-10);
+            }
+        }
+        CHECK(s.update_count == 18);
+        lab_linear_free(&s);
+    }
+    return 0;
+}
+static int rejected_updates_preserve_basis(void) {
+    const size_t start[] = {0, 1, 2, 3}, rows[] = {0, 1, 2};
+    const double identity[] = {1, 1, 1};
+    const double matrix[] = {1, 0, 0, 1, 1, 0, 0, 0, 1};
+    for (int dense = 0; dense < 2; dense++) {
+        LabLinear s = {0};
+        CHECK(lab_linear_factorize(&s, 3, start, rows, identity, dense) == 0);
+        const double column[] = {1, 1, 0};
+        CHECK(lab_linear_update_dense(&s, 0, column, column) == 0);
+        size_t saved_start[4], saved_rows[4];
+        double saved_values[4];
+        CHECK(s.nnz == 4);
+        memcpy(saved_start, s.col_start, sizeof saved_start);
+        memcpy(saved_rows, s.row_index, sizeof saved_rows);
+        memcpy(saved_values, s.value, sizeof saved_values);
+        const double singular[] = {0, 1, 0}, wrong_direction[] = {2, 0, 0};
+        const double weak_column[] = {1e-12, 1 + 1e-12, 0}, weak_direction[] = {1e-12, 1, 0};
+        const double nonfinite[] = {NAN, 1, 0}, nonfinite_direction[] = {1, INFINITY, 0};
+        const size_t duplicate_rows[] = {0, 0}, outside_row[] = {3};
+        CHECK(lab_linear_update_dense(&s, 0, singular, NULL) == 1);
+        CHECK(lab_linear_update_dense(&s, 0, weak_column, weak_direction) == 1);
+        CHECK(lab_linear_update_dense(&s, 0, column, wrong_direction) == 1);
+        CHECK(lab_linear_update_dense(&s, 0, nonfinite, NULL) == -1);
+        CHECK(lab_linear_update_dense(&s, 0, column, nonfinite_direction) == -1);
+        CHECK(lab_linear_update_dense(&s, 3, column, NULL) == -1);
+        CHECK(lab_linear_update(&s, 0, 2, duplicate_rows, identity, NULL) == -1);
+        CHECK(lab_linear_update(&s, 0, 1, outside_row, identity, NULL) == -1);
+        int saved_round = fegetround();
+        CHECK(fesetround(FE_UPWARD) == 0);
+        int code = lab_linear_update_dense(&s, 0, column, NULL);
+        int restored = fesetround(saved_round);
+        CHECK(restored == 0 && code == -1);
+        CHECK(s.valid && s.update_count == 1 && s.rejected_updates == 9);
+        CHECK(memcmp(saved_start, s.col_start, sizeof saved_start) == 0);
+        CHECK(memcmp(saved_rows, s.row_index, sizeof saved_rows) == 0);
+        CHECK(memcmp(saved_values, s.value, sizeof saved_values) == 0);
+        CHECK(check_updated_known_point(&s, matrix, 3) == 0);
+        /* Aliased sparse input is copied before the retained CSC is replaced. */
+        size_t count = s.col_start[1] - s.col_start[0];
+        CHECK(lab_linear_update(&s, 0, count, s.row_index, s.value, NULL) == 0);
+        CHECK(check_updated_known_point(&s, matrix, 3) == 0);
+        lab_linear_free(&s);
+    }
+    CHECK(lab_linear_update(NULL, 0, 0, NULL, NULL, NULL) == -1);
+    CHECK(lab_linear_update_dense(NULL, 0, NULL, NULL) == -1);
+    return 0;
+}
+static int large_sparse_updates(void) {
+    const size_t n = 12000;
+    size_t *start = malloc((n + 1) * sizeof(size_t)), *rows = malloc(n * sizeof(size_t));
+    double *values = malloc(n * sizeof(double)), *column = calloc(n, sizeof(double));
+    double *rhs = malloc(n * sizeof(double));
+    CHECK(start && rows && values && column && rhs);
+    for (size_t i = 0; i < n; i++) {
+        start[i] = rows[i] = i;
+        values[i] = 1;
+    }
+    start[n] = n;
+    LabLinear s = {0};
+    CHECK(lab_linear_factorize(&s, n, start, rows, values, 0) == 0);
+    for (size_t step = 0; step < 3; step++) {
+        size_t p = step * 4000;
+        memset(column, 0, n * sizeof(double));
+        column[p] = 2;
+        column[p + 1] = .25;
+        CHECK(lab_linear_update_dense(&s, p, column, NULL) == 0);
+        CHECK(s.factor.sparse && s.factor.lu == NULL && s.factor.factor_nnz == n);
+        CHECK(s.nnz == n + step + 1);
+        for (int transpose = 0; transpose < 2; transpose++) {
+            for (size_t i = 0; i < n; i++)
+                rhs[i] = 1;
+            for (size_t j = 0; j <= step; j++) {
+                size_t q = j * 4000;
+                rhs[q] = transpose ? 2.25 : 2;
+                if (!transpose)
+                    rhs[q + 1] = 1.25;
+            }
+            CHECK(lab_linear_solve(&s, rhs, rhs, transpose) == 0);
+            for (size_t i = 0; i < n; i++)
+                CHECK(fabs(rhs[i] - 1) <= 1e-12);
+            CHECK(s.max_backward_error <= 1e-10);
+        }
+    }
+    CHECK(s.update_count == 3);
+    lab_linear_free(&s);
+    free(start);
+    free(rows);
+    free(values);
+    free(column);
+    free(rhs);
+    return 0;
+}
 int main(void) {
     if (randomized_scaled_known_solutions() || equilibration_extremes() ||
         genuine_refinement_regression() || invalid_and_alias_cases() ||
-        product_roundoff_is_not_an_exact_residual() || rounding_mode_contract())
+        product_roundoff_is_not_an_exact_residual() || rounding_mode_contract() ||
+        bounded_update_chains() || scaled_update_units() || rejected_updates_preserve_basis() ||
+        large_sparse_updates())
         return 1;
-    puts("Linear equilibration/refinement contracts passed.");
+    puts("Linear equilibration/refinement/update contracts passed.");
     return 0;
 }

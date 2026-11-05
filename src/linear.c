@@ -43,6 +43,10 @@ void lab_linear_free(LabLinear *s) {
     free(s->value);
     free(s->row_exponent);
     free(s->col_exponent);
+    for (size_t i = 0; i < s->update_count; i++)
+        free(s->eta_value[i]);
+    free(s->eta_column);
+    free(s->eta_value);
     memset(s, 0, sizeof *s);
 }
 
@@ -239,7 +243,7 @@ static int residual(const LabLinear *s, const double *rhs, const double *x, doub
     *error = bad ? INFINITY : worst;
     return bad ? -1 : 0;
 }
-static int raw_solve(LabLinear *s, const double *rhs, double *x, int transpose) {
+static int base_solve(LabLinear *s, const double *rhs, double *x, int transpose) {
     size_t n = s->n;
     double *scaled_rhs = lab_alloc(n, sizeof(double));
     double *y = lab_alloc(n, sizeof(double));
@@ -262,6 +266,67 @@ static int raw_solve(LabLinear *s, const double *rhs, double *x, int transpose) 
     free(scaled_rhs);
     free(y);
     return bad ? -1 : 0;
+}
+/* B_new = B_old E, with E equal to the identity except for column p=d.
+ * E^-1 v uses x_p=v_p/d_p and x_i=v_i-d_i*x_p. E^-T only changes
+ * component p: x_p=(v_p-sum_(i!=p) d_i*v_i)/d_p. The normal chain is
+ * chronological after the base solve; the transpose chain is reversed before
+ * the base transpose solve. All eta vectors use original basis coordinates. */
+static int eta_solve(const LabLinear *s, size_t update, double *x, int transpose) {
+    size_t p = s->eta_column[update];
+    const double *d = s->eta_value[update];
+    double numerator = x[p], tail = 0;
+    if (transpose) {
+        for (size_t i = 0; i < s->n; i++) {
+            if (i == p)
+                continue;
+            double product = d[i] * x[i];
+            double error = fma(d[i], x[i], -product);
+            if (!isfinite(product) || !isfinite(error) ||
+                (d[i] != 0 && x[i] != 0 && product == 0) ||
+                add(&numerator, &tail, -product) || add(&numerator, &tail, -error))
+                return -1;
+        }
+        numerator += tail;
+    }
+    double pivot_value = numerator / d[p];
+    if (!isfinite(pivot_value) || (numerator != 0 && pivot_value == 0))
+        return -1;
+    if (!transpose)
+        for (size_t i = 0; i < s->n; i++) {
+            if (i == p)
+                continue;
+            double value = fma(-d[i], pivot_value, x[i]);
+            if (!isfinite(value) ||
+                (x[i] == 0 && d[i] != 0 && pivot_value != 0 && value == 0))
+                return -1;
+            x[i] = value;
+        }
+    x[p] = pivot_value;
+    return 0;
+}
+static int raw_solve(LabLinear *s, const double *rhs, double *x, int transpose) {
+    if (!transpose) {
+        if (base_solve(s, rhs, x, 0))
+            return -1;
+        for (size_t i = 0; i < s->update_count; i++)
+            if (eta_solve(s, i, x, 0))
+                return -1;
+        return 0;
+    }
+    double *work = lab_alloc(s->n, sizeof(double));
+    if (s->n)
+        memcpy(work, rhs, s->n * sizeof(double));
+    int failed = 0;
+    for (size_t i = s->update_count; i-- > 0;)
+        if (eta_solve(s, i, work, 1)) {
+            failed = 1;
+            break;
+        }
+    if (!failed)
+        failed = base_solve(s, work, x, 1);
+    free(work);
+    return failed ? -1 : 0;
 }
 int lab_linear_solve(LabLinear *s, const double *rhs, double *x, int transpose) {
     s->solve_calls++;
@@ -326,4 +391,137 @@ done:
     free(correction);
     free(candidate);
     return failed ? -1 : 0;
+}
+
+static int update_failure(LabLinear *s, const char *message, int status) {
+    if (s) {
+        s->rejected_updates++;
+        failure(s, message);
+    }
+    return status;
+}
+int lab_linear_update(LabLinear *s, size_t column, size_t count, const size_t *row,
+                      const double *value, const double *direction) {
+    if (!s)
+        return -1;
+    s->error[0] = 0;
+    if (fegetround() != FE_TONEAREST)
+        return update_failure(s, "Linear update requires round-to-nearest", -1);
+    if (!s->valid || column >= s->n || count > s->n || (count && (!row || !value)))
+        return update_failure(s, "Invalid basis update dimensions or storage", -1);
+    if (s->update_count >= LAB_LINEAR_UPDATE_LIMIT)
+        return update_failure(s, "Basis update limit requires refactorization", 1);
+    size_t n = s->n;
+    double *new_column = lab_alloc(n, sizeof(double));
+    unsigned char *seen = lab_alloc(n, sizeof(unsigned char));
+    double *d = lab_alloc(n, sizeof(double));
+    double *work = lab_alloc(n, sizeof(double));
+    int status = -1;
+    const char *message = "Invalid or duplicate basis update entry";
+    for (size_t i = 0; i < count; i++) {
+        if (row[i] >= n || seen[row[i]] || !isfinite(value[i]))
+            goto done;
+        seen[row[i]] = 1;
+        new_column[row[i]] = value[i];
+    }
+    if (direction) {
+        for (size_t i = 0; i < n; i++) {
+            if (!isfinite(direction[i])) {
+                message = "Nonfinite basis update direction";
+                goto done;
+            }
+            d[i] = direction[i];
+        }
+    } else if (lab_linear_solve(s, new_column, d, 0)) {
+        status = 1;
+        message = "Basis update direction requires refactorization";
+        goto done;
+    }
+    double error;
+    status = 1;
+    message = "Inaccurate basis update direction requires refactorization";
+    /* A stricter local target leaves room for accumulation across the bounded
+     * chain; every subsequent solve still checks the unchanged 1e-10 guard. */
+    if (residual(s, new_column, d, work, 0, &error) || error > 1e-12)
+        goto done;
+    double largest = 0;
+    for (size_t i = 0; i < n; i++)
+        largest = fmax(largest, fabs(d[i]));
+    message = "Weak basis update pivot requires refactorization";
+    if (largest == 0 || d[column] == 0 || fabs(d[column]) < 1e-8 * largest ||
+        !isfinite(1 / d[column]))
+        goto done;
+    for (size_t i = 0; i < n; i++)
+        if (!isfinite(d[i] / d[column]))
+            goto done;
+    size_t old_count = s->col_start[column + 1] - s->col_start[column];
+    size_t nnz = s->nnz - old_count + count;
+    message = "Updated basis storage limit requires refactorization";
+    if (nnz > LINEAR_ENTRY_LIMIT)
+        goto done;
+    /* Build a complete replacement CSC transactionally. Inputs may alias the
+     * retained old column; no old storage is released until all checks pass. */
+    size_t *start = lab_alloc(n + 1, sizeof(size_t));
+    size_t *rows = lab_alloc(nnz, sizeof(size_t));
+    double *values = lab_alloc(nnz, sizeof(double));
+    for (size_t j = 0; j < n; j++)
+        start[j + 1] = start[j] + (j == column ? count : s->col_start[j + 1] - s->col_start[j]);
+    size_t prefix = s->col_start[column], suffix = s->nnz - s->col_start[column + 1];
+    if (prefix) {
+        memcpy(rows, s->row_index, prefix * sizeof(size_t));
+        memcpy(values, s->value, prefix * sizeof(double));
+    }
+    if (count) {
+        memcpy(rows + prefix, row, count * sizeof(size_t));
+        memcpy(values + prefix, value, count * sizeof(double));
+    }
+    if (suffix) {
+        memcpy(rows + prefix + count, s->row_index + s->col_start[column + 1],
+               suffix * sizeof(size_t));
+        memcpy(values + prefix + count, s->value + s->col_start[column + 1],
+               suffix * sizeof(double));
+    }
+    if (!s->eta_column) {
+        s->eta_column = lab_alloc(LAB_LINEAR_UPDATE_LIMIT, sizeof(size_t));
+        s->eta_value = lab_alloc(LAB_LINEAR_UPDATE_LIMIT, sizeof(double *));
+    }
+    s->eta_column[s->update_count] = column;
+    s->eta_value[s->update_count] = d;
+    s->update_count++;
+    s->accepted_updates++;
+    d = NULL;
+    free(s->col_start);
+    free(s->row_index);
+    free(s->value);
+    s->col_start = start;
+    s->row_index = rows;
+    s->value = values;
+    s->nnz = nnz;
+    s->error[0] = 0;
+    status = 0;
+done:
+    free(new_column);
+    free(seen);
+    free(d);
+    free(work);
+    return status ? update_failure(s, message, status) : 0;
+}
+int lab_linear_update_dense(LabLinear *s, size_t column, const double *new_column,
+                            const double *direction) {
+    if (!s)
+        return -1;
+    if (!s->valid || column >= s->n || !new_column)
+        return update_failure(s, "Invalid dense basis update state or vector", -1);
+    size_t *row = lab_alloc(s->n, sizeof(size_t));
+    double *value = lab_alloc(s->n, sizeof(double));
+    size_t count = 0;
+    for (size_t i = 0; i < s->n; i++)
+        if (new_column[i] != 0) {
+            row[count] = i;
+            value[count++] = new_column[i];
+        }
+    int status = lab_linear_update(s, column, count, row, value, direction);
+    free(row);
+    free(value);
+    return status;
 }
