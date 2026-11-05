@@ -46,11 +46,13 @@ def report(root,runs_file='runs.jsonl',prefix='summary'):
     parts.append('<table><tr><th>Solver</th><th>Attempts</th><th>Passed checker</th><th>Reached reference</th><th>Certified LP bounds</th><th>Certified optima</th><th>Invalid candidates</th><th>Checker errors</th><th>Claimed statuses</th><th>Solver wall seconds</th></tr>')
     for name,s in summary.items():parts.append('<tr>'+''.join(f'<td>{E(x)}</td>' for x in [name,s['attempts'],s['checked_feasible'],s['reached_reference'],s['certified_lp_bounds'],s['certified_optima'],s['invalid_candidates'],s['checker_errors'],s['claimed_statuses'],round(s['total_solver_wall_s'],2)])+'</tr>')
     parts.append('</table><p>Reference matching: absolute 1e-4 + relative 1e-9, for pinned =opt= records only. No comparisons use a solver unvalidated dual bound as truth. All failures and missing candidates remain in the table.</p>')
-    parts.append('<h2>Individual runs</h2><p>Run status includes process failures; solver report preserves the parsed status before process overrides. Raw exits and signals remain in each record.</p><table><tr><th>Instance</th><th>Solver</th><th>Run status</th><th>Solver report</th><th>Checker</th><th>Checked objective</th><th>Certified LP bound</th><th>Reference reached</th><th>Wall seconds</th><th>Evidence</th></tr>')
+    parts.append('<h2>Individual runs</h2><p>Run status includes process outcomes and explicit terminal solution-header refinements. Solver report preserves the parsed log status and any separate solution status. Raw claims, exits and signals remain in each record.</p><table><tr><th>Instance</th><th>Solver</th><th>Run status</th><th>Solver report</th><th>Checker</th><th>Checked objective</th><th>Certified LP bound</th><th>Reference reached</th><th>Wall seconds</th><th>Evidence</th></tr>')
     for r in details:
         relative_run=f'{r["instance"]}/{r["solver"]}/seed-{r["seed"]}'
         bound=r['checker'].get('certified_bound') if r['checker'].get('bound_status')=='valid' else None
-        values=[r['instance'],r['solver'],r['claimed_status'],r.get('reported_solver_status'),r['checker']['status'],r['validated_objective_decimal'],bound,r['reached_reference'],round(r['wall_s'],4)]
+        reported=r.get('reported_solver_status')
+        if r.get('reported_solution_status'):reported=str(reported)+' / solution: '+r['reported_solution_status']
+        values=[r['instance'],r['solver'],r['claimed_status'],reported,r['checker']['status'],r['validated_objective_decimal'],bound,r['reached_reference'],round(r['wall_s'],4)]
         validation=f' / <a href="{E(relative_run)}/{E(r["revalidation"].get("record","checker-revalidated.json"))}">validation</a>' if 'revalidation' in r else ''
         if r.get('dual_file'):validation+=f' / <a href="{E(relative_run)}/dual.sol">dual</a>'
         parts.append('<tr>'+''.join(f'<td>{E(x)}</td>' for x in values)+f'<td><a href="{E(relative_run)}/run.json">record</a> / <a href="{E(relative_run)}/solver.log">log</a>{validation}</td></tr>')

@@ -80,6 +80,10 @@ The lab's separately checked certified_bound field is distinct from a solver's
 reported_dual_bound. The raw reported_solver_status is also distinct from the
 effective claimed_status, which can be process_error after a nonzero exit.
 Raw exit codes and signals are preserved even when a retained witness validates.
+Cbc's explicit terminal solution header can refine an unknown/ambiguous log
+status only after a clean process exit. Both reports and their source remain
+recorded. Conflicting explicit claims become unknown; timeouts, signals and
+nonzero exits keep priority. Reference objectives never influence status parsing.
 Reference matching uses 1e-4 absolute + 1e-9 relative error on =opt= objectives.
 It is not an optimality certificate. Contradictions remain visible in reports.
 Reference metadata can be revised upstream; upgrades require a new lock

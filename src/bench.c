@@ -401,6 +401,51 @@ static int cbc_lp_optimal_line(const char *line) {
         ++end;
     return !*end;
 }
+/* Cbc sometimes omits a terminal result block after preprocessing, but writes
+ * a more specific status in the first line of its native solution file. This
+ * is another solver report, never an independent feasibility/proof result. */
+static const char *cbc_solution_status(const char *path) {
+    FILE *f = fopen(path, "r");
+    if (!f)
+        return NULL;
+    char line[16384];
+    int have = fgets(line, sizeof line, f) != NULL;
+    int bad = ferror(f);
+    fclose(f);
+    if (!have || bad || (strlen(line) == sizeof line - 1 && !strchr(line, '\n')))
+        return NULL;
+    static const char *header[] = {"Optimal", "Infeasible", "Integer infeasible", "Unbounded"};
+    static const char *status[] = {"optimal", "infeasible", "infeasible", "unbounded"};
+    for (size_t i = 0; i < sizeof header / sizeof *header; i++) {
+        size_t n = strlen(header[i]);
+        if (strncmp(line, header[i], n))
+            continue;
+        const char *tail = line + n;
+        if (!strncmp(tail, " - objective value ", 19)) {
+            tail += 19;
+            char *end;
+            double objective = strtod(tail, &end);
+            if (end == tail || !isfinite(objective))
+                return NULL;
+            tail = end;
+        }
+        while (isspace((unsigned char)*tail))
+            tail++;
+        if (!*tail)
+            return status[i];
+    }
+    return NULL;
+}
+static int cbc_report_conflict(const char *log_status, const char *solution_status) {
+    if (!solution_status)
+        return 0;
+    if (!strcmp(log_status, "lp_unbounded"))
+        return strcmp(solution_status, "unbounded") != 0;
+    if (strcmp(log_status, "optimal") && strcmp(log_status, "infeasible") &&
+        strcmp(log_status, "unbounded"))
+        return 0;
+    return strcmp(log_status, solution_status) != 0;
+}
 static const char *status_from_log(const char *solver, const char *path, Process p,
                                    const char **reported, char bound[128]) {
     *reported = "unknown";
@@ -469,6 +514,12 @@ static const char *status_from_log(const char *solver, const char *path, Process
                 status = "lp_unbounded";
             else if (strstr(line, "Result - Stopped on time limit"))
                 status = "time_limit";
+            else if (!strncmp(line, "Pre-processing says infeasible or unbounded",
+                              sizeof("Pre-processing says infeasible or unbounded") - 1) &&
+                     (line[sizeof("Pre-processing says infeasible or unbounded") - 1] == 0 ||
+                      isspace((unsigned char)
+                                  line[sizeof("Pre-processing says infeasible or unbounded") - 1])))
+                status = "infeasible_or_unbounded";
         }
         char *start = NULL;
         if (!strcmp(solver, "highs"))
@@ -691,6 +742,23 @@ static void one(const Instance *inst, const Solver *s, const char *checker, cons
     char bound[128];
     const char *reported;
     const char *claimed = status_from_log(s->name, log, p, &reported, bound);
+    const char *solution_status = !strcmp(s->name, "cbc") ? cbc_solution_status(sol) : NULL;
+    int status_conflict = cbc_report_conflict(reported, solution_status);
+    const char *status_source = !strcmp(claimed, reported) ? "solver_log" : "process";
+    if (!strcmp(s->name, "cbc") && !interrupted && p.code == 0 && !p.signal && !p.timed_out) {
+        if (status_conflict) {
+            claimed = "unknown";
+            status_source = "conflicting_solver_reports";
+        } else if (solution_status &&
+                   (!strcmp(reported, "unknown") || !strcmp(reported, "infeasible_or_unbounded"))) {
+            /* A solution-file unbounded claim alone does not distinguish MILP
+             * unboundedness from an unbounded continuous relaxation. */
+            claimed =
+                !strcmp(solution_status, "unbounded") ? "infeasible_or_unbounded" : solution_status;
+            if (strcmp(claimed, reported))
+                status_source = "solution_header";
+        }
+    }
     Process cp = {.code = -1};
     int has_solution = access(sol, R_OK) == 0;
     int has_dual = relax && !strcmp(s->name, "lab") && access(dual, R_OK) == 0;
@@ -757,6 +825,14 @@ static void one(const Instance *inst, const Solver *s, const char *checker, cons
     lab_json_string(f, claimed);
     fprintf(f, ",\"reported_solver_status\":");
     lab_json_string(f, reported);
+    fprintf(f, ",\"reported_solution_status\":");
+    if (solution_status)
+        lab_json_string(f, solution_status);
+    else
+        fputs("null", f);
+    fprintf(f, ",\"status_source\":");
+    lab_json_string(f, status_source);
+    fprintf(f, ",\"status_conflict\":%s", status_conflict ? "true" : "false");
     fprintf(f, ",\"reported_dual_bound\":");
     if (bound[0])
         lab_json_string(f, bound);

@@ -217,4 +217,76 @@ class Harness(unittest.TestCase):
             for r in records:
                 self.assertEqual(r['mode'],'mip');self.assertEqual(r['claimed_status'],'optimal',r)
                 self.assertFalse(r['checker']['relaxation']);self.assertTrue(r['checker']['checked_feasible'],r)
+    def cbc_header_case(self,root,header,log,exit_code=0,terminate=None):
+        solution=header+'\n0 x 1 0\n1 y 0 0\n2 z .3 0\n'
+        body='import os,pathlib,signal,sys,time\np=pathlib.Path(sys.argv[sys.argv.index("-solution")+1])\np.write_text('+repr(solution)+')\nprint('+repr(log)+',flush=True)\n'
+        if terminate=='signal':body+='os.kill(os.getpid(),signal.SIGTERM)\n'
+        elif terminate=='watchdog':body+='time.sleep(20)\n'
+        else:body+='sys.exit('+str(exit_code)+')\n'
+        args=self.setup_case(root,body)
+        if terminate=='watchdog':
+            # Allow the interpreted fixture to write its header even under
+            # sanitizer/host load, then exercise timeout priority while it sleeps.
+            args[args.index('--limit')+1]='1';args[args.index('--grace')+1]='1'
+        else:args[args.index('--limit')+1]='5';args[args.index('--grace')+1]='1'
+        cfg=root/'solvers.tsv';cfg.write_text(cfg.read_text().replace('\nhighs\t','\ncbc\t'))
+        p=subprocess.run(args,capture_output=True,text=True,timeout=10)
+        self.assertEqual(p.returncode,0,p.stderr)
+        return json.loads((root/'result/runs.jsonl').read_text())
+    def test_cbc_solution_header_refines_only_clean_unknown_or_ambiguous_reports(self):
+        cases=[('Optimal - objective value 8.03','Continuous objective value is 8.03','unknown','optimal','optimal','solution_header'),
+               ('Integer infeasible - objective value 0.50000000','Pre-processing says infeasible or unbounded','infeasible_or_unbounded','infeasible','infeasible','solution_header'),
+               ('Infeasible','No result block','unknown','infeasible','infeasible','solution_header'),
+               ('Unbounded - objective value 8.03','No result block','unknown','unbounded','infeasible_or_unbounded','solution_header'),
+               ('Unbounded - objective value 8.03','Result - Linear relaxation unbounded','lp_unbounded','unbounded','lp_unbounded','solver_log')]
+        for header,log,reported,solution,claimed,source in cases:
+            with tempfile.TemporaryDirectory() as td:
+                r=self.cbc_header_case(pathlib.Path(td),header,log)
+                self.assertEqual(r['reported_solver_status'],reported,r)
+                self.assertEqual(r['reported_solution_status'],solution,r)
+                self.assertEqual(r['claimed_status'],claimed,r);self.assertEqual(r['status_source'],source,r)
+                self.assertFalse(r['status_conflict']);self.assertFalse(r['checker'].get('certifies_optimality',False))
+    def test_cbc_solution_header_never_upgrades_failed_or_limited_process(self):
+        cases=[('Result - Stopped on time limit',0,None,'time_limit','solver_log'),
+               ('No result block',1,None,'process_error','process'),
+               ('No result block',0,'signal','process_error','process'),
+               ('No result block',0,'watchdog','watchdog_timeout','process')]
+        for log,code,terminate,claimed,source in cases:
+            with tempfile.TemporaryDirectory() as td:
+                r=self.cbc_header_case(pathlib.Path(td),'Optimal - objective value 8.03',log,code,terminate)
+                self.assertEqual(r['reported_solution_status'],'optimal',r)
+                self.assertEqual(r['claimed_status'],claimed,r);self.assertEqual(r['status_source'],source,r)
+    def test_cbc_conflicting_explicit_reports_remain_visible(self):
+        cases=[('Result - Optimal solution found','Infeasible - objective value 8.03','optimal','infeasible',0,'unknown'),
+               ('Result - Problem proven infeasible','Optimal - objective value 8.03','infeasible','optimal',0,'unknown'),
+               ('Result - Linear relaxation unbounded','Optimal - objective value 8.03','lp_unbounded','optimal',0,'unknown'),
+               ('Result - Problem proven infeasible','Optimal - objective value 8.03','infeasible','optimal',1,'process_error')]
+        for log,header,reported,solution,code,claimed in cases:
+            with tempfile.TemporaryDirectory() as td:
+                r=self.cbc_header_case(pathlib.Path(td),header,log,code)
+                self.assertEqual(r['reported_solver_status'],reported,r)
+                self.assertEqual(r['reported_solution_status'],solution,r)
+                self.assertTrue(r['status_conflict']);self.assertEqual(r['claimed_status'],claimed,r)
+                self.assertEqual(r['status_source'],'process' if code else 'conflicting_solver_reports',r)
+    def test_cbc_header_is_anchored_and_status_does_not_use_reference_answers(self):
+        headers=['prefix Optimal - objective value 8.03','Infeasible or unbounded',
+                 'Optimality not established','Optimal - objective value nan',
+                 'not a header\nOptimal - objective value 8.03']
+        for header in headers:
+            with tempfile.TemporaryDirectory() as td:
+                r=self.cbc_header_case(pathlib.Path(td),header,'No result block')
+                self.assertIsNone(r['reported_solution_status'],r);self.assertEqual(r['claimed_status'],'unknown')
+        with tempfile.TemporaryDirectory() as td:
+            root=pathlib.Path(td)
+            # Deliberately wrong reference: status must still come exclusively
+            # from the native terminal header, with contradiction reporting left
+            # to the separate report stage.
+            body='import pathlib,sys\np=pathlib.Path(sys.argv[sys.argv.index("-solution")+1]);p.write_text("Optimal - objective value 8.03\\n0 x 1 0\\n1 y 0 0\\n2 z .3 0\\n")\nprint("No result block")\n'
+            args=self.setup_case(root,body);args[args.index('--limit')+1]='5'
+            cfg=root/'solvers.tsv';cfg.write_text(cfg.read_text().replace('\nhighs\t','\ncbc\t'))
+            suite=root/'suite.tsv';suite.write_text(suite.read_text().replace('\t=opt=\t8.03\n','\t=inf=\t-\n'))
+            p=subprocess.run(args,capture_output=True,text=True);self.assertEqual(p.returncode,0,p.stderr)
+            r=json.loads((root/'result/runs.jsonl').read_text())
+            self.assertEqual(r['claimed_status'],'optimal');self.assertEqual(r['reported_solution_status'],'optimal')
+            self.assertEqual(r['reference_status'],'=inf=');self.assertTrue(r['checker']['checked_feasible'])
 unittest.main()

@@ -37,4 +37,14 @@ class Report(unittest.TestCase):
             self.assertEqual(data['summary']['lab']['certified_lp_bounds'],1)
             self.assertEqual(data['summary']['lab']['certified_optima'],0)
             self.assertIn('Continuous LP relaxations',(root/'summary.html').read_text())
+    def test_solution_status_refinement_does_not_hide_reference_contradiction(self):
+        with tempfile.TemporaryDirectory() as td:
+            root=pathlib.Path(td)
+            r=record('cbc-claim','cbc','infeasible',None,False)
+            r.update({'reported_solver_status':'infeasible_or_unbounded','reported_solution_status':'infeasible'})
+            (root/'runs.jsonl').write_text(json.dumps(r)+'\n')
+            (root/'environment.json').write_text(json.dumps({'seed':1,'time_limit_s':2}))
+            data=report(root)
+            self.assertEqual(data['summary']['cbc']['reference_contradictions'],1)
+            self.assertIn('solution: infeasible',(root/'summary.html').read_text())
 unittest.main()

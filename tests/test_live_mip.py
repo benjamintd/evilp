@@ -155,7 +155,8 @@ def main():
         comparisons.append({'instance': name, 'solver': engine, 'claimed_status': row['claimed_status'],
                             'exit_code': row['exit_code'], 'passed_checker': feasible,
                             'objective': str(objective) if objective is not None else None,
-                            'reference': reference, 'objective_matches': objective_matches})
+                            'reference': reference, 'objective_matches': objective_matches,
+                            'reference_outcome_matches': bool(correct_status and objective_matches)})
     pairs = [(r['instance'], r['solver']) for r in rows]
     wanted = {(name, engine) for name, _, _ in models for engine in ('cbc', 'scip', 'highs', 'lab', 'lab-cold')}
     if len(pairs) != len(set(pairs)) or set(pairs) != wanted:
@@ -166,7 +167,7 @@ def main():
                'created_utc': datetime.datetime.now(datetime.timezone.utc).isoformat(),
                'passed': not failures, 'failures': failures, 'instances': len(models),
                'expected_runs': len(wanted), 'actual_runs': len(rows), 'reference_models': expected,
-               'counts': {'matched_reference_outcomes': sum(r['objective_matches'] for r in comparisons),
+               'counts': {'matched_reference_outcomes': sum(r['reference_outcome_matches'] for r in comparisons),
                           'checked_feasible_candidates': sum(r['passed_checker'] for r in comparisons)},
                'source': {'git_revision': revision, 'working_tree_dirty': dirty,
                           'script_sha256': sha(__file__), 'fixture_helper_sha256': sha(ROOT / 'tests/test_mip_solver.py')},
