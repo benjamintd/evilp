@@ -139,9 +139,67 @@ static int support_product(const mpq_t q, const Endpoint *x, mpq_t product,
     }
     return 1;
 }
+/* Best lower/upper bounded-denominator approximants are convergents or
+ * semiconvergents. Compare their distances exactly. Deterministic ties prefer
+ * the smaller denominator, then the lower rational; no floating arithmetic is
+ * used after the original finite double has been encoded as a dyadic. */
+static int nearest_denominator(mpq_t value, double deadline) {
+    const unsigned long limit = 1048576UL;
+    if (lab_now() >= deadline || !bounded(value))
+        return 0;
+    if (mpz_cmp_ui(mpq_denref(value), limit) <= 0)
+        return 1;
+    mpz_t n, d, a, remainder, p0, p1, p2, q0, q1, q2, k;
+    mpz_inits(n, d, a, remainder, p0, p1, p2, q0, q1, q2, k, NULL);
+    mpq_t first, second, error_first, error_second;
+    mpq_inits(first, second, error_first, error_second, NULL);
+    mpz_set(n, mpq_numref(value)); mpz_set(d, mpq_denref(value));
+    mpz_set_ui(q0, 1); mpz_set_ui(p1, 1);
+    int ok = 0;
+    for (unsigned int steps = 0; steps < 64; steps++) {
+        if (lab_now() >= deadline || mpz_sgn(d) <= 0)
+            goto done;
+        mpz_fdiv_qr(a, remainder, n, d);
+        mpz_mul(q2, a, q1); mpz_add(q2, q2, q0);
+        if (mpz_cmp_ui(q2, limit) > 0) {
+            mpz_ui_sub(k, limit, q0); mpz_fdiv_q(k, k, q1);
+            mpz_mul(p2, k, p1); mpz_add(p2, p2, p0);
+            mpz_mul(q2, k, q1); mpz_add(q2, q2, q0);
+            mpq_set_num(first, p2); mpq_set_den(first, q2);
+            mpq_set_num(second, p1); mpq_set_den(second, q1);
+            mpq_canonicalize(first); mpq_canonicalize(second);
+            if (!bounded(first) || !bounded(second))
+                goto done;
+            mpq_sub(error_first, first, value); mpq_abs(error_first, error_first);
+            mpq_sub(error_second, second, value); mpq_abs(error_second, error_second);
+            if (!bounded(error_first) || !bounded(error_second) || lab_now() >= deadline)
+                goto done;
+            int compare = mpq_cmp(error_first, error_second);
+            int denominators = mpz_cmp(mpq_denref(first), mpq_denref(second));
+            if (compare > 0 || (!compare && (denominators > 0 ||
+                (!denominators && mpq_cmp(first, second) > 0))))
+                mpq_set(value, second);
+            else
+                mpq_set(value, first);
+            ok = 1;
+            goto done;
+        }
+        mpz_mul(p2, a, p1); mpz_add(p2, p2, p0);
+        if (mpz_sizeinbase(p2, 2) > MAX_BITS || mpz_sizeinbase(q2, 2) > MAX_BITS)
+            goto done;
+        mpz_swap(p0, p1); mpz_swap(p1, p2);
+        mpz_swap(q0, q1); mpz_swap(q1, q2);
+        mpz_swap(n, d); mpz_swap(d, remainder);
+    }
+done:
+    mpz_clears(n, d, a, remainder, p0, p1, p2, q0, q1, q2, k, NULL);
+    mpq_clears(first, second, error_first, error_second, NULL);
+    return ok;
+}
 static int construct_candidate(const LabModel *m, size_t terms, const size_t *source_row,
                                  const double *scale, const double *pi, double deadline,
-                                 int project_rows, int simplify_terms, LabFarkasCandidate *r) {
+                                 int project_rows, int simplify_terms, int reconstruct_terms,
+                                 LabFarkasCandidate *r) {
     if (!r)
         return -1;
     memset(r, 0, sizeof *r);
@@ -257,8 +315,17 @@ static int construct_candidate(const LabModel *m, size_t terms, const size_t *so
                 continue;
             }
         }
-        if (source_row[i] != SIZE_MAX) {
+        if (reconstruct_terms) {
             mpq_set_d(value, pi[i]);
+            mpq_set(factor, value);
+            if (!nearest_denominator(value, deadline))
+                goto cleanup;
+            if (mpq_cmp(value, factor))
+                r->reconstructed_terms++;
+        }
+        if (source_row[i] != SIZE_MAX) {
+            if (!reconstruct_terms)
+                mpq_set_d(value, pi[i]);
             mpq_set_d(factor, scale[i]);
             mpq_mul(value, value, factor);
             mpq_add(y[source_row[i]], y[source_row[i]], value);
@@ -372,17 +439,22 @@ done:
 int lab_farkas_candidate(const LabModel *m, size_t terms, const size_t *source_row,
                           const double *scale, const double *pi, double deadline,
                           LabFarkasCandidate *r) {
-    return construct_candidate(m, terms, source_row, scale, pi, deadline, 0, 0, r);
+    return construct_candidate(m, terms, source_row, scale, pi, deadline, 0, 0, 0, r);
 }
 int lab_farkas_projected_candidate(const LabModel *m, size_t terms, const size_t *source_row,
                                     const double *scale, const double *pi, double deadline,
                                     LabFarkasCandidate *r) {
-    return construct_candidate(m, terms, source_row, scale, pi, deadline, 1, 0, r);
+    return construct_candidate(m, terms, source_row, scale, pi, deadline, 1, 0, 0, r);
 }
 int lab_farkas_simplified_candidate(const LabModel *m, size_t terms, const size_t *source_row,
                                      const double *scale, const double *pi, double deadline,
                                      LabFarkasCandidate *r) {
-    return construct_candidate(m, terms, source_row, scale, pi, deadline, 1, 1, r);
+    return construct_candidate(m, terms, source_row, scale, pi, deadline, 1, 1, 0, r);
+}
+int lab_farkas_reconstructed_candidate(const LabModel *m, size_t terms,
+                                        const size_t *source_row, const double *scale,
+                                        const double *pi, double deadline, LabFarkasCandidate *r) {
+    return construct_candidate(m, terms, source_row, scale, pi, deadline, 1, 0, 1, r);
 }
 void lab_farkas_candidate_free(LabFarkasCandidate *r) {
     if (!r)

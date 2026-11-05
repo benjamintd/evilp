@@ -33,6 +33,7 @@ typedef struct {
     int farkas_margin_is_lower_bound;
     size_t source_infeasibility_attempts, source_infeasibilities, source_projected_rows;
     size_t source_removed_terms;
+    size_t source_reconstructed_terms;
     size_t rejected_pivots, harris_rescues;
     size_t primal_repairs, primal_repair_iterations;
     size_t exact_primal_attempts, exact_primal_recoveries;

@@ -10,6 +10,7 @@ typedef struct {
     const char *margin_kind; /* source_enclosure; never an exact-margin claim */
     char message[256];
     double elapsed;
+    size_t reconstructed_terms; /* canonical pi changed, including changes to zero */
 } LabFarkasCandidate;
 /* Map each active canonical multiplier to its original row as scale*pi, in
  * exact dyadic arithmetic. SIZE_MAX source rows are ignored. Validate a strict
@@ -41,5 +42,15 @@ int lab_farkas_simplified_candidate(const LabModel *model, size_t terms,
                                      const size_t *source_row, const double *scale,
                                      const double *pi, double deadline,
                                      LabFarkasCandidate *candidate);
+/* Alternate constructor: replace each canonical pi with its nearest rational
+ * having denominator at most2^20, then aggregate exact scale*pi and project
+ * invalid-current-row-side multipliers. Ties choose smaller denominator, then
+ * the lower rational. All canonical terms participate, including SIZE_MAX
+ * source rows; reconstructed_terms counts changes, including changes to zero.
+ * The entire unchanged source/support proof must pass; q is never rounded. */
+int lab_farkas_reconstructed_candidate(const LabModel *model, size_t terms,
+                                        const size_t *source_row, const double *scale,
+                                        const double *pi, double deadline,
+                                        LabFarkasCandidate *candidate);
 void lab_farkas_candidate_free(LabFarkasCandidate *candidate);
 #endif

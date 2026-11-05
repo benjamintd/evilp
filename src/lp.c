@@ -659,6 +659,12 @@ static int source_phase_one_certificate(Work *w) {
         accepted = lab_farkas_simplified_candidate(w->model, w->m, w->source_row,
                                                    w->row_scale, w->pi, deadline, &candidate);
     }
+    if (!accepted && lab_now() < deadline) {
+        lab_farkas_candidate_free(&candidate);
+        w->result->source_infeasibility_attempts++;
+        accepted = lab_farkas_reconstructed_candidate(w->model, w->m, w->source_row,
+                                                      w->row_scale, w->pi, deadline, &candidate);
+    }
     if (accepted == 1) {
         LabLpResult *r = w->result;
         r->farkas = candidate.multiplier;
@@ -668,6 +674,7 @@ static int source_phase_one_certificate(Work *w) {
         r->source_infeasibilities++;
         r->source_projected_rows += candidate.projected_rows;
         r->source_removed_terms += candidate.removed_terms;
+        r->source_reconstructed_terms += candidate.reconstructed_terms;
         candidate.multiplier = NULL;
         candidate.rows = 0;
         candidate.margin_lower_bound = NULL;
