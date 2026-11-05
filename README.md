@@ -8,6 +8,9 @@ dual reoptimization, and a minimal deterministic branch-and-bound MILP solver.
 The independent checker validates original-model witnesses and rational LP bounds.
 
 See [the current solver contract](docs/MILESTONE-2BC.md).
+The [40-case MILP report](results/mip-native-v2/report.html) and
+[MIPLIB smoke report](results/miplib-smoke-2s-v1/runs/summary.html) preserve
+successful witnesses, numerical failures and capacity limits.
 
 Milestone 2A is preserved in [the original LP engine contract](docs/LP-ENGINE.md),
 [the lab's LP report](results/lp-native-v2/lab/summary.html), and

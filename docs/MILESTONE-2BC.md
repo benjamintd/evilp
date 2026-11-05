@@ -5,6 +5,45 @@ mixed-integer search. The original checker remains a separate process with its
 own reader and exact rational arithmetic. Existing milestone-1 and milestone-2A
 Git tags and experiment records are preserved.
 
+## Completed validation
+
+| Gate | Result |
+| --- | --- |
+| Release and AddressSanitizer/UndefinedBehaviorSanitizer | All nine suites pass; subsequent adapter/report changes pass their focused checks in both profiles |
+| Independent exact LP oracle | 1,000 cases pass |
+| Independent exact MILP oracle | 300 cases pass |
+| Bound-overlay sequences | 200 cases pass across sparse and dense backends |
+| Native MILP comparison | 40/40 strict status/reference outcomes match; all 35 feasible candidates pass checking |
+| Two-second MIPLIB smoke | 12 attempts, two checked incumbents, zero invalid candidates |
+
+The tiny fixture reaches objective 8.03 in three nodes. Warm search uses five
+LP calls, four warm starts and 12 refactorizations; cold search uses the same
+five calls and 19 refactorizations. Across all eight native fixtures, warm/cold
+totals are 56/68 refactorizations and 23/22 pivots. These are operation counts
+on tiny models, not a speed result.
+
+The MIPLIB smoke finds checked incumbents on `neos5` and `pk1`; neither reaches
+the pinned reference optimum. Six models exceed the configured dimension cap,
+three stop with numerical failures, and one times out without an incumbent.
+The numerical failures are uncertain Phase I dual signs or failed basis-solve
+residual checks. They remain unresolved rather than being treated as proved
+infeasibility. Scaling and solve refinement are the next priorities.
+
+- [Readable 40-case report](../results/mip-native-v2/report.html),
+  [raw summary](../results/mip-native-v2/summary.json) and
+  [warm/cold operation counts](../results/mip-native-v2/warm-cold.json).
+- [MIPLIB smoke report](../results/miplib-smoke-2s-v1/runs/summary.html).
+- [Release and sanitizer evidence](../results/milestone-2bc-contracts-v1/summary.json).
+- [Exact primal example](../results/mip-demo-v1/warm/checker.json), whose
+  checker explicitly does not certify the MILP optimum.
+
+The numerical engine is frozen at `71247b2`; the final native campaign records
+clean source `82c1897`, which adds tested benchmark status/report refinements.
+The earlier [v1 diagnostic](../results/mip-native-v1/summary.json) is preserved:
+its strict comparison failed because Cbc's preprocessing log was ambiguous.
+The final adapter reads Cbc's explicit terminal solution header after a clean
+exit, preserving both reports. It never uses reference answers to infer status.
+
 ## Sparse LP storage and factorization
 
 The optimizer keeps both the original model and transformed standard form
