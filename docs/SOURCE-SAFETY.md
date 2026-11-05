@@ -2,8 +2,9 @@
 
 These checkpoints address numerical stops exposed by the complete corpus run.
 The independent checker, original-model acceptance policies and proof guards
-remain separate from optimizer statuses. The frozen full-corpus v2 outcome is
-still zero correct completions, 235 time limits and five numerical stops.
+remain separate from optimizer statuses. The frozen full-corpus v3 outcome is
+zero correct completions, 238 time limits and two numerical stops. The earlier
+v2 inventory retains its 235 time limits and five numerical stops.
 
 ## Repair a genuinely negative basic value
 
@@ -93,3 +94,51 @@ to zero. Alternative candidate construction is being investigated separately.
 The [autoresearch gate](AUTORESEARCH.md) stays closed. No research paper has
 been selected. Full benchmark completion and a later matched HiGHS comparison
 over the unchanged 240-instance denominator remain required.
+
+## Later validated checkpoints
+
+`af61788` adds phase-local primal entering-column ranking while retaining the
+full reduced-cost scan, existing eligibility predicates and every pivot guard.
+The default chooses the most negative eligible canonical reduced cost. Exact
+ties use column order. A validated zero step, or eight consecutive positive
+short steps, switches permanently to the original policy for that phase.
+`--bland-pricing` requests the original policy directly. Requested mode and
+accepted-pivot/stall/fallback counters are recorded separately. Deferred pivots
+are counted only after their basis is validated; a rejected trial is not an
+accepted step. Both builds pass all 26 suites, including 140 independent
+solver/checker pairs per profile; the
+[pricing record](../results/pricing-contracts-v1/summary.json) binds the source
+to the checkpoint. A generated family needs one productive pivot versus 32
+under the original rule. That establishes controlled work reduction only.
+
+`390fcba` bypasses identity `scalbn` operations for finite zero-exponent values.
+All nonzero-exponent and rejection paths retain their guards. The work-only
+equivalence check compares status, output bits and floating exception flags on
+101,404 scalar cases and 1,256 public solves per profile, including signed
+zeros, subnormals, extreme magnitudes, both backends and in-place operations.
+Generated operation counts show the avoided scaling calls; concurrent timings
+are not used as a speed ranking.
+
+`332afbd` adds a third candidate constructor. It omits canonical multipliers
+with exact magnitude at most `max(abs(pi))*2^-40`, aggregates the remaining
+multipliers exactly, applies invalid-side projection and repeats the complete
+source/support proof. Source coefficients and combined-column residuals are
+unchanged. All three attempts share the existing deadline. The
+[combined record](../results/simplified-source-contracts-v1/summary.json) passes
+all 26 suites in both builds. Each constructor rejects 2,000 independently
+generated feasible adversaries. Captured `glass4` and `graphdraw-domain` node
+proofs validate after this candidate construction, but a new default-pricing
+`glass4` stop appears later, at node 78.
+
+The five ten-second default-pricing development probes then retain four time
+limits and that one numerical stop. All 40 emitted local proofs pass replay;
+`mad` submits the only solution, accepted independently at `1e-7`. Evidence is
+in `work/source-stop-probes-v3/independent-audit.json`. These selected outcomes
+do not replace the frozen full-corpus counts.
+
+The node-78 residual involves meaningful multipliers rather than tiny terms.
+Offline nearest-rational reconstruction with denominator limit `2^20` gives a
+new vector whose complete source-enclosure proof has margin `13/420`; the
+independent checker confirms it. A fourth C constructor is being validated as
+a separate candidate proposal. Its acceptance still requires the complete
+unchanged proof. No nonzero combined coefficient is clipped.

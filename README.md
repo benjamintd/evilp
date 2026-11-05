@@ -36,12 +36,12 @@ successful witnesses, numerical failures and capacity limits. The earlier
 
 The [autoresearch protocol](docs/AUTORESEARCH.md) starts only after every MILP
 problem in the existing benchmarks passes. That gate is not yet complete.
-The [full 240-instance v2 inventory](results/miplib-candidate-v2/inventory.json)
-records zero unsupported cases, 235 time limits, five numerical stops, nine
+The [full 240-instance v3 inventory](results/miplib-candidate-v3/inventory.json)
+records zero unsupported cases, 238 time limits, two numerical stops, nine
 independently checked incumbents and zero correctly completed instances.
 All 240 attempts and all failures are retained. Concurrent engineering makes
 this development coverage evidence unsuitable for a speed ranking.
-The [gate result](results/miplib-candidate-v2/gate.json) remains closed. The
+The [gate result](results/miplib-candidate-v3/gate.json) remains closed. The
 subsequent performance target is at least 120 strict paired wins against HiGHS
 over the fixed 240-instance denominator under matched conditions.
 
@@ -66,6 +66,16 @@ projected-candidate retry at `e02a45e` passes all 24 Release suites and focused
 certificate sanitizer checks, with all 31 exported local proofs in its selected
 diagnostic accepted independently. These local proofs and targeted progress do
 not change the frozen full-corpus completion count.
+
+The [pricing checkpoint](results/pricing-contracts-v1/summary.json) `af61788`
+passes all 26 Release and sanitizer suites, including 140 independent
+solver/checker pairs per build. Default primal pricing selects the most negative
+eligible reduced cost with phase-local stall fallback; `--bland-pricing` retains
+the original entering rule. The [combined checkpoint](results/simplified-source-contracts-v1/summary.json)
+at `332afbd` also passes all 26 suites in both builds. It adds a simplified
+multiplier candidate and identity-scaling fast paths. Those changes are outside
+the frozen v3 inventory. A fresh ten-second campaign retains all 240 models and
+will have separate completion counts after it finishes.
 
 Milestone 2A is preserved in [the original LP engine contract](docs/LP-ENGINE.md),
 [the lab's LP report](results/lp-native-v2/lab/summary.html), and

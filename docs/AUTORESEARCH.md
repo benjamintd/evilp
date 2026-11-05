@@ -48,12 +48,12 @@ distinct; individual LP certificates do not constitute a complete MILP tree proo
 Any budget change creates a fresh declared campaign, preserving earlier results.
 
 The gate is currently **not complete**. The frozen
-[full 240-instance v2 inventory](../results/miplib-candidate-v2/inventory.json)
-contains one attempt for every locked instance: zero `unsupported`, 235
-`time_limit`, five `numerical_failure`, nine independently checked incumbents
-and zero correctly completed problems. Its [gate record](../results/miplib-candidate-v2/gate.json)
+[full 240-instance v3 inventory](../results/miplib-candidate-v3/inventory.json)
+contains one attempt for every locked instance: zero `unsupported`, 238
+`time_limit`, two `numerical_failure`, nine independently checked incumbents
+and zero correctly completed problems. Its [gate record](../results/miplib-candidate-v3/gate.json)
 has no missing instances and leaves both completion and speed gates closed.
-The inventory used a two-second budget at source revision `61a738c`, while
+The inventory used a two-second budget at source revision `e02a45e`, while
 engineering ran concurrently. It is coverage and failure evidence, explicitly
 not a comparable timing campaign. The `=best=` reference for `supportcase22`
 also remains an unresolved expected-outcome policy; it cannot be promoted to a
@@ -62,9 +62,10 @@ known optimum. Passing unit tests or finding incumbents does not open the gate.
 Version 0.7 adds singleton peeling, guarded basis updates, larger finite sparse
 capacity guards, source-aware root propagation and learned branch ranking.
 The [earlier v1 inventory](../results/miplib-candidate-v1/inventory.json) retains
-its 209 size-cap stops and 31 time limits. The v2 archive and evaluator hashes
-are unchanged; subsequent column-norm caching and column overlays are outside
-its evaluated source. Every subsequent candidate requires fresh evidence.
+its 209 size-cap stops and 31 time limits. The v2 inventory retains its 235 time limits and five numerical stops. Each
+archive and evaluator remains unchanged. Later pricing, scaling shortcuts and
+candidate constructors are outside the v3 evaluated source; every subsequent
+candidate requires fresh evidence.
 The capacity guard and the cost of factoring a large remaining coupled core
 are separate blockers. Larger allowed dimensions do not establish completion,
 memory feasibility or a speed advantage. The earlier
@@ -84,6 +85,13 @@ denominator remains 240: unsupported cases, limits, invalid candidates and
 ties cannot become strict wins or be removed to improve the fraction. An
 unmatched or concurrently disturbed development run cannot satisfy this paired
 speed gate. No speed claim is made by either inventory or the 0.7 contract tests.
+
+Pricing and pricing-integration tests are also additive prerequisites. All 26
+suites pass in both builds at `af61788` and the combined `332afbd` checkpoint;
+[recorded evidence](../results/simplified-source-contracts-v1/summary.json) binds
+tested source files to the commit. A new ten-second campaign preserves every
+member and earlier result. A longer declared budget cannot turn a limit into a
+pass.
 
 ## One-paper, one-idea cycle after the gate
 
