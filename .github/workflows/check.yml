@@ -1,0 +1,11 @@
+name: C contracts
+on: [push, pull_request]
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: sudo apt-get update && sudo apt-get install -y libgmp-dev zlib1g-dev
+      - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DLAB_SANITIZE=ON
+      - run: cmake --build build -j 2
+      - run: ctest --test-dir build --output-on-failure

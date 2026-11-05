@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import hashlib,json,os,pathlib,subprocess,sys,tempfile,unittest
+import hashlib,json,os,pathlib,signal,subprocess,sys,tempfile,time,unittest
 BIN=str(pathlib.Path(sys.argv.pop(1)).resolve());CHECK=str(pathlib.Path(sys.argv.pop(1)).resolve())
 FIX=pathlib.Path(__file__).parent/'fixtures'
 def sha(p):return hashlib.sha256(pathlib.Path(p).read_bytes()).hexdigest()
@@ -30,4 +30,37 @@ class Harness(unittest.TestCase):
             self.assertNotEqual(subprocess.run(args,capture_output=True).returncode,0)
     def test_seed_zero_rejected(self):
         p=subprocess.run([BIN,'--seed','0'],capture_output=True);self.assertNotEqual(p.returncode,0)
+    def test_interrupt_terminates_active_run(self):
+        with tempfile.TemporaryDirectory() as td:
+            root=pathlib.Path(td);args=self.setup_case(root,'import time\ntime.sleep(20)\n')
+            args[args.index('--limit')+1]='20'
+            p=subprocess.Popen(args,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+            deadline=time.monotonic()+5
+            log=root/'result/tiny/highs/seed-1/solver.log'
+            while not log.exists() and time.monotonic()<deadline:time.sleep(.02)
+            self.assertTrue(log.exists())
+            p.send_signal(signal.SIGINT);out,err=p.communicate(timeout=5)
+            self.assertEqual(p.returncode,130,err)
+            r=json.loads((root/'result/runs.jsonl').read_text());self.assertEqual(r['claimed_status'],'interrupted')
+    def test_cbc_max_objective_flag(self):
+        with tempfile.TemporaryDirectory() as td:
+            root=pathlib.Path(td)
+            body='import pathlib,sys\nassert "-max" in sys.argv\np=pathlib.Path(sys.argv[sys.argv.index("-solution")+1])\np.write_text("Optimal - objective value 8.03\\n0 x 1 0\\n1 y 0 0\\n2 z .3 0\\n")\nprint("Result - Optimal solution found")\n'
+            args=self.setup_case(root,body);args[args.index('--limit')+1]='5';args[args.index('--grace')+1]='1'
+            cfg=root/'solvers.tsv';cfg.write_text(cfg.read_text().replace('\nhighs\t','\ncbc\t'))
+            p=subprocess.run(args,capture_output=True,text=True);self.assertEqual(p.returncode,0,p.stderr)
+            r=json.loads((root/'result/runs.jsonl').read_text())
+            self.assertEqual(r['checker']['objective'],'803/100',r);self.assertIn('-max',r['argv'])
+    def test_ambiguous_and_lp_statuses_are_not_milp_certificates(self):
+        cases=[('highs','Solving report\\n  Status            Unbounded or infeasible','infeasible_or_unbounded'),
+               ('scip','SCIP Status : problem is solved [infeasible or unbounded]','infeasible_or_unbounded'),
+               ('cbc','Result - Linear relaxation unbounded','lp_unbounded')]
+        for solver,message,status in cases:
+            with tempfile.TemporaryDirectory() as td:
+                root=pathlib.Path(td);args=self.setup_case(root,'print("'+message+'")\n')
+                args[args.index('--limit')+1]='5';args[args.index('--grace')+1]='1'
+                cfg=root/'solvers.tsv';cfg.write_text(cfg.read_text().replace('\nhighs\t','\n'+solver+'\t'))
+                p=subprocess.run(args,capture_output=True,text=True);self.assertEqual(p.returncode,0,p.stderr)
+                r=json.loads((root/'result/runs.jsonl').read_text())
+                self.assertEqual(r['claimed_status'],status,r);self.assertFalse(r['checker']['checked_feasible'])
 unittest.main()

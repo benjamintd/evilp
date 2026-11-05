@@ -8,7 +8,8 @@ It does not contain a new optimization solver yet.
 ## Build and test
 
 Requirements: C17 compiler, CMake 3.20+, GMP, zlib, Python 3.12+ for setup
-(test/report scripts also run on 3.9), curl, and Git.
+(test/report scripts also run on 3.9), curl, and Git. Cbc's source build also
+requires a C++ compiler and make.
 
 ~~~sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
@@ -55,6 +56,13 @@ build/milpbench --suite data/miplib2017/suite.tsv \
   --out results/my-miplib-pilot --limit 2 --seed 1
 python3 scripts/report.py results/my-miplib-pilot
 python3 scripts/freeze.py results/my-miplib-pilot/evaluator-lock.json
+~~~
+
+Retained solutions can be checked again without rerunning the solvers:
+
+~~~sh
+python3 scripts/revalidate.py results/my-miplib-pilot --checker build/milpcheck
+python3 scripts/report.py results/my-miplib-pilot --runs revalidated.jsonl --prefix validated
 ~~~
 
 Each output directory must be new. Raw run artifacts and JSONL remain available

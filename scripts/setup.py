@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Download pinned native baselines and MIPLIB; no global installation."""
-import argparse, concurrent.futures, hashlib, json, os, pathlib, shutil, subprocess, tarfile, zipfile
+import argparse, concurrent.futures, hashlib, json, os, pathlib, shutil, subprocess, sys, tarfile, zipfile
+if sys.version_info < (3,12):
+    raise SystemExit('Setup requires Python 3.12 or later (safe archive extraction).')
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 def sha(path):
     h=hashlib.sha256()
@@ -29,7 +31,7 @@ def solvers():
         if name=='cbc' and native.exists() and native_prov.exists():
             p=json.loads(native_prov.read_text())
             if sha(native)==p['binary_sha256']:
-                return name,native.resolve(),{**s,'version':'2.10.13 (local source build)','source_provenance':'tools/cbc-source-provenance.json'}
+                return name,native.resolve(),{'version':'2.10.13 (local source build)','source_lock':'config/cbc-source.lock.json','source_provenance':'tools/cbc-source-provenance.json'}
         archive=ROOT/'work/downloads'/s['url'].split('/')[-1]
         fetch(s['url'],archive,s['sha256'])
         dest=ROOT/'tools'/name
@@ -48,8 +50,7 @@ def solvers():
             print('Installed',name,s['version'],flush=True)
     (ROOT/'config/solvers.tsv').write_text('\n'.join(rows)+'\n')
     (ROOT/'tools/provenance.json').write_text(json.dumps(provenance,indent=2)+'\n')
-    if not (ROOT/'tools/cbc-native/bin/cbc').exists():
-        import sys
+    if provenance['cbc']['binary'] != 'tools/cbc-native/bin/cbc':
         subprocess.run([sys.executable,str(ROOT/'scripts/build_cbc.py')],check=True)
 def miplib():
     root=ROOT/'data/miplib2017'; root.mkdir(parents=True,exist_ok=True)

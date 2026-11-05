@@ -29,7 +29,7 @@ class Checker(unittest.TestCase):
         for sol in ['','x nan\n','x inf\n','x 1e100000\n','x 1\nx 1\n','unknown 1\n','x garbage\n']:
             self.check_text(sol,2)
     def test_no_solution_is_not_a_certificate(self):
-        for fmt,sol in [('simple','=infeas=\n'),('scip','solution status: infeasible\n'),('cbc','Infeasible - objective value 1\n'),('highs','Model status\nInfeasible\n')]:
+        for fmt,sol in [('simple','=infeas=\n'),('scip','solution status: infeasible\n'),('scip','solution status: time limit reached\nno solution available\n'),('cbc','Infeasible - objective value 1\n'),('highs','Model status\nInfeasible\n')]:
             r=self.check_text(sol,4,fmt=fmt);self.assertFalse(r['checked_feasible'])
     def test_adapter_formats(self):
         examples={
@@ -65,6 +65,11 @@ class Checker(unittest.TestCase):
             model='NAME I\nROWS\n N O\nCOLUMNS\n M0 \'MARKER\' \'INTORG\'\n x O 1\n M1 \'MARKER\' \'INTEND\'\nBOUNDS\n'+bound+'ENDATA\n'
             with tempfile.TemporaryDirectory() as td:
                 m=pathlib.Path(td)/'i.mps';m.write_text(model);self.check_text('x '+value+'\n',code,model=m,extra=['--exact'])
+    def test_conflicting_marker_declarations_fail_closed(self):
+        text="NAME BAD\nROWS\n N O\n E R\nCOLUMNS\n x O 1\n M0 'MARKER' 'INTORG'\n x R 1\n M1 'MARKER' 'INTEND'\nRHS\n b R 0.5\nENDATA\n"
+        with tempfile.TemporaryDirectory() as td:
+            m=pathlib.Path(td)/'conflict.mps';m.write_text(text)
+            code,r=self.call(m);self.assertEqual(code,2,r)
     def test_fail_closed_model_extensions_and_truncation(self):
         original=(FIX/'tiny.mps').read_text()
         with tempfile.TemporaryDirectory() as td:

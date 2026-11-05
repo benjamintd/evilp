@@ -32,5 +32,9 @@ def main():
         w=csv.DictWriter(f,fieldnames=rows[0].keys(),delimiter='\t');w.writeheader();w.writerows(rows)
     provenance={**lock,'binary_sha256':digest,'CXXFLAGS':flags,'coinbrew_sha256':hashlib.sha256(coinbrew.read_bytes()).hexdigest(),'flags':'static COIN libraries; cbc-parallel enabled; tests main'}
     (ROOT/'tools/cbc-source-provenance.json').write_text(json.dumps(provenance,indent=2)+'\n')
+    path=ROOT/'tools/provenance.json'
+    selected=json.loads(path.read_text()) if path.exists() else {}
+    selected['cbc']={'version':'2.10.13 (local source build)','binary':str(binary.relative_to(ROOT)),'binary_sha256':digest,'source_lock':'config/cbc-source.lock.json','source_provenance':'tools/cbc-source-provenance.json'}
+    path.write_text(json.dumps(selected,indent=2)+'\n')
     print('Selected local Cbc:',binary)
 if __name__=='__main__':main()

@@ -34,6 +34,7 @@ numbers, empty or missing solutions, incomplete models, and unsupported extensio
 fail closed. Only one RHS/range/bound vector is supported. Blank RHS vector
 names, embedded spaces within fixed-width names, semicontinuous variables,
 SOS, indicators, and quadratic/nonlinear extensions are unsupported.
+Conflicting integer-marker declarations for the same column are rejected.
 
 Default absolute tolerances: linear rows/bounds 1e-4; integrality 1e-5;
 claimed-objective consistency 1e-4. All comparisons use rationals.
@@ -55,7 +56,8 @@ Solver defaults otherwise apply. External numerical libraries receive one-thread
 environment settings; requested thread limits do not establish bitwise determinism.
 Internal time limits follow each solver's own clock and exclude different setup
 work. Always compare recorded end-to-end wall time as well. A separate watchdog
-terminates the process group after limit + grace. Checker time is excluded.
+signals the process group with SIGTERM after limit + grace, escalating to
+SIGKILL one second later if needed. Checker time is excluded.
 Do not treat a short-budget pilot as a fair speed ranking.
 
 Every run records raw argv/settings/log/solution, exit/signal/watchdog outcome,
@@ -70,6 +72,18 @@ Reference matching uses 1e-4 absolute + 1e-9 relative error on =opt= objectives.
 It is not an optimality certificate. Contradictions remain visible in reports.
 Reference metadata can be revised upstream; upgrades require a new lock
 and a new experiment directory.
+
+The original timed campaign uses the evaluator-v1 Git tag. Subsequent checker
+updates can be applied to retained solutions with scripts/revalidate.py; this
+writes new validation records and revalidated.jsonl, without changing run.json,
+solver logs, solutions, or timings. Report these with report.py --runs
+revalidated.jsonl --prefix validated. Freeze the original evaluator from its
+Git tag and record the revalidation evaluator separately.
+
+The Cbc adapter explicitly passes the MPS objective sense, because Cbc's reader
+ignores OBJSENSE. Maximization regression tests guard this behavior. The pinned
+MIPLIB benchmark models use minimization; this adapter correction does not
+reinterpret their original timed runs.
 
 ## Reproducibility boundaries
 
