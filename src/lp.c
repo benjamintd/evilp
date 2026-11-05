@@ -27,6 +27,7 @@ typedef struct {
     double *equation_scale;
     unsigned char *row_upper;
     unsigned char *artificial;
+    unsigned char *basic;
     size_t *lower_row, *upper_row;
     unsigned char *transform;
     LabLinear linear;
@@ -37,6 +38,7 @@ typedef struct {
     LabLpResult *result;
     double started;
 } Work;
+static int factor_basis(Work *w);
 static void put(Work *w, size_t row, size_t col, double value) {
     if (value == 0)
         return;
@@ -78,6 +80,12 @@ static long double column_norm(const Work *w, size_t j) {
     return norm;
 }
 static int linear_solve(Work *w, const double *rhs, double *x, int transpose) {
+    double *saved = NULL;
+    if (rhs == x) {
+        saved = lab_alloc(w->m, sizeof(double));
+        memcpy(saved, rhs, w->m * sizeof(double));
+        rhs = saved;
+    }
     size_t before = w->linear.refinement_steps;
     int failed = lab_linear_solve(&w->linear, rhs, x, transpose);
     w->result->refinement_steps += w->linear.refinement_steps - before;
@@ -87,6 +95,11 @@ static int linear_solve(Work *w, const double *rhs, double *x, int transpose) {
     if (isfinite(w->linear.max_backward_error))
         w->result->max_backward_error =
             fmax(w->result->max_backward_error, w->linear.max_backward_error);
+    if (failed && w->linear.update_count && !factor_basis(w)) {
+        w->result->basis_update_rejections++;
+        failed = linear_solve(w, rhs, x, transpose);
+    }
+    free(saved);
     return failed;
 }
 static int transpose_solve(Work *w, const double *rhs, double *x) {
@@ -97,7 +110,7 @@ static int transpose_solve(Work *w, const double *rhs, double *x) {
         long double sum = dot(w, w->basis[j], x, &magnitude);
         if (!isfinite(sum) || !isfinite(magnitude) ||
             fabsl(sum - rhs[j]) > 1e-10L * (1 + magnitude))
-            return -1;
+            return w->linear.update_count && !factor_basis(w) ? transpose_solve(w, rhs, x) : -1;
     }
     return 0;
 }
@@ -125,7 +138,15 @@ static double original_basic_tolerance(const Work *w, size_t position) {
         tolerance = fmin(tolerance, 1e-7 * w->equation_scale[w->a[j].row[0]]);
     return tolerance;
 }
-static int refactor(Work *w, int primal_required) {
+static int factor_basis(Work *w) {
+    memset(w->basic, 0, w->n);
+    for (size_t i = 0; i < w->m; i++) {
+        if (w->basis[i] >= w->n || w->basic[w->basis[i]]) {
+            message(w, "numerical_failure", "Invalid or duplicated basis column");
+            return -1;
+        }
+        w->basic[w->basis[i]] = 1;
+    }
     w->result->refactorizations++;
     int failed;
     {
@@ -153,10 +174,19 @@ static int refactor(Work *w, int primal_required) {
     }
     if (w->linear.factor.peak_nnz > w->result->factor_nnz_peak)
         w->result->factor_nnz_peak = w->linear.factor.peak_nnz;
-    if (!failed)
-        failed = linear_solve(w, w->b, w->xb, 0);
+    if (w->linear.factor.core_dimension > w->result->factor_core_peak)
+        w->result->factor_core_peak = w->linear.factor.core_dimension;
+    if (w->linear.factor.eliminated_singletons > w->result->singleton_eliminations_peak)
+        w->result->singleton_eliminations_peak = w->linear.factor.eliminated_singletons;
     if (failed) {
         message(w, "numerical_failure", "Singular or ill-conditioned basis");
+        return -1;
+    }
+    return 0;
+}
+static int basis_values(Work *w, int primal_required) {
+    if (linear_solve(w, w->b, w->xb, 0)) {
+        message(w, "numerical_failure", "Basis solve failed residual check");
         return -1;
     }
     /* Recompute residuals rather than trusting a successful factorization. */
@@ -191,11 +221,33 @@ static int refactor(Work *w, int primal_required) {
     }
     return 0;
 }
+static int refactor(Work *w, int primal_required) {
+    return factor_basis(w) || basis_values(w, primal_required) ? -1 : 0;
+}
 static int is_basic(const Work *w, size_t j) {
-    for (size_t i = 0; i < w->m; i++)
-        if (w->basis[i] == j)
-            return 1;
-    return 0;
+    return w->basic[j] != 0;
+}
+static void change_basis(Work *w, size_t position, size_t column) {
+    w->basic[w->basis[position]] = 0;
+    w->basis[position] = column;
+    w->basic[column] = 1;
+}
+/* The caller has changed its combinatorial basis. A rejected update leaves the
+ * previous linear factor valid, so fallback builds the complete NEW basis. */
+static int update_basis(Work *w, size_t position, const double *direction, int primal_required) {
+    if (w->options->no_updates || !w->linear.valid || w->linear.n != w->m)
+        return refactor(w, primal_required);
+    const Column *c = &w->a[w->basis[position]];
+    size_t before = w->linear.refinement_steps;
+    int status = lab_linear_update(&w->linear, position, c->count, c->row, c->value, direction);
+    w->result->refinement_steps += w->linear.refinement_steps - before;
+    if (status == 0) {
+        w->result->basis_updates++;
+        if (!basis_values(w, primal_required))
+            return 0;
+    }
+    w->result->basis_update_rejections++;
+    return refactor(w, primal_required);
 }
 static void exact_coefficient(const LabModel *m, size_t k, mpq_t q) {
     if (m->exact)
@@ -640,18 +692,18 @@ static int simplex(Work *w, int phase_one) {
         const char *prior_status = w->result->status;
         char prior_message[sizeof w->result->message];
         memcpy(prior_message, w->result->message, sizeof prior_message);
-        w->basis[leaving] = entering;
+        change_basis(w, leaving, entering);
         w->result->iterations++;
         if (!w->options->bland_ratio) {
             /* A ratio prediction cannot establish actual basis feasibility.
              * Check the newly factored basis before accepting it. Retain that
              * factor for the next iteration; the ordinary path factors once. */
-            if (refactor(w, 1)) {
+            if (update_basis(w, leaving, w->direction, 1)) {
                 w->result->rejected_pivots++;
-                w->basis[leaving] = old_column;
+                change_basis(w, leaving, old_column);
                 if (alternative == SIZE_MAX || alternative == leaving || budget(w))
                     return -1;
-                w->basis[alternative] = entering;
+                change_basis(w, alternative, entering);
                 w->result->iterations++;
                 if (refactor(w, 1)) {
                     w->result->rejected_pivots++;
@@ -662,10 +714,15 @@ static int simplex(Work *w, int phase_one) {
                 memcpy(w->result->message, prior_message, sizeof prior_message);
             }
             factor_ready = 1;
+        } else if (!w->options->no_updates) {
+            if (update_basis(w, leaving, w->direction, 1))
+                return -1;
+            factor_ready = 1;
         }
     }
 }
 static void remove_row(Work *w, size_t row, size_t basis_position) {
+    w->basic[w->basis[basis_position]] = 0;
     for (size_t j = 0; j < w->n; j++) {
         Column *c = &w->a[j];
         size_t keep = 0;
@@ -736,7 +793,7 @@ static int remove_artificials(Work *w) {
                 ambiguous = 1;
         }
         if (entering != SIZE_MAX) {
-            w->basis[i] = entering;
+            change_basis(w, i, entering);
             w->result->iterations++;
             i++;
         } else if (ambiguous) {
@@ -872,7 +929,8 @@ static int scale_form(Work *w, const LabModel *m) {
 }
 static int build(Work *w, const LabModel *m) {
     size_t dim = w->options->max_dimension, nz = 0, nr = 0;
-    if (dim > 32768 || (w->options->dense && dim > 4096)) {
+    if (dim > LAB_LP_SPARSE_DIMENSION_LIMIT ||
+        (w->options->dense && dim > LAB_LP_DENSE_DIMENSION_LIMIT)) {
         message(w, "unsupported", "Backend dimension ceiling exceeded");
         return -1;
     }
@@ -899,7 +957,7 @@ static int build(Work *w, const LabModel *m) {
         message(w, "unsupported", "Standard-form dimension limit exceeded");
         return -1;
     }
-    if (m->nnz > (20000000U - 3 * nr) / 4) {
+    if (m->nnz > (128000000U - 3 * nr) / 4) {
         message(w, "unsupported", "Sparse transformation entry budget exceeded");
         return -1;
     }
@@ -919,6 +977,7 @@ static int build(Work *w, const LabModel *m) {
         w->equation_scale[i] = 1;
     w->row_id = lab_alloc(cap, sizeof(size_t));
     w->artificial = lab_alloc(n, 1);
+    w->basic = lab_alloc(n, 1);
     w->art_row = lab_alloc(n, sizeof(size_t));
     w->shift = lab_alloc(m->cols, sizeof(double));
     w->original = lab_alloc(nz, sizeof(size_t));
@@ -1064,23 +1123,25 @@ static int build(Work *w, const LabModel *m) {
         free(precise_shift);
     }
     mpq_clears(precise_rhs, precise_bound, NULL);
+    unsigned char *has_structural = lab_alloc(nr, 1);
+    for (size_t j = 0; j < nz; j++)
+        for (size_t k = 0; k < w->a[j].count; k++)
+            has_structural[w->a[j].row[k]] = 1;
     for (size_t i = 0; i < nr; i++) {
         if (!isfinite(w->b[i])) {
+            free(has_structural);
             message(w, "numerical_failure", "Bound transformation overflow");
             return -1;
         }
         if (w->artificial[w->basis[i]] && w->b[i] > 0) {
-            int nonzero = 0;
-            for (size_t j = 0; j < nz && !nonzero; j++)
-                for (size_t k = 0; k < w->a[j].count; k++)
-                    if (w->a[j].row[k] == i)
-                        nonzero = 1;
-            if (!nonzero) {
+            if (!has_structural[i]) {
+                free(has_structural);
                 message(w, "infeasible", "Contradictory constant row");
                 return -1;
             }
         }
     }
+    free(has_structural);
     for (size_t j = 0; j < n; j++) {
         w->result->standard_nnz += w->a[j].count;
         for (size_t k = 0; k < w->a[j].count; k++)
@@ -1381,6 +1442,7 @@ static void work_free(Work *w) {
     free(w->equation_scale);
     free(w->row_upper);
     free(w->artificial);
+    free(w->basic);
     free(w->lower_row);
     free(w->upper_row);
     free(w->transform);
@@ -1442,9 +1504,12 @@ static int cold_solve(Work *w, const LabModel *m) {
 static int dual_simplex(Work *w, int original_units) {
     double *reduced = lab_alloc(w->n, sizeof(double));
     int outcome = -1;
+    int factor_ready = !w->options->no_updates && w->linear.valid && w->linear.n == w->m &&
+                       !basis_values(w, 0);
     for (;;) {
-        if (budget(w) || refactor(w, 0))
+        if (budget(w) || (!factor_ready && refactor(w, 0)))
             break;
+        factor_ready = 0;
         for (size_t i = 0; i < w->m; i++)
             w->cb[i] = w->cost[w->basis[i]];
         if (transpose_solve(w, w->cb, w->pi)) {
@@ -1545,9 +1610,14 @@ static int dual_simplex(Work *w, int original_units) {
             }
             break;
         }
-        w->basis[leaving] = entering;
+        change_basis(w, leaving, entering);
         w->result->iterations++;
         w->result->dual_iterations++;
+        if (!w->options->no_updates) {
+            if (update_basis(w, leaving, NULL, 0))
+                break;
+            factor_ready = 1;
+        }
     }
     free(reduced);
     return outcome;

@@ -260,6 +260,67 @@ class MilpSolver(unittest.TestCase):
                 self.assertEqual(result['status'], status, result)
                 self.assertFalse(result.get('certifies_optimality', False))
 
+    def test_root_presolve_tightens_box_and_owned_row_view(self):
+        # x+y<=3 and x-y>=1 with fixed y=1 imply x=2. Both source rows
+        # become redundant only inside that returned box. The original model
+        # is still used by assert_point and the independent external checker.
+        model = {'cost': [1, F(1, 10)], 'integer': [True, False],
+                 'bounds': [(0, 8), (1, 1)],
+                 'rows': [([1, 1], None, 3), ([1, -1], 1, None)]}
+        self.assertEqual(mip_oracle(model), F(21, 10))
+        for cold in ([], ['--cold']):
+            with self.subTest(cold=cold):
+                enabled = self.compare(model, cold)
+                disabled = self.compare(model, [*cold, '--no-presolve'])
+                self.assertGreater(enabled['presolve_passes'], 0, enabled)
+                self.assertGreater(enabled['presolve_tightenings'], 0, enabled)
+                self.assertEqual(enabled['presolve_fixed'], 2, enabled)
+                self.assertEqual(enabled['presolve_rows'], 2, enabled)
+                self.assertEqual(disabled['presolve_passes'], 0, disabled)
+                self.assertEqual(disabled['presolve_tightenings'], 0, disabled)
+                self.assertEqual(disabled['presolve_rows'], 0, disabled)
+                self.assertEqual(enabled['objective'], disabled['objective'])
+
+    def test_root_presolve_integer_contradiction_is_not_lp_unboundedness(self):
+        # The continuous interval [.5,.75] is nonempty, while the integer
+        # domain is empty. Disable propagation to retain the branching path.
+        model = {'cost': [1], 'integer': [True], 'bounds': [(0, 2)],
+                 'rows': [([1], F(1, 2), F(3, 4))]}
+        self.assertIsNone(mip_oracle(model))
+        enabled = self.compare(model)
+        disabled = self.compare(model, ['--no-presolve'])
+        self.assertEqual(enabled['nodes'], 0, enabled)
+        self.assertEqual(enabled['lp_solves'], 0, enabled)
+        self.assertGreater(enabled['presolve_tightenings'], 0, enabled)
+        self.assertGreater(disabled['nodes'], 0, disabled)
+        self.assertGreater(disabled['lp_solves'], 0, disabled)
+        self.assertEqual(disabled['branch_observations'], 0, disabled)
+
+    def test_most_fractional_selection_learning_and_first_fractional_ablation(self):
+        # Root LP is (.25,.5). Most fractionality chooses x1; the explicit
+        # legacy ablation chooses x0. Two optimal children can train history;
+        # infeasible children and the final fixed-integer repair cannot.
+        base = {'cost': [1, 1], 'integer': [True, True], 'bounds': [(0, 2), (0, 2)],
+                'rows': [([1, 0], F(1, 4), None), ([0, 1], F(1, 2), None)]}
+        with tempfile.TemporaryDirectory() as td:
+            root = pathlib.Path(td)
+            signatures = []
+            for offset in (0, 10**12):
+                model = {**base, 'offset': offset}
+                for policy, flags, expected in [('default', [], 'x1'),
+                                                 ('replay', [], 'x1'),
+                                                 ('first', ['--first-fractional'], 'x0')]:
+                    trace = root / f'{offset}-{policy}.jsonl'
+                    result = self.compare(model, ['--no-presolve', '--trace', trace, *flags])
+                    events = [json.loads(line) for line in trace.read_text().splitlines()]
+                    branches = [(event['variable'], event['value']) for event in events
+                                if event['event'] == 'branch']
+                    self.assertEqual(branches[0][0], expected, (result, events))
+                    self.assertEqual(result['branch_observations'], 0 if policy == 'first' else 2, result)
+                    if policy != 'first':
+                        signatures.append(branches)
+            self.assertTrue(all(signature == signatures[0] for signature in signatures))
+
     def test_node_limit_retains_a_checked_incumbent(self):
         # Either first down branch produces objective one, while a sibling
         # with LP bound1.5 remains. Hitting a limit must keep that witness.

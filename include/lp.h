@@ -1,6 +1,8 @@
 #ifndef LAB_LP_H
 #define LAB_LP_H
 #include "model.h"
+#define LAB_LP_SPARSE_DIMENSION_LIMIT 16000000
+#define LAB_LP_DENSE_DIMENSION_LIMIT 4096
 typedef struct {
     double time_limit;
     size_t iteration_limit, max_dimension;
@@ -8,6 +10,7 @@ typedef struct {
     int dense; /* zero: sparse LU; one: dense reference backend */
     int no_scaling, no_refinement, no_exact, bland_ratio;
     int no_primal_repair;
+    int no_updates;
 } LabLpOptions;
 typedef struct {
     const char *status;
@@ -29,6 +32,8 @@ typedef struct {
     size_t primal_repairs, primal_repair_iterations;
     size_t exact_primal_attempts, exact_primal_recoveries;
     int primal_repair_required;
+    size_t basis_updates, basis_update_rejections;
+    size_t factor_core_peak, singleton_eliminations_peak;
 } LabLpResult;
 void lab_lp_solve(const LabModel *m, const LabLpOptions *options, LabLpResult *result);
 void lab_lp_result_free(LabLpResult *result);

@@ -232,7 +232,7 @@ static int invalid_and_alias_cases(void) {
     CHECK(lab_linear_solve(&s, rhs, x, 0) != 0);
     rhs[0] = 2;
     CHECK(lab_linear_solve(&s, rhs, x, 0) == 0 && x[0] == 2 && x[1] == 1);
-    CHECK(lab_linear_factorize(&s, 1000001, empty, NULL, NULL, 0) != 0);
+    CHECK(lab_linear_factorize(&s, LAB_LINEAR_DIMENSION_LIMIT + 1, empty, NULL, NULL, 0) != 0);
     CHECK(lab_linear_factorize(&s, 4097, empty, NULL, NULL, 1) != 0);
     const size_t bad_start[] = {0, 2, 1}, bad_rows[] = {0, 2};
     CHECK(lab_linear_factorize(&s, 2, bad_start, rows, values, 0) != 0);

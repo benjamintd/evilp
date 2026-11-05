@@ -8,7 +8,7 @@ typedef struct {
     LabLpOptions lp;
     double time_limit;
     size_t node_limit;
-    int cold;
+    int cold, no_presolve, first_fractional;
     const char *trace_path;
 } LabBbOptions;
 
@@ -27,6 +27,10 @@ typedef struct {
     size_t rejected_pivots, harris_rescues;
     size_t primal_repairs, primal_repair_iterations;
     size_t exact_primal_attempts, exact_primal_recoveries;
+    size_t basis_updates, basis_update_rejections;
+    size_t factor_core_peak, singleton_eliminations_peak;
+    size_t presolve_passes, presolve_tightenings, presolve_fixed, presolve_rows;
+    size_t branch_observations;
 } LabBbResult;
 
 void lab_bb_solve(const LabModel *model, const LabBbOptions *options, LabBbResult *result);

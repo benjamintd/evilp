@@ -97,18 +97,21 @@ int main(int argc, char **argv) {
              "          [--time-limit SECONDS] [--iteration-limit N] [--max-dimension N]\n"
              "          [--backend sparse|dense]\n"
              "          [--no-scaling] [--no-refinement] [--no-exact] [--bland-ratio]\n"
-             "          [--no-primal-repair]\n"
+             "          [--no-primal-repair] [--no-updates]\n"
              "          LP: [--dual NEW_FILE] [--farkas NEW_FILE] [--basis NEW_FILE] [--read-basis FILE]\n"
              "          MILP: [--node-limit N] [--cold] [--trace NEW_FILE]\n"
+             "                [--no-presolve] [--first-fractional]\n"
              "C17 LP and numerical branch-and-bound prototype. Select problem mode explicitly.\n"
              "JSON statuses are numerical solver claims; use milpcheck for validation.\n"
-             "Default standard-form dimension limit4096; sparse hard cap32768,dense hard cap4096.");
+             "Sparse standard-form limit16000000; dense hard cap4096. Sparse basis limit8000000.");
         return 0;
     }
     const char *path = NULL, *solution = NULL, *dual = NULL, *trace_path = NULL, *farkas = NULL;
-    int relax = 0, mip = 0, cold = 0, node_limit_set = 0;
+    int relax = 0, mip = 0, cold = 0, node_limit_set = 0, dimension_limit_set = 0;
+    int no_presolve = 0, first_fractional = 0;
     size_t node_limit = 100000;
-    LabLpOptions options = {.time_limit = 60, .iteration_limit = 100000, .max_dimension = 4096};
+    LabLpOptions options = {.time_limit = 60, .iteration_limit = 100000,
+                            .max_dimension = LAB_LP_SPARSE_DIMENSION_LIMIT};
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
         if (!strcmp(a, "--relax")) {
@@ -127,6 +130,12 @@ int main(int argc, char **argv) {
             options.bland_ratio = 1;
         } else if (!strcmp(a, "--no-primal-repair")) {
             options.no_primal_repair = 1;
+        } else if (!strcmp(a, "--no-updates")) {
+            options.no_updates = 1;
+        } else if (!strcmp(a, "--no-presolve")) {
+            no_presolve = 1;
+        } else if (!strcmp(a, "--first-fractional")) {
+            first_fractional = 1;
         } else if (!strcmp(a, "--solution") || !strcmp(a, "--dual") || !strcmp(a, "--basis") ||
                    !strcmp(a, "--read-basis") || !strcmp(a, "--trace") || !strcmp(a, "--farkas")) {
             if (++i == argc)
@@ -170,7 +179,9 @@ int main(int argc, char **argv) {
                                                         : &options.max_dimension;
             if (!strcmp(a, "--node-limit"))
                 node_limit_set = 1;
-            if (positive_size(argv[i], v, !strcmp(a, "--max-dimension") ? 32768 : SIZE_MAX))
+            if (!strcmp(a, "--max-dimension"))
+                dimension_limit_set = 1;
+            if (positive_size(argv[i], v, !strcmp(a, "--max-dimension") ? LAB_LP_SPARSE_DIMENSION_LIMIT : SIZE_MAX))
                 return error("input_error", "Invalid positive integer limit", 2);
         } else if (a[0] == '-' || path) {
             return error("input_error", "Unknown option or extra model path", 2);
@@ -183,9 +194,11 @@ int main(int argc, char **argv) {
     if (mip && (dual || farkas || options.basis_in || options.basis_out))
         return error("input_error",
                      "Dual/basis files are LP-only; MILP tree proofs are not implemented", 2);
-    if (!mip && (cold || node_limit_set || trace_path))
+    if (!mip && (cold || node_limit_set || trace_path || no_presolve || first_fractional))
         return error("input_error", "Cold search, node limits and traces require --mip", 2);
-    if (options.dense && options.max_dimension > 4096)
+    if (options.dense && !dimension_limit_set)
+        options.max_dimension = LAB_LP_DENSE_DIMENSION_LIMIT;
+    if (options.dense && options.max_dimension > LAB_LP_DENSE_DIMENSION_LIMIT)
         return error("input_error", "Dense backend hard dimension limit is4096", 2);
     double started = lab_now();
     char hash[65];
@@ -206,6 +219,8 @@ int main(int argc, char **argv) {
                                    .time_limit = options.time_limit,
                                    .node_limit = node_limit,
                                    .cold = cold,
+                                   .no_presolve = no_presolve,
+                                   .first_fractional = first_fractional,
                                    .trace_path = trace_path};
         LabBbResult r;
         lab_bb_solve(&model, &bb_options, &r);
@@ -246,7 +261,11 @@ int main(int argc, char **argv) {
                "\"exact_infeasibilities\":%zu,\"ratio_test\":\"%s\",\"exact_model_available\":%s,"
                "\"rejected_pivots\":%zu,\"harris_rescues\":%zu,"
                "\"primal_repair_enabled\":%s,\"primal_repairs\":%zu,\"primal_repair_iterations\":%zu,"
-               "\"exact_primal_attempts\":%zu,\"exact_primal_recoveries\":%zu}\n",
+               "\"exact_primal_attempts\":%zu,\"exact_primal_recoveries\":%zu,"
+               "\"updates_enabled\":%s,\"basis_updates\":%zu,\"basis_update_rejections\":%zu,"
+               "\"factor_core_peak\":%zu,\"singleton_eliminations_peak\":%zu,"
+               "\"presolve_enabled\":%s,\"presolve_passes\":%zu,\"presolve_tightenings\":%zu,"
+               "\"presolve_fixed\":%zu,\"presolve_rows\":%zu,\"branch_observations\":%zu}\n",
                model.rows, model.cols, model.nnz, r.nodes, r.lp_solves, r.lp_iterations,
                r.refactorizations, r.warm_starts, r.cold_starts, r.pruned_nodes, r.dual_iterations,
                r.cold_fallbacks, r.factor_nnz_peak, r.standard_nnz_peak, r.elapsed,
@@ -258,7 +277,10 @@ int main(int argc, char **argv) {
                options.bland_ratio ? "bland" : "guarded_bland_harris", model.exact ? "true" : "false",
                r.rejected_pivots, r.harris_rescues, options.no_primal_repair ? "false" : "true",
                r.primal_repairs, r.primal_repair_iterations, r.exact_primal_attempts,
-               r.exact_primal_recoveries);
+               r.exact_primal_recoveries, options.no_updates ? "false" : "true", r.basis_updates,
+               r.basis_update_rejections, r.factor_core_peak, r.singleton_eliminations_peak,
+               no_presolve ? "false" : "true", r.presolve_passes, r.presolve_tightenings,
+               r.presolve_fixed, r.presolve_rows, r.branch_observations);
         int code = status_code(r.status);
         lab_bb_result_free(&r);
         lab_model_free(&model);
@@ -302,7 +324,9 @@ int main(int argc, char **argv) {
         "\"ratio_test\":\"%s\",\"exact_model_available\":%s,"
         "\"rejected_pivots\":%zu,\"harris_rescues\":%zu,"
         "\"primal_repair_enabled\":%s,\"primal_repairs\":%zu,\"primal_repair_iterations\":%zu,"
-        "\"exact_primal_attempts\":%zu,\"exact_primal_recoveries\":%zu}\n",
+        "\"exact_primal_attempts\":%zu,\"exact_primal_recoveries\":%zu,"
+        "\"updates_enabled\":%s,\"basis_updates\":%zu,\"basis_update_rejections\":%zu,"
+        "\"factor_core_peak\":%zu,\"singleton_eliminations_peak\":%zu}\n",
         model.rows, model.cols, model.nnz, r.standard_rows, r.standard_columns, r.redundant_rows,
         r.iterations, r.refactorizations, r.primal_residual, r.dual_residual, r.elapsed,
         lab_now() - started, options.dense ? "dense_lu_reference" : "sparse_lu",
@@ -314,7 +338,8 @@ int main(int argc, char **argv) {
         r.farkas ? "true" : "false", options.bland_ratio ? "bland" : "guarded_bland_harris",
         model.exact ? "true" : "false", r.rejected_pivots, r.harris_rescues,
         options.no_primal_repair ? "false" : "true", r.primal_repairs, r.primal_repair_iterations,
-        r.exact_primal_attempts, r.exact_primal_recoveries);
+        r.exact_primal_attempts, r.exact_primal_recoveries, options.no_updates ? "false" : "true",
+        r.basis_updates, r.basis_update_rejections, r.factor_core_peak, r.singleton_eliminations_peak);
     int code = status_code(r.status);
     lab_lp_result_free(&r);
     lab_model_free(&model);

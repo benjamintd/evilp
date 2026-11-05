@@ -24,11 +24,12 @@
 #endif
 
 enum {
-    LINEAR_DIMENSION_LIMIT = 1000000,
-    LINEAR_ENTRY_LIMIT = 20000000,
+    LINEAR_DIMENSION_LIMIT = LAB_LINEAR_DIMENSION_LIMIT,
+    LINEAR_ENTRY_LIMIT = 128000000,
     LINEAR_DENSE_LIMIT = 4096,
     REFINEMENT_LIMIT = 8
 };
+#define LINEAR_ETA_ENTRY_LIMIT 4000000
 
 static int failure(LabLinear *s, const char *message) {
     snprintf(s->error, sizeof s->error, "%s", message);
@@ -169,6 +170,7 @@ int lab_linear_factorize_ex(LabLinear *s, size_t n, const size_t *start, const s
     free(scaled);
     if (result)
         return failure(s, "Scaled basis is singular or ill-conditioned");
+    s->factor.core_refinement = refinement != 0;
     s->valid = 1;
     return 0;
 }
@@ -409,7 +411,8 @@ int lab_linear_update(LabLinear *s, size_t column, size_t count, const size_t *r
         return update_failure(s, "Linear update requires round-to-nearest", -1);
     if (!s->valid || column >= s->n || count > s->n || (count && (!row || !value)))
         return update_failure(s, "Invalid basis update dimensions or storage", -1);
-    if (s->update_count >= LAB_LINEAR_UPDATE_LIMIT)
+    if (s->update_count >= LAB_LINEAR_UPDATE_LIMIT ||
+        s->n > LINEAR_ETA_ENTRY_LIMIT / (s->update_count + 1))
         return update_failure(s, "Basis update limit requires refactorization", 1);
     size_t n = s->n;
     double *new_column = lab_alloc(n, sizeof(double));

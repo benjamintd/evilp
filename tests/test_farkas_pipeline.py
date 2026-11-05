@@ -300,7 +300,13 @@ class FarkasPipeline(unittest.TestCase):
             root = pathlib.Path(td)
             path, trace = root / 'source.mps', root / 'trace.jsonl'
             path.write_text(model)
-            p = subprocess.run([SOLVER, str(path), '--mip', '--trace', str(trace)],
+            default = subprocess.run([SOLVER, str(path), '--mip'],
+                                     text=True, capture_output=True, timeout=20)
+            self.assertEqual(default.returncode, 0, (default.stdout, default.stderr))
+            self.assertEqual(json.loads(default.stdout)['status'], 'infeasible')
+            # Root propagation now closes this integer model. Keep this same
+            # model, explicitly disable it to exercise local branch proofs.
+            p = subprocess.run([SOLVER, str(path), '--mip', '--no-presolve', '--trace', str(trace)],
                                text=True, capture_output=True, timeout=20)
             self.assertEqual(p.returncode, 0, (p.stdout, p.stderr))
             self.assertEqual(json.loads(p.stdout)['status'], 'infeasible')

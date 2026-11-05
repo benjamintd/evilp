@@ -3,6 +3,7 @@
 #include "factor.h"
 
 #define LAB_LINEAR_UPDATE_LIMIT 32
+#define LAB_LINEAR_DIMENSION_LIMIT 8000000
 
 /* Equilibrated basis solve. Caller CSC inputs remain immutable. Current
  * original-unit coefficients are retained for compensated residuals; sparse
@@ -41,7 +42,7 @@ int lab_linear_solve(LabLinear *s, const double *rhs, double *x, int transpose);
  * optional direction is B_current^-1 * new_column in ORIGINAL units. Supplied
  * directions are independently checked; NULL computes it with guarded solves.
  * Return 0 when accepted, 1 when a full refactorization is required (including
- * the bounded update limit or a weak/inaccurate pivot), -1 on invalid input.
+ * the 32-update/four-million-entry limit or a weak/inaccurate pivot), -1 on invalid input.
  * Every nonzero return leaves the old basis and factorization usable. The
  * caller may refactor its NEW basis directly with lab_linear_factorize_ex. */
 int lab_linear_update(LabLinear *s, size_t column, size_t nnz, const size_t *row,

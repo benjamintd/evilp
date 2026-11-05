@@ -1,6 +1,8 @@
 #include "bb.h"
 #include "common.h"
 #include "exact.h"
+#include "presolve.h"
+#include "search.h"
 #include <math.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -14,9 +16,15 @@ typedef struct Node {
     double lower, upper;
     long double bound;
     int has_bound;
+    long double parent_lp_score;
+    double branch_distance;
+    LabSearchDirection direction;
 } Node;
 typedef struct {
     const LabModel *model;
+    LabModel lp_model;
+    double *lp_row_lower, *lp_row_upper;
+    LabSearch branching;
     const LabBbOptions *options;
     LabBbResult *result;
     double started, sense;
@@ -160,7 +168,7 @@ static int call_lp(Search *s, const double *lower, const double *upper, LabLpRes
     } else
 #endif
     {
-        LabModel view = *s->model;
+        LabModel view = s->lp_model;
         view.col_lower = (double *)lower;
         view.col_upper = (double *)upper;
         lab_lp_solve(&view, &opt, lp);
@@ -182,6 +190,12 @@ static int call_lp(Search *s, const double *lower, const double *upper, LabLpRes
     s->result->primal_repair_iterations += lp->primal_repair_iterations;
     s->result->exact_primal_attempts += lp->exact_primal_attempts;
     s->result->exact_primal_recoveries += lp->exact_primal_recoveries;
+    s->result->basis_updates += lp->basis_updates;
+    s->result->basis_update_rejections += lp->basis_update_rejections;
+    if (lp->factor_core_peak > s->result->factor_core_peak)
+        s->result->factor_core_peak = lp->factor_core_peak;
+    if (lp->singleton_eliminations_peak > s->result->singleton_eliminations_peak)
+        s->result->singleton_eliminations_peak = lp->singleton_eliminations_peak;
     s->result->refinement_steps += lp->refinement_steps;
     if (lp->scaled_rows > s->result->scaled_rows)
         s->result->scaled_rows = lp->scaled_rows;
@@ -345,13 +359,20 @@ static int repair(Search *s, const LabLpResult *lp, const Node *node) {
     lab_lp_result_free(&fixed);
     return closes_node;
 }
-static size_t branch_variable(Search *s, const double *primal, double tolerance) {
+static LabSearchChoice branch_variable(Search *s, const double *primal, double tolerance,
+                                       size_t *variable) {
+    if (!s->options->first_fractional)
+        return lab_search_choose(s->model, primal, s->lower, s->upper,
+                                 &s->branching, tolerance, variable);
+    *variable = SIZE_MAX;
     for (size_t j = 0; j < s->model->cols; j++)
-        if (s->model->integer[j] && fabs(primal[j] - round(primal[j])) > tolerance)
-            return j;
-    return SIZE_MAX;
+        if (s->model->integer[j] && fabs(primal[j] - round(primal[j])) > tolerance) {
+            *variable = j;
+            return LAB_SEARCH_CHOSEN;
+        }
+    return LAB_SEARCH_INTEGRAL;
 }
-static int branches(Search *s, Node *node, size_t j, double x) {
+static int branches(Search *s, Node *node, size_t j, double x, long double lp_score) {
     double left = floor(x), right = ceil(x);
     int has_left = left >= s->lower[j] && left < s->upper[j];
     int has_right = right <= s->upper[j] && right > s->lower[j];
@@ -362,10 +383,20 @@ static int branches(Search *s, Node *node, size_t j, double x) {
     }
     /* Push right first so the lower branch is explored first. Both children
      * inherit the solved parent's numerical lower bound. */
-    if (has_right)
-        push(s, new_node(s, node, j, right, s->upper[j], node->bound, node->has_bound));
-    if (has_left)
-        push(s, new_node(s, node, j, s->lower[j], left, node->bound, node->has_bound));
+    if (has_right) {
+        Node *child = new_node(s, node, j, right, s->upper[j], node->bound, node->has_bound);
+        child->parent_lp_score = lp_score;
+        child->branch_distance = right - x;
+        child->direction = LAB_SEARCH_UP;
+        push(s, child);
+    }
+    if (has_left) {
+        Node *child = new_node(s, node, j, s->lower[j], left, node->bound, node->has_bound);
+        child->parent_lp_score = lp_score;
+        child->branch_distance = x - left;
+        child->direction = LAB_SEARCH_DOWN;
+        push(s, child);
+    }
     trace(s, node, "branch", j, x, 1);
     return 0;
 }
@@ -377,6 +408,7 @@ void lab_bb_solve(const LabModel *model, const LabBbOptions *options, LabBbResul
     memset(result, 0, sizeof *result);
     Search s = {0};
     s.model = model;
+    s.lp_model = *model;
     s.options = options;
     s.result = result;
     s.sense = model->maximize ? -1 : 1;
@@ -406,7 +438,6 @@ void lab_bb_solve(const LabModel *model, const LabBbOptions *options, LabBbResul
     s.upper = lab_alloc(n, sizeof(double));
     s.repair_lower = lab_alloc(n, sizeof(double));
     s.repair_upper = lab_alloc(n, sizeof(double));
-    s.constant = model->offset;
     for (size_t j = 0; j < n; j++) {
         double lo = model->col_lower[j], hi = model->col_upper[j];
         if (model->integer[j]) {
@@ -428,15 +459,70 @@ void lab_bb_solve(const LabModel *model, const LabBbOptions *options, LabBbResul
         }
         s.base_lower[j] = lo;
         s.base_upper[j] = hi;
+    }
+    if (!options->no_presolve) {
+        double available = remaining(&s);
+        if (available <= 0) {
+            outcome(&s, "time_limit", "MILP time budget exhausted before presolve");
+            goto cleanup;
+        }
+        LabPresolveOptions opt = {.time_limit = fmin(2, .05 * available),
+                                  .max_passes = 32, .relax = 0};
+        LabPresolveResult presolved;
+        lab_presolve(model, s.base_lower, s.base_upper, &opt, &presolved);
+        result->presolve_passes = presolved.passes;
+        result->presolve_tightenings = presolved.tightenings;
+        result->presolve_fixed = presolved.fixed;
+        result->presolve_rows = presolved.redundant_rows;
+        if (remaining(&s) <= 0) {
+            outcome(&s, "time_limit", "MILP time budget exhausted during root presolve");
+            lab_presolve_result_free(&presolved);
+            goto cleanup;
+        }
+        if (!strcmp(presolved.status, "input_error") || !strcmp(presolved.status, "infeasible")) {
+            outcome(&s, presolved.status, presolved.message);
+            lab_presolve_result_free(&presolved);
+            goto cleanup;
+        }
+        memcpy(s.base_lower, presolved.lower, n * sizeof(double));
+        memcpy(s.base_upper, presolved.upper, n * sizeof(double));
+        if (presolved.redundant_rows) {
+            s.lp_row_lower = lab_alloc(model->rows, sizeof(double));
+            s.lp_row_upper = lab_alloc(model->rows, sizeof(double));
+            memcpy(s.lp_row_lower, model->row_lower, model->rows * sizeof(double));
+            memcpy(s.lp_row_upper, model->row_upper, model->rows * sizeof(double));
+            for (size_t i = 0; i < model->rows; i++)
+                if (presolved.redundant[i]) {
+                    s.lp_row_lower[i] = -INFINITY;
+                    s.lp_row_upper[i] = INFINITY;
+                }
+            s.lp_model.row_lower = s.lp_row_lower;
+            s.lp_model.row_upper = s.lp_row_upper;
+        }
+        lab_presolve_result_free(&presolved);
+    }
+    s.lp_model.col_lower = s.base_lower;
+    s.lp_model.col_upper = s.base_upper;
+    s.constant = model->offset;
+    for (size_t j = 0; j < n; j++) {
+        double lo = s.base_lower[j], hi = s.base_upper[j];
+        if (model->integer[j] &&
+            ((isfinite(lo) && fabs(lo) > 9007199254740991.0) ||
+             (isfinite(hi) && fabs(hi) > 9007199254740991.0))) {
+            outcome(&s, "unsupported", "Integer bounds exceed the exactly spaced double range");
+            goto cleanup;
+        }
         s.reference[j] = isfinite(lo) ? lo : isfinite(hi) ? hi : 0;
         s.constant += (long double)model->objective[j] * s.reference[j];
     }
+    if (!options->first_fractional)
+        (void)lab_search_init(&s.branching, n); /* allocation failure keeps deterministic fallback */
 #ifdef LAB_LP_SESSION_API
     if (!options->cold) {
         LabLpOptions opt = options->lp;
         opt.basis_in = opt.basis_out = NULL;
         opt.time_limit = fmin(opt.time_limit, remaining(&s));
-        s.session = lab_lp_session_create(model, &opt);
+        s.session = lab_lp_session_create(&s.lp_model, &opt);
     }
 #endif
     push(&s, new_node(&s, NULL, SIZE_MAX, 0, 0, 0, 0));
@@ -519,6 +605,10 @@ void lab_bb_solve(const LabModel *model, const LabBbOptions *options, LabBbResul
             release(node);
             goto cleanup;
         }
+        if (!options->first_fractional && node->parent && node->variable != SIZE_MAX &&
+            lab_search_observe(&s.branching, node->variable, node->direction,
+                               node->branch_distance, normalized - node->parent_lp_score) == 1)
+            result->branch_observations++;
         node->bound = node->has_bound ? fmaxl(node->bound, lower) : lower;
         node->has_bound = 1;
         if (result->has_primal && node->bound >= s.incumbent) {
@@ -529,8 +619,17 @@ void lab_bb_solve(const LabModel *model, const LabBbOptions *options, LabBbResul
             release(node);
             continue;
         }
-        size_t variable = branch_variable(&s, lp.primal, 1e-7);
-        if (variable == SIZE_MAX) {
+        size_t variable = SIZE_MAX;
+        LabSearchChoice selection = branch_variable(&s, lp.primal, 1e-7, &variable);
+        if (selection < 0) {
+            outcome(&s, selection == LAB_SEARCH_UNSUPPORTED ? "unsupported" : "numerical_failure",
+                    "Cannot select a progressing integer branch");
+            global_bound(&s, node);
+            lab_lp_result_free(&lp);
+            release(node);
+            goto cleanup;
+        }
+        if (selection == LAB_SEARCH_INTEGRAL) {
             int repaired = repair(&s, &lp, node);
             if (repaired < 0) {
                 global_bound(&s, node);
@@ -545,16 +644,17 @@ void lab_bb_solve(const LabModel *model, const LabBbOptions *options, LabBbResul
             }
             /* A failed rounded assignment does not establish this node's
              * infeasibility. Branch on any remaining exact fraction or stop. */
-            variable = branch_variable(&s, lp.primal, 0);
-            if (variable == SIZE_MAX) {
-                outcome(&s, "numerical_failure", "Integral node failed fixed-integer repair");
+            selection = branch_variable(&s, lp.primal, 0, &variable);
+            if (selection != LAB_SEARCH_CHOSEN) {
+                outcome(&s, selection == LAB_SEARCH_UNSUPPORTED ? "unsupported" : "numerical_failure",
+                        "Integral node failed fixed-integer repair");
                 global_bound(&s, node);
                 lab_lp_result_free(&lp);
                 release(node);
                 goto cleanup;
             }
         }
-        if (branches(&s, node, variable, lp.primal[variable])) {
+        if (branches(&s, node, variable, lp.primal[variable], normalized)) {
             global_bound(&s, node);
             lab_lp_result_free(&lp);
             release(node);
@@ -580,6 +680,7 @@ cleanup:
 #ifdef LAB_LP_SESSION_API
     lab_lp_session_free(s.session);
 #endif
+    lab_search_free(&s.branching);
     if (s.trace) {
         int failed = ferror(s.trace);
         if (fclose(s.trace))
@@ -589,6 +690,8 @@ cleanup:
     }
     free(s.base_lower);
     free(s.base_upper);
+    free(s.lp_row_lower);
+    free(s.lp_row_upper);
     free(s.reference);
     free(s.lower);
     free(s.upper);
