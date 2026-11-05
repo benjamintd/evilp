@@ -24,6 +24,7 @@ typedef struct {
     size_t *basis, *original, *row_id, *art_row;
     size_t *source_row;
     double *row_scale;
+    double *structural_norm;
     double *equation_scale;
     unsigned char *row_upper;
     unsigned char *artificial;
@@ -74,10 +75,10 @@ static void scatter(const Work *w, size_t j, double *v) {
         v[c->row[k]] += c->value[k];
 }
 static long double column_norm(const Work *w, size_t j) {
-    long double norm = 0;
-    for (size_t k = 0; k < w->a[j].count; k++)
-        norm = fmaxl(norm, fabs(w->a[j].value[k]));
-    return norm;
+    if (j < w->structural)
+        return w->structural_norm[j];
+    /* Slack and artificial columns have at most one unscaled unit entry. */
+    return w->a[j].count ? fabs(w->a[j].value[0]) : 0;
 }
 static int linear_solve(Work *w, const double *rhs, double *x, int transpose) {
     double *saved = NULL;
@@ -726,13 +727,17 @@ static void remove_row(Work *w, size_t row, size_t basis_position) {
     for (size_t j = 0; j < w->n; j++) {
         Column *c = &w->a[j];
         size_t keep = 0;
+        double norm = 0;
         for (size_t k = 0; k < c->count; k++) {
             if (c->row[k] == row)
                 continue;
             c->row[keep] = c->row[k] - (size_t)(c->row[k] > row);
             c->value[keep++] = c->value[k];
+            norm = fmax(norm, fabs(c->value[keep - 1]));
         }
         c->count = keep;
+        if (j < w->structural)
+            w->structural_norm[j] = norm;
     }
     for (size_t i = row; i + 1 < w->m; i++) {
         w->b[i] = w->b[i + 1];
@@ -1152,6 +1157,13 @@ static int build(Work *w, const LabModel *m) {
     }
     if (scale_form(w, m))
         return -1;
+    /* Coefficients remain fixed between row deletions. Cache the same maximum
+     * used by pricing's uncertainty guard instead of rescanning every column
+     * after every pivot. Only structural columns need an allocated cache. */
+    w->structural_norm = lab_alloc(nz, sizeof(double));
+    for (size_t j = 0; j < nz; j++)
+        for (size_t k = 0; k < w->a[j].count; k++)
+            w->structural_norm[j] = fmax(w->structural_norm[j], fabs(w->a[j].value[k]));
     w->xb = lab_alloc(cap, sizeof(double));
     w->pi = lab_alloc(cap, sizeof(double));
     w->cb = lab_alloc(cap, sizeof(double));
@@ -1439,6 +1451,7 @@ static void work_free(Work *w) {
     free(w->art_row);
     free(w->source_row);
     free(w->row_scale);
+    free(w->structural_norm);
     free(w->equation_scale);
     free(w->row_upper);
     free(w->artificial);
