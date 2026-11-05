@@ -7,7 +7,9 @@ Milestone 2A adds the first native LP solver: bounded-variable transformations,
 two-phase revised simplex, a dense LU reference backend, and independent
 rational LP-bound validation. Integer search is the next milestone.
 
-See [the LP engine and validation contract](docs/LP-ENGINE.md).
+See [the LP engine and completed validation](docs/LP-ENGINE.md),
+[the lab's LP report](results/lp-native-v2/lab/summary.html), and
+[the four-engine crosscheck](results/lp-native-v2/summary.json).
 
 Milestone 1 is implemented and exercised on all 240 MIPLIB benchmark instances.
 See [the baseline summary](docs/BASELINES.md),

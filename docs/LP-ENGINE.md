@@ -130,6 +130,40 @@ unbounded-ray verification and complete MILP proof logging are not implemented.
 
 ## Validation and next gate
 
+Completed validation at clean source revision `f94761e`:
+
+| Check | Result |
+| --- | --- |
+| Release CTest | All six suites pass |
+| AddressSanitizer / UndefinedBehaviorSanitizer CTest | All six suites pass |
+| Generated exact LP oracle | 1,000 cases agree |
+| Native continuous LP comparisons | 32/32 candidates pass and match exact references within the recorded comparison tolerance |
+| Independently checked lab bounds | 8/8 valid and on the safe side of the exact optimum |
+| Exact exported primal/dual example | LP optimum 853/100 independently certified |
+
+The native comparison consists of eight fixtures × HiGHS, SCIP, Cbc and the
+lab solver. Maximum objective error is about 5.24e-9, from Cbc's printed
+solution precision. There are 31 clean process exits and one documented HiGHS
+row-name output warning with exit code 1. Its raw `claimed_status` remains
+`process_error`, while `reported_solver_status` is `optimal`; the exact-reference
+and primal checks pass. The integration script accepts only that specific
+known warning pattern and retains it separately. No timing ranking is claimed.
+
+Artifacts:
+
+- [Final native crosscheck summary](../results/lp-native-v2/summary.json),
+  [native baseline report](../results/lp-native-v2/native/summary.html) and
+  [lab report](../results/lp-native-v2/lab/summary.html).
+- [Contract evidence](../results/lp-contracts-v1/summary.json) and
+  [full sanitizer log](../results/lp-contracts-v1/sanitizer-ctest.log).
+- [Exact LP certificate example](../results/lp-exact-demo-v1/checker.json).
+- [All-240 reader audit](../results/lp-parser-audit-v1/summary.json).
+
+The earlier [failed diagnostic campaign](../results/lp-native-v1/summary.json)
+is preserved. It exposed the HiGHS primal/dual-section parsing bug; final
+results use a fresh directory, fixed checker, frozen binaries and source lock.
+Milestone-1 MIPLIB runs and their evaluator tags remain untouched.
+
 CTest covers 1,000 generated bounded rational LPs using independent Fraction
 vertex enumeration, along with free/fixed/upper-only variables, ranges,
 min/max offsets, degeneracy, infeasibility, unboundedness, malformed input,
