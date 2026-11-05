@@ -10,16 +10,20 @@ and implements one clearly identified idea from it.
 
 Freeze a versioned inventory of problem membership, expected outcomes,
 configurations, reference versions, tolerances and budgets. The current inventory
-includes all 22 CTest suites and their generated/adversarial cases, the
+includes all current CTest suites and their generated/adversarial cases, the
 eight native MILP fixture models in the
 [crosscheck](../results/mip-native-v5/summary.json), the selected development
 MILP cases, and all 240 MIPLIB benchmark instances identified by the
 [dataset lock](../config/miplib.lock.json) and imported suite. Newly added
 regressions remain part of the gate; no failing case may be dropped or skipped.
 The original 18 suites remain in this inventory. Presolve, branch selection,
-benchmark-gate and scalability contracts are additive requirements. The current
-22-suite Release and sanitizer runs both pass at engine checkpoint `82c1355`,
-with [recorded logs and source hashes](../results/milestone-2g-contracts-v1/summary.json). Earlier
+benchmark-gate, scalability, source-candidate and source-sign repair contracts
+are additive requirements. The 24-suite source-safety checkpoint `ade4924`
+passes Release and sanitizer checks, with
+[recorded logs and source hashes](../results/source-safety-contracts-v1/summary.json).
+The later `e02a45e` candidate retry passes all 24 Release suites and its focused
+certificate sanitizer checks. Later additions remain required even when an
+older frozen checkpoint has fewer suites. Earlier
 [18-suite Release and sanitizer evidence](../results/primal-regressions-v1/final-validation.json)
 remains a frozen record of that checkpoint, not evidence for the added suites.
 
@@ -67,6 +71,10 @@ memory feasibility or a speed advantage. The earlier
 [smoke](../results/miplib-smoke-2s-v4/runs/summary.html) and
 [selected comparison](../results/primal-recovery-v1/report.html) remain available
 as historical development evidence.
+
+The [source-safety follow-up](SOURCE-SAFETY.md) gets past three original
+numerical stops in selected development reruns. Those runs still hit limits;
+they do not replace a complete versioned 240-instance campaign or open the gate.
 
 After correct completion, the requested performance target is strictly faster
 than HiGHS on at least 120 of the fixed 240 MIPLIB instances. Use matched

@@ -19,7 +19,8 @@ deterministic reliability-based pseudocost selection.
 The independent checker validates original-model witnesses, rational LP bounds
 and exact infeasibility certificates.
 
-See [sparse basis updates and full-corpus coverage](docs/MILESTONE-2G.md),
+See [source-sign repair and checked infeasibility candidates](docs/SOURCE-SAFETY.md),
+[sparse basis updates and full-corpus coverage](docs/MILESTONE-2G.md),
 [original-unit primal recovery](docs/MILESTONE-2F.md),
 [pivot safeguards and infeasibility witnesses](docs/MILESTONE-2E.md),
 [numerical scaling and refinement](docs/MILESTONE-2D.md), and
@@ -57,6 +58,14 @@ checking. Later column-norm caching (`303d9bf`) and transactional column
 overlays (`4c02d7e`) also pass all 22 Release suites and their focused sanitizer
 checks. They were added after the frozen v2 campaign; its results do not
 measure those changes.
+
+The [source-safety checkpoint](results/source-safety-contracts-v1/summary.json)
+at `ade4924` passes all 24 suites in Release and sanitizer builds. It adds
+strict source-sign repair and source-enclosed Phase I candidates. The later
+projected-candidate retry at `e02a45e` passes all 24 Release suites and focused
+certificate sanitizer checks, with all 31 exported local proofs in its selected
+diagnostic accepted independently. These local proofs and targeted progress do
+not change the frozen full-corpus completion count.
 
 Milestone 2A is preserved in [the original LP engine contract](docs/LP-ENGINE.md),
 [the lab's LP report](results/lp-native-v2/lab/summary.html), and
