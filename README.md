@@ -7,9 +7,12 @@ The current prototype adds sparse LP storage and LU factorization, saved-basis
 dual reoptimization, and a minimal deterministic branch-and-bound MILP solver.
 It also applies reversible power-of-two changes of units and compensated
 iterative refinement, with the original feasibility policies unchanged.
+Small uncertain Phase I solves can reconstruct exact original-decimal
+infeasibility witnesses; guarded pivots can retry a stronger leaving choice.
 The independent checker validates original-model witnesses and rational LP bounds.
 
-See [numerical scaling and refinement](docs/MILESTONE-2D.md) and
+See [pivot safeguards and infeasibility witnesses](docs/MILESTONE-2E.md),
+[numerical scaling and refinement](docs/MILESTONE-2D.md), and
 [the integer-search contract](docs/MILESTONE-2BC.md).
 The [numerical ablations](results/numerics-roots-v1/report.html),
 [40-case MILP crosscheck](results/mip-native-v3/summary.json), and

@@ -1,6 +1,9 @@
 #include "lp.h"
 #include "common.h"
 #include "linear.h"
+#include "exact.h"
+#include "rational.h"
+#include "pivot.h"
 #include <float.h>
 #include <math.h>
 #include <stdint.h>
@@ -29,6 +32,7 @@ typedef struct {
     double *xb, *pi, *cb, *direction, *column;
     size_t scaled_rows, scaled_columns;
     const LabLpOptions *options;
+    const LabModel *model;
     LabLpResult *result;
     double started;
 } Work;
@@ -168,7 +172,7 @@ static int refactor(Work *w, int primal_required) {
         return -1;
     }
     for (size_t i = 0; i < w->m; i++) {
-        if (primal_required && w->xb[i] < -1e-8) {
+        if (primal_required && w->xb[i] < -LAB_PRIMAL_TOLERANCE) {
             message(w, "numerical_failure", "Basis lost primal feasibility");
             return -1;
         }
@@ -183,12 +187,151 @@ static int is_basic(const Work *w, size_t j) {
             return 1;
     return 0;
 }
-/* 0 optimum, 1 unbounded, -1 explicit failure/limit. Bland's index rules
- * resolve entering variables and ratio ties deterministically. */
+static void exact_coefficient(const LabModel *m, size_t k, mpq_t q) {
+    if (m->exact)
+        mpq_set(q, m->exact->value[k]);
+    else
+        mpq_set_d(q, m->value[k]);
+}
+static void exact_column_bound(const LabModel *m, size_t j, int upper, mpq_t q) {
+    double current = upper ? m->col_upper[j] : m->col_lower[j];
+    if (m->exact && current == (upper ? m->exact->col_upper_source[j]
+                                      : m->exact->col_lower_source[j]))
+        mpq_set(q, upper ? m->exact->col_upper[j] : m->exact->col_lower[j]);
+    else
+        mpq_set_d(q, current);
+}
+/* Reconstruct a small Phase I basis over original decimal coefficients, then
+ * validate the resulting row combination against the original model and box.
+ * Stored standard-form RHS rounding is deliberately absent from this proof.
+ * An unavailable/limited reconstruction cannot bypass an uncertain sign. */
+static int phase_one_certificate(Work *w) {
+    const LabModel *m = w->model;
+    size_t n = w->m;
+    if (w->options->no_exact || n > LAB_RATIONAL_MAX_DIMENSION ||
+        (m->parsed_decimal && !m->exact))
+        return 0;
+    w->result->exact_attempts++;
+    double deadline = fmin(w->started + w->options->time_limit, lab_now() + 1);
+    mpq_t *a = lab_alloc(n * n, sizeof(mpq_t));
+    mpq_t *rhs = lab_alloc(n, sizeof(mpq_t));
+    mpq_t *y = lab_alloc(m->rows, sizeof(mpq_t));
+    for (size_t k = 0; k < n * n; k++)
+        mpq_init(a[k]);
+    for (size_t i = 0; i < n; i++)
+        mpq_init(rhs[i]);
+    for (size_t i = 0; i < m->rows; i++)
+        mpq_init(y[i]);
+    mpq_t value, multiplier, margin, q, side;
+    mpq_inits(value, multiplier, margin, q, side, NULL);
+    int valid = 1;
+    for (size_t t = 0; t < n; t++) {
+        size_t j = w->basis[t];
+        mpq_set_ui(rhs[t], w->artificial[j], 1);
+        const Column *c = &w->a[j];
+        for (size_t k = 0; k < c->count; k++) {
+            size_t i = c->row[k];
+            if (j < w->structural && w->source_row[i] != SIZE_MAX) {
+                size_t col = w->original[j], source = w->source_row[i];
+                size_t lo = m->col_start[col], hi = m->col_start[col + 1];
+                while (lo < hi) {
+                    size_t mid = lo + (hi - lo) / 2;
+                    if (m->row_index[mid] < source)
+                        lo = mid + 1;
+                    else
+                        hi = mid;
+                }
+                if (lo == m->col_start[col + 1] || m->row_index[lo] != source) {
+                    valid = 0;
+                    break;
+                }
+                exact_coefficient(m, lo, value);
+                mpq_set_d(multiplier, w->sign[j]);
+                mpq_mul(value, value, multiplier);
+                mpq_set_d(multiplier, w->row_scale[i]);
+                mpq_mul(value, value, multiplier);
+            } else
+                mpq_set_d(value, c->value[k]);
+            mpq_add(a[t * n + i], a[t * n + i], value);
+        }
+        if (!valid)
+            break;
+    }
+    if (valid && lab_rational_solve(n, a, rhs, deadline))
+        valid = 0;
+    for (size_t i = 0; i < n && valid; i++)
+        if (w->source_row[i] != SIZE_MAX) {
+            mpq_set_d(multiplier, w->row_scale[i]);
+            mpq_mul(value, multiplier, rhs[i]);
+            mpq_add(y[w->source_row[i]], y[w->source_row[i]], value);
+        }
+    for (size_t i = 0; i < m->rows && valid; i++) {
+        int sign = mpq_sgn(y[i]);
+        if (!sign)
+            continue;
+        double bound = sign > 0 ? m->row_lower[i] : m->row_upper[i];
+        if (!isfinite(bound)) {
+            valid = 0;
+            break;
+        }
+        if (m->exact)
+            mpq_set(side, sign > 0 ? m->exact->row_lower[i] : m->exact->row_upper[i]);
+        else
+            mpq_set_d(side, bound);
+        mpq_mul(value, y[i], side);
+        mpq_add(margin, margin, value);
+    }
+    for (size_t j = 0; j < m->cols && valid; j++) {
+        mpq_set_ui(q, 0, 1);
+        for (size_t k = m->col_start[j]; k < m->col_start[j + 1]; k++) {
+            exact_coefficient(m, k, value);
+            mpq_mul(value, value, y[m->row_index[k]]);
+            mpq_add(q, q, value);
+        }
+        int sign = mpq_sgn(q);
+        if (!sign)
+            continue;
+        double bound = sign > 0 ? m->col_upper[j] : m->col_lower[j];
+        if (!isfinite(bound)) {
+            valid = 0;
+            break;
+        }
+        exact_column_bound(m, j, sign > 0, side);
+        mpq_mul(value, q, side);
+        mpq_sub(margin, margin, value);
+        if (lab_now() >= deadline)
+            valid = 0;
+    }
+    valid = valid && mpq_sgn(margin) > 0 && lab_now() < deadline;
+    if (valid) {
+        LabLpResult *r = w->result;
+        r->farkas_rows = m->rows;
+        r->farkas = lab_alloc(m->rows, sizeof(char *));
+        for (size_t i = 0; i < m->rows; i++)
+            r->farkas[i] = mpq_get_str(NULL, 10, y[i]);
+        r->farkas_margin = mpq_get_str(NULL, 10, margin);
+        r->exact_infeasibilities++;
+    }
+    for (size_t k = 0; k < n * n; k++)
+        mpq_clear(a[k]);
+    for (size_t i = 0; i < n; i++)
+        mpq_clear(rhs[i]);
+    for (size_t i = 0; i < m->rows; i++)
+        mpq_clear(y[i]);
+    free(a);
+    free(rhs);
+    free(y);
+    mpq_clears(value, multiplier, margin, q, side, NULL);
+    return valid;
+}
+/* 0 optimum, 1 unbounded, -1 explicit failure/limit. Bland's normal leaving
+ * order is preserved. A rejected basis can retry a validated Harris pivot. */
 static int simplex(Work *w, int phase_one) {
+    int factor_ready = 0;
     for (;;) {
-        if (budget(w) || refactor(w, 1))
+        if (budget(w) || (!factor_ready && refactor(w, 1)))
             return -1;
+        factor_ready = 0;
         for (size_t i = 0; i < w->m; i++)
             w->cb[i] = phase_one ? (double)w->artificial[w->basis[i]] : w->cost[w->basis[i]];
         if (transpose_solve(w, w->cb, w->pi)) {
@@ -225,15 +368,23 @@ static int simplex(Work *w, int phase_one) {
         if (!phase_one)
             w->result->dual_residual = worst;
         if (entering == SIZE_MAX) {
-            if (phase_one && worst > 0) {
+            if (phase_one) {
                 double artificial_value = 0;
                 for (size_t i = 0; i < w->m; i++)
                     if (w->artificial[w->basis[i]])
                         artificial_value += w->xb[i];
                 if (artificial_value > 1e-8) {
-                    message(w, "numerical_failure",
-                            "Uncertain Phase I dual sign; infeasibility unproved");
-                    return -1;
+                    if (phase_one_certificate(w)) {
+                        message(w, "infeasible", "Exact original-model Farkas contradiction reconstructed");
+                        return -1;
+                    }
+                    if (budget(w))
+                        return -1;
+                    if (worst > 0) {
+                        message(w, "numerical_failure",
+                                "Uncertain Phase I dual sign; infeasibility unproved");
+                        return -1;
+                    }
                 }
             }
             return 0;
@@ -244,35 +395,46 @@ static int simplex(Work *w, int phase_one) {
             return -1;
         }
         size_t leaving = SIZE_MAX;
-        double theta = INFINITY;
-        int tiny_positive = 0;
-        for (size_t i = 0; i < w->m; i++) {
-            double d = w->direction[i];
-            if (d > 0 && d <= 1e-12)
-                tiny_positive = 1;
-            if (d <= 1e-12)
-                continue;
-            double ratio = w->xb[i] / d;
-            if (!isfinite(ratio)) {
-                message(w, "numerical_failure", "Ratio test overflow");
-                return -1;
-            }
-            double tie = 1e-12 * (1 + fabs(ratio));
-            if (leaving == SIZE_MAX || ratio < theta - tie ||
-                (fabs(ratio - theta) <= tie && w->basis[i] < w->basis[leaving])) {
-                theta = ratio;
-                leaving = i;
-            }
-        }
-        if (leaving == SIZE_MAX) {
-            if (phase_one || tiny_positive) {
+        int ratio_status = lab_primal_ratio(w->m, w->xb, w->direction, w->basis,
+                                            1, &leaving);
+        if (ratio_status) {
+            if (phase_one || ratio_status < 0) {
                 message(w, "numerical_failure", "No stable leaving pivot");
                 return -1;
             }
             return 1;
         }
+        size_t alternative = SIZE_MAX;
+        if (!w->options->bland_ratio &&
+            lab_primal_ratio(w->m, w->xb, w->direction, w->basis, 0, &alternative))
+            alternative = SIZE_MAX;
+        size_t old_column = w->basis[leaving];
+        const char *prior_status = w->result->status;
+        char prior_message[sizeof w->result->message];
+        memcpy(prior_message, w->result->message, sizeof prior_message);
         w->basis[leaving] = entering;
         w->result->iterations++;
+        if (!w->options->bland_ratio) {
+            /* A ratio prediction cannot establish actual basis feasibility.
+             * Check the newly factored basis before accepting it. Retain that
+             * factor for the next iteration; the ordinary path factors once. */
+            if (refactor(w, 1)) {
+                w->result->rejected_pivots++;
+                w->basis[leaving] = old_column;
+                if (alternative == SIZE_MAX || alternative == leaving || budget(w))
+                    return -1;
+                w->basis[alternative] = entering;
+                w->result->iterations++;
+                if (refactor(w, 1)) {
+                    w->result->rejected_pivots++;
+                    return -1;
+                }
+                w->result->harris_rescues++;
+                w->result->status = prior_status;
+                memcpy(w->result->message, prior_message, sizeof prior_message);
+            }
+            factor_ready = 1;
+        }
     }
 }
 static void remove_row(Work *w, size_t row, size_t basis_position) {
@@ -831,6 +993,10 @@ static int recover(Work *w, const LabModel *m) {
 void lab_lp_result_free(LabLpResult *result) {
     free(result->primal);
     free(result->dual);
+    for (size_t i = 0; i < result->farkas_rows; i++)
+        free(result->farkas[i]);
+    free(result->farkas);
+    free(result->farkas_margin);
     memset(result, 0, sizeof *result);
 }
 static void work_free(Work *w) {
@@ -864,6 +1030,7 @@ static void work_free(Work *w) {
     memset(w, 0, sizeof *w);
 }
 static int cold_solve(Work *w, const LabModel *m) {
+    w->model = m;
     if (build(w, m))
         return -1;
     if (simplex(w, 1))

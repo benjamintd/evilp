@@ -77,20 +77,34 @@ static int status_code(const char *status) {
         return 0;
     return 4;
 }
+static int write_farkas(const char *path, const LabModel *m, const LabLpResult *r) {
+    if (!path || !r->farkas)
+        return 0;
+    FILE *f = fopen(path, "wx");
+    if (!f)
+        return -1;
+    fputs("MILPLAB_FARKAS_1\n", f);
+    for (size_t i = 0; i < r->farkas_rows; i++)
+        fprintf(f, "%s %s\n", m->row_name[i], r->farkas[i]);
+    int bad = ferror(f);
+    if (fclose(f))
+        bad = 1;
+    return bad ? -1 : 0;
+}
 int main(int argc, char **argv) {
     if (argc == 2 && !strcmp(argv[1], "--help")) {
         puts("milpsolve MODEL (--relax | --mip) [--solution NEW_FILE]\n"
              "          [--time-limit SECONDS] [--iteration-limit N] [--max-dimension N]\n"
              "          [--backend sparse|dense]\n"
-             "          [--no-scaling] [--no-refinement]\n"
-             "          LP: [--dual NEW_FILE] [--basis NEW_FILE] [--read-basis FILE]\n"
+             "          [--no-scaling] [--no-refinement] [--no-exact] [--bland-ratio]\n"
+             "          LP: [--dual NEW_FILE] [--farkas NEW_FILE] [--basis NEW_FILE] [--read-basis FILE]\n"
              "          MILP: [--node-limit N] [--cold] [--trace NEW_FILE]\n"
              "C17 LP and numerical branch-and-bound prototype. Select problem mode explicitly.\n"
              "JSON statuses are numerical solver claims; use milpcheck for validation.\n"
              "Default standard-form dimension limit4096; sparse hard cap32768,dense hard cap4096.");
         return 0;
     }
-    const char *path = NULL, *solution = NULL, *dual = NULL, *trace_path = NULL;
+    const char *path = NULL, *solution = NULL, *dual = NULL, *trace_path = NULL, *farkas = NULL;
     int relax = 0, mip = 0, cold = 0, node_limit_set = 0;
     size_t node_limit = 100000;
     LabLpOptions options = {.time_limit = 60, .iteration_limit = 100000, .max_dimension = 4096};
@@ -106,8 +120,12 @@ int main(int argc, char **argv) {
             options.no_scaling = 1;
         } else if (!strcmp(a, "--no-refinement")) {
             options.no_refinement = 1;
+        } else if (!strcmp(a, "--no-exact")) {
+            options.no_exact = 1;
+        } else if (!strcmp(a, "--bland-ratio")) {
+            options.bland_ratio = 1;
         } else if (!strcmp(a, "--solution") || !strcmp(a, "--dual") || !strcmp(a, "--basis") ||
-                   !strcmp(a, "--read-basis") || !strcmp(a, "--trace")) {
+                   !strcmp(a, "--read-basis") || !strcmp(a, "--trace") || !strcmp(a, "--farkas")) {
             if (++i == argc)
                 return error("input_error", "Missing option value", 2);
             if (!strcmp(a, "--solution"))
@@ -118,6 +136,8 @@ int main(int argc, char **argv) {
                 options.basis_out = argv[i];
             else if (!strcmp(a, "--trace"))
                 trace_path = argv[i];
+            else if (!strcmp(a, "--farkas"))
+                farkas = argv[i];
             else
                 options.basis_in = argv[i];
         } else if (!strcmp(a, "--backend")) {
@@ -157,7 +177,7 @@ int main(int argc, char **argv) {
     }
     if (!path || relax == mip)
         return error("input_error", "Provide a model and exactly one of --relax or --mip", 2);
-    if (mip && (dual || options.basis_in || options.basis_out))
+    if (mip && (dual || farkas || options.basis_in || options.basis_out))
         return error("input_error",
                      "Dual/basis files are LP-only; MILP tree proofs are not implemented", 2);
     if (!mip && (cold || node_limit_set || trace_path))
@@ -219,14 +239,19 @@ int main(int argc, char **argv) {
                "\"solve_wall_s\":%.9g,\"total_wall_s\":%.9g,\"backend\":\"%s\",\"cold\":%s,"
                "\"scaling_enabled\":%s,\"refinement_enabled\":%s,\"refinement_steps\":%zu,"
                "\"scaled_rows\":%zu,\"scaled_columns\":%zu,\"initial_backward_error\":%.17g,"
-               "\"max_backward_error\":%.17g}\n",
+               "\"max_backward_error\":%.17g,\"exact_enabled\":%s,\"exact_attempts\":%zu,"
+               "\"exact_infeasibilities\":%zu,\"ratio_test\":\"%s\",\"exact_model_available\":%s,"
+               "\"rejected_pivots\":%zu,\"harris_rescues\":%zu}\n",
                model.rows, model.cols, model.nnz, r.nodes, r.lp_solves, r.lp_iterations,
                r.refactorizations, r.warm_starts, r.cold_starts, r.pruned_nodes, r.dual_iterations,
                r.cold_fallbacks, r.factor_nnz_peak, r.standard_nnz_peak, r.elapsed,
                lab_now() - started, options.dense ? "dense_lu_reference" : "sparse_lu",
                cold ? "true" : "false", options.no_scaling ? "false" : "true",
                options.no_refinement ? "false" : "true", r.refinement_steps, r.scaled_rows,
-               r.scaled_columns, r.initial_backward_error, r.max_backward_error);
+               r.scaled_columns, r.initial_backward_error, r.max_backward_error,
+               options.no_exact ? "false" : "true", r.exact_attempts, r.exact_infeasibilities,
+               options.bland_ratio ? "bland" : "guarded_bland_harris", model.exact ? "true" : "false",
+               r.rejected_pivots, r.harris_rescues);
         int code = status_code(r.status);
         lab_bb_result_free(&r);
         lab_model_free(&model);
@@ -234,6 +259,10 @@ int main(int argc, char **argv) {
     }
     LabLpResult r;
     lab_lp_solve(&model, &options, &r);
+    if (write_farkas(farkas, &model, &r)) {
+        r.status = "input_error";
+        snprintf(r.message, sizeof r.message, "Cannot create fresh Farkas file");
+    }
     if (r.has_primal &&
         (write_vector(solution, &model, &r, 0) || write_vector(dual, &model, &r, 1))) {
         r.status = "input_error";
@@ -260,14 +289,21 @@ int main(int argc, char **argv) {
         "\"warm_start\":%s,\"dual_iterations\":%zu,\"cold_fallbacks\":%zu,"
         "\"factor_nnz_peak\":%zu,\"standard_nnz\":%zu,\"scaling_enabled\":%s,"
         "\"refinement_enabled\":%s,\"refinement_steps\":%zu,\"scaled_rows\":%zu,"
-        "\"scaled_columns\":%zu,\"initial_backward_error\":%.17g,\"max_backward_error\":%.17g}\n",
+        "\"scaled_columns\":%zu,\"initial_backward_error\":%.17g,\"max_backward_error\":%.17g,"
+        "\"exact_enabled\":%s,\"exact_attempts\":%zu,\"exact_infeasibilities\":%zu,"
+        "\"has_farkas_candidate\":%s,\"certifies_infeasibility\":false,"
+        "\"ratio_test\":\"%s\",\"exact_model_available\":%s,"
+        "\"rejected_pivots\":%zu,\"harris_rescues\":%zu}\n",
         model.rows, model.cols, model.nnz, r.standard_rows, r.standard_columns, r.redundant_rows,
         r.iterations, r.refactorizations, r.primal_residual, r.dual_residual, r.elapsed,
         lab_now() - started, options.dense ? "dense_lu_reference" : "sparse_lu",
         r.warm_start ? "true" : "false", r.dual_iterations, r.cold_fallbacks, r.factor_nnz_peak,
         r.standard_nnz, options.no_scaling ? "false" : "true",
         options.no_refinement ? "false" : "true", r.refinement_steps, r.scaled_rows,
-        r.scaled_columns, r.initial_backward_error, r.max_backward_error);
+        r.scaled_columns, r.initial_backward_error, r.max_backward_error,
+        options.no_exact ? "false" : "true", r.exact_attempts, r.exact_infeasibilities,
+        r.farkas ? "true" : "false", options.bland_ratio ? "bland" : "guarded_bland_harris",
+        model.exact ? "true" : "false", r.rejected_pivots, r.harris_rescues);
     int code = status_code(r.status);
     lab_lp_result_free(&r);
     lab_model_free(&model);

@@ -6,7 +6,7 @@ typedef struct {
     size_t iteration_limit, max_dimension;
     const char *basis_in, *basis_out, *model_sha256;
     int dense; /* zero: sparse LU; one: dense reference backend */
-    int no_scaling, no_refinement;
+    int no_scaling, no_refinement, no_exact, bland_ratio;
 } LabLpOptions;
 typedef struct {
     const char *status;
@@ -19,6 +19,12 @@ typedef struct {
     size_t dual_iterations, cold_fallbacks, factor_nnz_peak, standard_nnz;
     size_t refinement_steps, scaled_rows, scaled_columns;
     double initial_backward_error, max_backward_error;
+    /* Exact original-row Farkas candidate; external checking is separate.
+     * Bound overlays are part of the LP to which this candidate applies. */
+    char **farkas;
+    char *farkas_margin;
+    size_t farkas_rows, exact_attempts, exact_infeasibilities;
+    size_t rejected_pivots, harris_rescues;
 } LabLpResult;
 void lab_lp_solve(const LabModel *m, const LabLpOptions *options, LabLpResult *result);
 void lab_lp_result_free(LabLpResult *result);

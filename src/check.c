@@ -34,7 +34,7 @@ typedef struct {
     char *objname;
     mpq_t obj;
     char error[512];
-    int unsupported, dual_enabled;
+    int unsupported, dual_enabled, farkas_enabled;
 } Model;
 static void fail(Model *m, const char *fmt, ...) {
     if (m->error[0])
@@ -399,6 +399,11 @@ static int read_mps(Model *m, const char *path, int evaluate) {
                             mpq_mul(t, a, m->r[r].dual);
                             mpq_sub(m->c[c].residual, m->c[c].residual, t);
                         }
+                    } else if (m->farkas_enabled && m->r[r].type != 'N') {
+                        /* In infeasibility mode residual stores q = A^T y, without
+                         * any objective contribution or optimization-library API. */
+                        mpq_mul(t, a, m->r[r].dual);
+                        mpq_add(m->c[c].residual, m->c[c].residual, t);
                     }
                 } else
                     m->nnz++;
@@ -736,6 +741,66 @@ static int read_dual(Model *m, const char *path) {
     m->dual_enabled = !m->error[0];
     return m->error[0] ? -1 : 0;
 }
+static int read_farkas(Model *m, const char *path) {
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        fail(m, "cannot open Farkas certificate");
+        return -1;
+    }
+    char line[16384], *v[4];
+    int header = 0, ch = 0;
+    while (!m->error[0]) {
+        size_t length = 0;
+        while ((ch = fgetc(f)) != EOF && ch != '\n') {
+            if (!ch || length == sizeof line - 1) {
+                fail(m, !ch ? "NUL byte in Farkas certificate"
+                            : "Farkas certificate line too long");
+                break;
+            }
+            line[length++] = (char)ch;
+        }
+        if (m->error[0] || (!length && ch == EOF))
+            break;
+        line[length] = 0;
+        char *start = line;
+        while (isspace((unsigned char)*start))
+            start++;
+        if (*start == '#')
+            continue;
+        int n = tokens(line, v, 4);
+        if (!n)
+            continue;
+        if (!header) {
+            if (n != 1 || strcmp(v[0], "MILPLAB_FARKAS_1")) {
+                fail(m, "missing/malformed MILPLAB_FARKAS_1 header");
+                break;
+            }
+            header = 1;
+            continue;
+        }
+        if (n != 2) {
+            fail(m, "malformed Farkas certificate record");
+            break;
+        }
+        size_t r = lookup(&m->rows, v[0]);
+        if (r == SIZE_MAX || m->r[r].type == 'N') {
+            fail(m, "unknown/nonconstraint Farkas row %s", v[0]);
+            break;
+        }
+        if (m->r[r].dual_seen || rational(m->r[r].dual, v[1])) {
+            fail(m, "duplicate/invalid Farkas multiplier for %s", v[0]);
+            break;
+        }
+        m->r[r].dual_seen = 1;
+    }
+    if (ferror(f))
+        fail(m, "Farkas certificate read error");
+    if (!header)
+        fail(m, "missing MILPLAB_FARKAS_1 header");
+    fclose(f);
+    m->farkas_enabled = !m->error[0];
+    return m->error[0] ? -1 : 0;
+}
 static void row_bounds(const Row *r, mpq_t lo, mpq_t hi, int *lf, int *hf, mpq_t scratch) {
     *lf = r->type != 'L';
     *hf = r->type != 'G';
@@ -792,6 +857,63 @@ static int certified_bound(Model *m, mpq_t bound, char message[512]) {
     mpq_clears(lo, hi, t, NULL);
     return available;
 }
+/* For every feasible x, L = sum y_i b_i <= (A^T y)^T x <= U,
+ * where each b_i is the row lower side for y_i > 0, upper for y_i < 0,
+ * and U is the exact support of the original column box. Thus L-U > 0
+ * proves LP (and consequently integer) infeasibility. No tolerance applies. */
+static int certified_infeasibility(Model *m, mpq_t margin, const char **kind,
+                                   char message[512]) {
+    *kind = "row_combination";
+    /* An empty original column box is itself a proof, even for an empty ray.
+     * Integer bounds are not rounded: this mode proves LP infeasibility. */
+    for (size_t i = 0; i < m->nc; i++) {
+        Col *c = &m->c[i];
+        if (c->lf && c->hf && mpq_cmp(c->lo, c->hi) > 0) {
+            *kind = "column_bounds";
+            mpq_sub(margin, c->lo, c->hi);
+            snprintf(message, 512, "contradictory original bounds on column %s", c->name);
+            return 1;
+        }
+    }
+    mpq_t lo, hi, t;
+    mpq_inits(lo, hi, t, NULL);
+    mpq_set_ui(margin, 0, 1);
+    int result = 0;
+    for (size_t i = 0; i < m->nr; i++) {
+        Row *r = &m->r[i];
+        int sign = mpq_sgn(r->dual);
+        if (r->type == 'N' || !sign)
+            continue;
+        int lf, hf;
+        row_bounds(r, lo, hi, &lf, &hf, t);
+        if ((sign > 0 && !lf) || (sign < 0 && !hf)) {
+            snprintf(message, 512, "multiplier selects infinite side of row %s", r->name);
+            result = -1;
+            goto done;
+        }
+        mpq_mul(t, r->dual, sign > 0 ? lo : hi);
+        mpq_add(margin, margin, t);
+    }
+    for (size_t i = 0; i < m->nc; i++) {
+        Col *c = &m->c[i];
+        int sign = mpq_sgn(c->residual);
+        if (!sign)
+            continue;
+        if ((sign > 0 && !c->hf) || (sign < 0 && !c->lf)) {
+            snprintf(message, 512, "row combination selects infinite side of column %s", c->name);
+            result = -1;
+            goto done;
+        }
+        mpq_mul(t, c->residual, sign > 0 ? c->hi : c->lo);
+        mpq_sub(margin, margin, t);
+    }
+    result = mpq_sgn(margin) > 0;
+    snprintf(message, 512, "%s exact contradiction margin",
+             result ? "positive" : "nonpositive");
+done:
+    mpq_clears(lo, hi, t, NULL);
+    return result;
+}
 static void maximum(mpq_t max, const mpq_t a) {
     if (mpq_cmp(a, max) > 0)
         mpq_set(max, a);
@@ -803,15 +925,16 @@ static void json_q(const mpq_t q) {
 }
 int main(int argc, char **argv) {
     if (argc == 2 && !strcmp(argv[1], "--help")) {
-        puts("milpcheck --model FILE [--inspect | --solution FILE | --dual FILE]\n"
+        puts("milpcheck --model FILE [--inspect | --solution FILE | --dual FILE | --farkas FILE]\n"
              "          [--format simple|rational|highs|scip|cbc] [--relax] [--dual FILE]\n"
              "          [--lin-tol DECIMAL] [--int-tol DECIMAL] [--obj-tol DECIMAL] [--exact]\n"
-             "Independent primal and LP-bound checking. Exact matching primal/dual witnesses\n"
-             "can certify optimality; no infeasibility/unboundedness proof is implemented.");
+             "Independent exact primal, LP-bound and Farkas infeasibility checking.\n"
+             "Matching exact primal/dual witnesses can certify optimality. Farkas proof\n"
+             "validity ignores tolerances; no unboundedness proof is implemented.");
         return 0;
     }
-    const char *model = NULL, *sol = NULL, *dual = NULL, *format = "simple", *lt = "1e-4",
-               *it = "1e-5", *ot = "1e-4";
+    const char *model = NULL, *sol = NULL, *dual = NULL, *farkas = NULL, *format = "simple",
+               *lt = "1e-4", *it = "1e-5", *ot = "1e-4";
     int inspect = 0, relax = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--inspect"))
@@ -826,6 +949,8 @@ int main(int argc, char **argv) {
             sol = argv[++i];
         else if (i + 1 < argc && !strcmp(argv[i], "--dual"))
             dual = argv[++i];
+        else if (i + 1 < argc && !strcmp(argv[i], "--farkas"))
+            farkas = argv[++i];
         else if (i + 1 < argc && !strcmp(argv[i], "--format"))
             format = argv[++i];
         else if (i + 1 < argc && !strcmp(argv[i], "--lin-tol"))
@@ -839,10 +964,11 @@ int main(int argc, char **argv) {
             return 64;
         }
     }
-    if (!model || (!inspect && !sol && !dual) || (inspect && (sol || dual)) ||
+    if (!model || (!inspect && !sol && !dual && !farkas) ||
+        (inspect && (sol || dual || farkas)) || (farkas && (sol || dual)) ||
         (strcmp(format, "simple") && strcmp(format, "highs") && strcmp(format, "scip") &&
          strcmp(format, "cbc") && strcmp(format, "rational"))) {
-        fputs("usage: milpcheck --model FILE [--inspect | --solution FILE | --dual FILE] "
+        fputs("usage: milpcheck --model FILE [--inspect | --solution FILE | --dual FILE | --farkas FILE] "
               "[--format simple|rational|highs|scip|cbc] [--relax] [--dual FILE] [--exact]\n",
               stderr);
         return 64;
@@ -850,25 +976,38 @@ int main(int argc, char **argv) {
     Model m = {0};
     m.objective = SIZE_MAX;
     mpq_init(m.obj);
-    mpq_t lin, integ, objtol, claimed, lo, hi, t, u, maxrow, maxbound, maxint, objerr, bound;
+    mpq_t lin, integ, objtol, claimed, lo, hi, t, u, maxrow, maxbound, maxint, objerr, bound,
+          contradiction;
     mpq_inits(lin, integ, objtol, claimed, lo, hi, t, u, maxrow, maxbound, maxint, objerr, bound,
-              NULL);
+              contradiction, NULL);
     if (number(lin, lt) || number(integ, it) || number(objtol, ot) || mpq_sgn(lin) < 0 ||
         mpq_sgn(integ) < 0 || mpq_sgn(objtol) < 0)
         fail(&m, "invalid tolerance");
+    if (farkas) {
+        mpq_set_ui(lin, 0, 1);
+        mpq_set_ui(integ, 0, 1);
+        mpq_set_ui(objtol, 0, 1);
+    }
     if (!m.error[0])
         read_mps(&m, model, 0);
     if (!m.error[0] && dual)
         read_dual(&m, dual);
+    if (!m.error[0] && farkas)
+        read_farkas(&m, farkas);
     int exitcode = 0, has_claimed = 0, nosol = 0, bound_valid = 0;
-    char bound_message[512] = "";
+    int certificate_result = -1;
+    const char *certificate_kind = NULL;
+    char bound_message[512] = "", certificate_message[512] = "";
     size_t rb = 0, bb = 0, ib = 0;
     if (!m.error[0] && sol)
         nosol = solution(&m, sol, format, claimed, &has_claimed);
-    if (!m.error[0] && !inspect && ((!nosol && sol) || dual))
+    if (!m.error[0] && !inspect && ((!nosol && sol) || dual || farkas))
         read_mps(&m, model, 1);
     if (!m.error[0] && dual)
         bound_valid = certified_bound(&m, bound, bound_message);
+    if (!m.error[0] && farkas)
+        certificate_result = certified_infeasibility(&m, contradiction, &certificate_kind,
+                                                     certificate_message);
     if (!m.error[0] && sol && !nosol) {
         for (size_t i = 0; i < m.nc; i++) {
             Col *c = &m.c[i];
@@ -933,6 +1072,8 @@ int main(int argc, char **argv) {
         exitcode = 4;
     else if (dual && !sol && !bound_valid)
         exitcode = 4;
+    else if (farkas && certificate_result <= 0)
+        exitcode = certificate_result < 0 ? 4 : 1;
     int primal_valid = sol && !inspect && !exitcode;
     int optimal = primal_valid && bound_valid && !mpq_sgn(lin) && !mpq_sgn(integ) &&
                   !mpq_sgn(objtol) && !mpq_cmp(m.obj, bound);
@@ -941,6 +1082,7 @@ int main(int argc, char **argv) {
                             : nosol    ? "no_solution"
                             : inspect  ? "supported"
                             : dual && !sol && !bound_valid ? "unavailable"
+                            : farkas && certificate_result < 0 ? "unavailable"
                             : exitcode                     ? "invalid"
                                                            : "valid");
     printf(",\"message\":");
@@ -949,6 +1091,24 @@ int main(int argc, char **argv) {
            "feasible\":%s,\"relaxation\":%s,\"certifies_optimality\":%s",
            m.nr, m.nc, m.nnz, m.maximize ? "max" : "min", primal_valid ? "true" : "false",
            relax ? "true" : "false", optimal ? "true" : "false");
+    printf(",\"certifies_infeasibility\":%s,\"certificate_status\":",
+           farkas && !m.error[0] && certificate_result > 0 ? "true" : "false");
+    lab_json_string(stdout, !farkas ? "absent"
+                            : m.error[0] ? (m.unsupported ? "unsupported" : "error")
+                            : certificate_result > 0 ? "valid"
+                            : certificate_result < 0 ? "unavailable" : "invalid");
+    printf(",\"certificate_kind\":");
+    if (certificate_kind && !m.error[0])
+        lab_json_string(stdout, certificate_kind);
+    else
+        printf("null");
+    printf(",\"contradiction_margin\":");
+    if (farkas && !m.error[0] && certificate_result >= 0)
+        json_q(contradiction);
+    else
+        printf("null");
+    printf(",\"certificate_message\":");
+    lab_json_string(stdout, certificate_message);
     printf(",\"bound_status\":");
     lab_json_string(stdout, m.error[0] || !dual ? "absent" : bound_valid ? "valid" : "unavailable");
     printf(",\"bound_direction\":\"%s\",\"certified_bound\":", m.maximize ? "upper" : "lower");
@@ -982,6 +1142,6 @@ int main(int argc, char **argv) {
     printf("}\n");
     cleanup(&m);
     mpq_clears(lin, integ, objtol, claimed, lo, hi, t, u, maxrow, maxbound, maxint, objerr, bound,
-               NULL);
+               contradiction, NULL);
     return exitcode;
 }

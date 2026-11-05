@@ -23,6 +23,8 @@ typedef struct {
     size_t dual_iterations, cold_fallbacks, factor_nnz_peak, standard_nnz_peak;
     size_t refinement_steps, scaled_rows, scaled_columns;
     double initial_backward_error, max_backward_error;
+    size_t exact_attempts, exact_infeasibilities;
+    size_t rejected_pivots, harris_rescues;
 } LabBbResult;
 
 void lab_bb_solve(const LabModel *model, const LabBbOptions *options, LabBbResult *result);

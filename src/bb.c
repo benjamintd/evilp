@@ -1,5 +1,6 @@
 #include "bb.h"
 #include "common.h"
+#include "exact.h"
 #include <math.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -173,6 +174,10 @@ static int call_lp(Search *s, const double *lower, const double *upper, LabLpRes
 #ifdef LAB_LP_SESSION_API
     s->result->dual_iterations += lp->dual_iterations;
     s->result->cold_fallbacks += lp->cold_fallbacks;
+    s->result->exact_attempts += lp->exact_attempts;
+    s->result->exact_infeasibilities += lp->exact_infeasibilities;
+    s->result->rejected_pivots += lp->rejected_pivots;
+    s->result->harris_rescues += lp->harris_rescues;
     s->result->refinement_steps += lp->refinement_steps;
     if (lp->scaled_rows > s->result->scaled_rows)
         s->result->scaled_rows = lp->scaled_rows;
@@ -188,6 +193,48 @@ static int call_lp(Search *s, const double *lower, const double *upper, LabLpRes
 #endif
     s->result->lp_iterations += lp->iterations;
     s->result->refactorizations += lp->refactorizations;
+    if (s->trace && lp->farkas) {
+        fprintf(s->trace, "{\"event\":\"lp_infeasibility_certificate\",\"lp_solve\":%zu,"
+                         "\"scope\":\"LP with recorded column bounds; not a tree proof\","
+                         "\"bounds\":[", s->result->lp_solves);
+        mpq_t q;
+        mpq_init(q);
+        for (size_t j = 0; j < s->model->cols; j++) {
+            if (j)
+                fputc(',', s->trace);
+            fputs("{\"column\":", s->trace);
+            lab_json_string(s->trace, s->model->col_name[j]);
+            for (int side = 0; side < 2; side++) {
+                fputs(side ? ",\"upper\":" : ",\"lower\":", s->trace);
+                double v = side ? upper[j] : lower[j];
+                if (!isfinite(v))
+                    fputs("null", s->trace);
+                else {
+                    const LabExactModel *e = s->model->exact;
+                    if (e && v == (side ? e->col_upper_source[j] : e->col_lower_source[j]))
+                        mpq_set(q, side ? e->col_upper[j] : e->col_lower[j]);
+                    else
+                        mpq_set_d(q, v);
+                    char *text = mpq_get_str(NULL, 10, q);
+                    lab_json_string(s->trace, text);
+                    free(text);
+                }
+            }
+            fputc('}', s->trace);
+        }
+        mpq_clear(q);
+        fputs("],\"multipliers\":{", s->trace);
+        for (size_t i = 0; i < lp->farkas_rows; i++) {
+            if (i)
+                fputc(',', s->trace);
+            lab_json_string(s->trace, s->model->row_name[i]);
+            fputc(':', s->trace);
+            lab_json_string(s->trace, lp->farkas[i]);
+        }
+        fputs("},\"contradiction_margin\":", s->trace);
+        lab_json_string(s->trace, lp->farkas_margin);
+        fputs("}\n", s->trace);
+    }
     if (remaining(s) <= 0) {
         outcome(s, "time_limit", "MILP time budget exhausted during an LP solve");
         return -1;

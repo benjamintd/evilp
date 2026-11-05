@@ -2,6 +2,7 @@
 #define LAB_MODEL_H
 
 #include <stddef.h>
+typedef struct LabExactModel LabExactModel;
 
 /* Original (unscaled) bounded-row model. The matrix is compressed by column.
  * Bounds use +/-INFINITY; every stored coefficient and objective is finite.
@@ -17,6 +18,10 @@ typedef struct {
     int maximize;
     char error[512];
     int unsupported;
+    /* Optional bounded decimal provenance, owned by this model. In-memory
+     * sessions borrow it; manually constructed models leave both fields zero. */
+    LabExactModel *exact;
+    int parsed_decimal;
 } LabModel;
 
 /* Start from a zero-initialized model. On failure the diagnostic stays in
