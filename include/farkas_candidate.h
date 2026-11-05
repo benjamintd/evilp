@@ -4,6 +4,7 @@
 typedef struct {
     size_t rows;
     size_t projected_rows;
+    size_t removed_terms; /* nonzero canonical terms omitted by simplification */
     char **multiplier;
     char *margin_lower_bound;
     const char *margin_kind; /* source_enclosure; never an exact-margin claim */
@@ -31,5 +32,14 @@ int lab_farkas_projected_candidate(const LabModel *model, size_t terms,
                                     const size_t *source_row, const double *scale,
                                     const double *pi, double deadline,
                                     LabFarkasCandidate *candidate);
+/* Alternate candidate constructor: omit each nonzero canonical pi term with
+ * exact abs(pi)<=max(abs(pi))*2^-40, then aggregate scale*pi exactly and apply
+ * the invalid-current-row-side projection above. The cutoff uses all canonical
+ * pi terms, including SIZE_MAX source rows. removed_terms counts omitted
+ * nonzero canonical terms. The full proof and combined q remain unchanged. */
+int lab_farkas_simplified_candidate(const LabModel *model, size_t terms,
+                                     const size_t *source_row, const double *scale,
+                                     const double *pi, double deadline,
+                                     LabFarkasCandidate *candidate);
 void lab_farkas_candidate_free(LabFarkasCandidate *candidate);
 #endif

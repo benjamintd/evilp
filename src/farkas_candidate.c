@@ -141,7 +141,7 @@ static int support_product(const mpq_t q, const Endpoint *x, mpq_t product,
 }
 static int construct_candidate(const LabModel *m, size_t terms, const size_t *source_row,
                                  const double *scale, const double *pi, double deadline,
-                                 int project_rows, LabFarkasCandidate *r) {
+                                 int project_rows, int simplify_terms, LabFarkasCandidate *r) {
     if (!r)
         return -1;
     memset(r, 0, sizeof *r);
@@ -226,14 +226,37 @@ static int construct_candidate(const LabModel *m, size_t terms, const size_t *so
             break;
         mpq_init(y[initialized]);
     }
-    mpq_t qlo, qhi, alo, ahi, product_lo, product_hi, factor, value, maximum, margin;
-    mpq_inits(qlo, qhi, alo, ahi, product_lo, product_hi, factor, value, maximum, margin, NULL);
+    mpq_t qlo, qhi, alo, ahi, product_lo, product_hi, factor, value, maximum, margin, cutoff;
+    mpq_inits(qlo, qhi, alo, ahi, product_lo, product_hi, factor, value, maximum, margin, cutoff, NULL);
     Endpoint box_lo = {0}, box_hi = {0};
     mpq_init(box_lo.value);
     mpq_init(box_hi.value);
     if (initialized != m->rows)
         goto cleanup;
+    if (simplify_terms) {
+        /* Candidate construction only: exact comparisons avoid underflow in
+         * max(abs(pi))*2^-40 and preserve the inclusive cutoff at every scale. */
+        for (size_t i = 0; i < terms; i++) {
+            mpq_set_d(value, pi[i]);
+            mpq_abs(value, value);
+            if (mpq_cmp(value, cutoff) > 0)
+                mpq_set(cutoff, value);
+            if ((i & 1023U) == 0 && lab_now() >= deadline)
+                goto cleanup;
+        }
+        mpq_div_2exp(cutoff, cutoff, 40);
+    }
     for (size_t i = 0; i < terms; i++) {
+        if ((i & 1023U) == 0 && lab_now() >= deadline)
+            goto cleanup;
+        if (simplify_terms && pi[i] != 0) {
+            mpq_set_d(value, pi[i]);
+            mpq_abs(factor, value);
+            if (mpq_cmp(factor, cutoff) <= 0) {
+                r->removed_terms++;
+                continue;
+            }
+        }
         if (source_row[i] != SIZE_MAX) {
             mpq_set_d(value, pi[i]);
             mpq_set_d(factor, scale[i]);
@@ -242,8 +265,6 @@ static int construct_candidate(const LabModel *m, size_t terms, const size_t *so
             if (!bounded(y[source_row[i]]))
                 goto cleanup;
         }
-        if ((i & 1023U) == 0 && lab_now() >= deadline)
-            goto cleanup;
     }
     if (project_rows)
         for (size_t i = 0; i < m->rows; i++) {
@@ -334,7 +355,7 @@ static int construct_candidate(const LabModel *m, size_t terms, const size_t *so
     outcome = 1;
 cleanup:
     mpq_clear(box_lo.value); mpq_clear(box_hi.value);
-    mpq_clears(qlo, qhi, alo, ahi, product_lo, product_hi, factor, value, maximum, margin, NULL);
+    mpq_clears(qlo, qhi, alo, ahi, product_lo, product_hi, factor, value, maximum, margin, cutoff, NULL);
     for (size_t i = 0; i < initialized; i++)
         mpq_clear(y[i]);
     free(y);
@@ -351,12 +372,17 @@ done:
 int lab_farkas_candidate(const LabModel *m, size_t terms, const size_t *source_row,
                           const double *scale, const double *pi, double deadline,
                           LabFarkasCandidate *r) {
-    return construct_candidate(m, terms, source_row, scale, pi, deadline, 0, r);
+    return construct_candidate(m, terms, source_row, scale, pi, deadline, 0, 0, r);
 }
 int lab_farkas_projected_candidate(const LabModel *m, size_t terms, const size_t *source_row,
                                     const double *scale, const double *pi, double deadline,
                                     LabFarkasCandidate *r) {
-    return construct_candidate(m, terms, source_row, scale, pi, deadline, 1, r);
+    return construct_candidate(m, terms, source_row, scale, pi, deadline, 1, 0, r);
+}
+int lab_farkas_simplified_candidate(const LabModel *m, size_t terms, const size_t *source_row,
+                                     const double *scale, const double *pi, double deadline,
+                                     LabFarkasCandidate *r) {
+    return construct_candidate(m, terms, source_row, scale, pi, deadline, 1, 1, r);
 }
 void lab_farkas_candidate_free(LabFarkasCandidate *r) {
     if (!r)

@@ -10,6 +10,12 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+typedef int (*Constructor)(const LabModel *, size_t, const size_t *, const double *,
+                           const double *, double, LabFarkasCandidate *);
+static Constructor constructors[] = {
+    lab_farkas_candidate, lab_farkas_projected_candidate, lab_farkas_simplified_candidate
+};
+
 static void require(int ok, const char *message) {
     if (!ok) {
         fprintf(stderr, "source Farkas candidate: %s\n", message);
@@ -179,6 +185,10 @@ static void free_columns_and_source_box(const char *checker) {
     require(lab_farkas_projected_candidate(&m, 2, source, scale, pi, lab_now() + 5, &r) == 0,
             "row projection never clips a nonzero combined free-column coefficient");
     lab_farkas_candidate_free(&r);
+    require(lab_farkas_simplified_candidate(&m, 2, source, scale, pi, lab_now() + 5, &r) == 0 &&
+            r.removed_terms == 0,
+            "simplification never clips a surviving nonzero combined free-column coefficient");
+    lab_farkas_candidate_free(&r);
     unlink(path); lab_model_free(&m);
     read_model(&m,
         "NAME SOURCEBOX\nROWS\n N O\n G R\nCOLUMNS\n x O 0 R 1\n"
@@ -271,7 +281,7 @@ static void feasible_oracles_and_malformed_input(void) {
     size_t source[] = {0, 1, 2, 3, 0, 1, 2, SIZE_MAX};
     double scale[8], pi[8];
     uint32_t state = UINT32_C(7176723);
-    for (size_t sample = 0; sample < 1000; sample++) {
+    for (size_t sample = 0; sample < 2000; sample++) {
         for (size_t k = 0; k < 12; k++) {
             state = UINT32_C(1664525) * state + UINT32_C(1013904223);
             a[k] = (double)((long)(state % 7) - 3);
@@ -282,20 +292,35 @@ static void feasible_oracles_and_malformed_input(void) {
                 activity += a[4 * j + i] * point[j];
             rl[i] = activity - (double)(sample % 3);
             ru[i] = activity + (double)(sample % 5);
+            if ((sample + i) % 7 == 0)
+                rl[i] = -INFINITY;
+            if ((sample + i) % 11 == 0)
+                ru[i] = INFINITY;
+        }
+        for (size_t j = 0; j < 3; j++) {
+            lower[j] = (sample + j) % 13 == 0 ? -INFINITY : -2;
+            upper[j] = (sample + j) % 17 == 0 ? INFINITY : 3;
         }
         for (size_t i = 0; i < 8; i++) {
             state = UINT32_C(1664525) * state + UINT32_C(1013904223);
             pi[i] = (double)((long)(state % 17) - 8) / 8;
+            if ((sample + i) % 3 == 0)
+                pi[i] = scalbn(pi[i], -100);
             scale[i] = scalbn(1, (int)(i % 7) - 3);
         }
         LabFarkasCandidate r;
-        require(lab_farkas_candidate(&m, 8, source, scale, pi, lab_now() + 5, &r) == 0,
-                "1000 independent exact feasible points forbid a contradiction for arbitrary dyadic y");
-        require(!r.multiplier && !r.margin_lower_bound, "unavailable result does not leak a witness");
-        lab_farkas_candidate_free(&r);
-        require(lab_farkas_projected_candidate(&m, 8, source, scale, pi, lab_now() + 5, &r) == 0,
-                "1000 exact feasible points also forbid a projected-candidate contradiction");
-        lab_farkas_candidate_free(&r);
+        double pi_snapshot[8], scale_snapshot[8];
+        memcpy(pi_snapshot, pi, sizeof pi);
+        memcpy(scale_snapshot, scale, sizeof scale);
+        for (size_t method = 0; method < sizeof constructors / sizeof *constructors; method++) {
+            require(constructors[method](&m, 8, source, scale, pi, lab_now() + 5, &r) == 0,
+                    "2000 exact feasible points forbid all three constructors from claiming infeasibility");
+            require(!r.multiplier && !r.margin_lower_bound,
+                    "unavailable result does not leak a witness");
+            require(!memcmp(pi_snapshot, pi, sizeof pi) &&
+                    !memcmp(scale_snapshot, scale, sizeof scale), "candidate inputs are immutable");
+            lab_farkas_candidate_free(&r);
+        }
     }
     source[0] = 4;
     LabFarkasCandidate r;
@@ -357,7 +382,157 @@ static void projected_wrong_sign_control(const char *checker) {
             !strcmp(r.margin_lower_bound, "1"), "projection is exact and recorded");
     checker_replay(checker, path, &m, &r, 0);
     lab_farkas_candidate_free(&r);
+    require(lab_farkas_simplified_candidate(&m, 2, source, scale, pi, lab_now() + 5, &r) == 1 &&
+            r.removed_terms == 1 && r.projected_rows == 0,
+            "simplification records omitted canonical terms before row projection");
+    checker_replay(checker, path, &m, &r, 0);
+    lab_farkas_candidate_free(&r);
+    pi[1] = -.5;
+    require(lab_farkas_simplified_candidate(&m, 2, source, scale, pi, lab_now() + 5, &r) == 1 &&
+            r.removed_terms == 0 && r.projected_rows == 1,
+            "simplified constructor still projects retained invalid-side source multipliers");
+    checker_replay(checker, path, &m, &r, 0);
+    lab_farkas_candidate_free(&r);
     unlink(path); lab_model_free(&m);
+}
+static void simplified_cutoffs_and_scope(const char *checker) {
+    LabModel m = {0};
+    char path[64];
+    read_model(&m,
+        "NAME SIMPLIFY\nROWS\n N O\n G PROOF\n E NOISE\nCOLUMNS\n x O 0 NOISE 1\n"
+        "RHS\n b PROOF 1 NOISE 0\nBOUNDS\n FR b x\nENDATA\n", path);
+    size_t source[] = {0, 1, SIZE_MAX};
+    double scale[] = {1, 1, 1}, pi[] = {1, 0x1p-60, 0};
+    LabFarkasCandidate r;
+    for (size_t method = 0; method < 2; method++) {
+        require(constructors[method](&m, 2, source, scale, pi, lab_now() + 5, &r) == 0,
+                "strict and projected APIs preserve the original noisy-candidate rejection");
+        require(!r.removed_terms, "legacy constructors never simplify canonical multipliers");
+        lab_farkas_candidate_free(&r);
+    }
+    require(lab_farkas_simplified_candidate(&m, 2, source, scale, pi, lab_now() + 5, &r) == 1 &&
+            r.removed_terms == 1 && !r.projected_rows && !strcmp(r.multiplier[0], "1") &&
+            !strcmp(r.multiplier[1], "0") && !strcmp(r.margin_lower_bound, "1"),
+            "generic simplification proposes an independently verifiable different candidate");
+    checker_replay(checker, path, &m, &r, 0);
+    lab_farkas_candidate_free(&r);
+    for (int exponent = -1022; exponent <= 1023; exponent += 2045) {
+        pi[0] = scalbn(1, exponent);
+        pi[1] = scalbn(1, exponent - 40);
+        require(lab_farkas_simplified_candidate(&m, 2, source, scale, pi, lab_now() + 5, &r) == 1 &&
+                r.removed_terms == 1, "exact inclusive relative cutoff works at extreme exponents");
+        checker_replay(checker, path, &m, &r, 0);
+        lab_farkas_candidate_free(&r);
+        pi[1] = nextafter(pi[1], INFINITY);
+        require(lab_farkas_simplified_candidate(&m, 2, source, scale, pi, lab_now() + 5, &r) == 0 &&
+                !r.removed_terms, "a surviving one-ulp-above-cutoff free-column residual still rejects");
+        lab_farkas_candidate_free(&r);
+    }
+    pi[0] = 1; pi[1] = 0x1p-60; pi[2] = 0x1p1023;
+    require(lab_farkas_simplified_candidate(&m, 3, source, scale, pi, lab_now() + 5, &r) == 0 &&
+            r.removed_terms == 2,
+            "cutoff maximum and removal count include ignored canonical source rows consistently");
+    lab_farkas_candidate_free(&r);
+    pi[0] = pi[1] = pi[2] = 0;
+    for (size_t method = 0; method < sizeof constructors / sizeof *constructors; method++) {
+        require(constructors[method](&m, 3, source, scale, pi, lab_now() + 5, &r) == 0 &&
+                !r.removed_terms, "zero maximum emits no certificate and removes no nonzero terms");
+        lab_farkas_candidate_free(&r);
+        require(constructors[method](&m, 0, NULL, NULL, NULL, lab_now() + 5, &r) == 0,
+                "empty canonical multiplier vectors do not prove infeasibility");
+        lab_farkas_candidate_free(&r);
+        require(constructors[method](&m, 3, source, scale, pi, lab_now() - 1, &r) == 0 &&
+                !r.multiplier && strstr(r.message, "deadline"), "all constructors obey expired budgets");
+        lab_farkas_candidate_free(&r);
+        pi[0] = NAN;
+        require(constructors[method](&m, 3, source, scale, pi, lab_now() + 5, &r) == -1,
+                "all constructors reject nonfinite pi before exact conversion or simplification");
+        lab_farkas_candidate_free(&r);
+        pi[0] = 0;
+    }
+    for (int exponent = -1074; exponent <= 1023; exponent += 2097) {
+        scale[0] = pi[0] = scalbn(1, exponent);
+        for (size_t method = 0; method < sizeof constructors / sizeof *constructors; method++) {
+            require(constructors[method](&m, 1, source, scale, pi, lab_now() + 5, &r) == 1 &&
+                    !r.removed_terms, "all constructors retain exact scale*pi below/above binary64 range");
+            checker_replay(checker, path, &m, &r, 0);
+            lab_farkas_candidate_free(&r);
+        }
+    }
+    unlink(path); lab_model_free(&m);
+}
+static void all_constructor_source_and_overlay_guards(const char *checker) {
+    size_t source[] = {0};
+    double scale[] = {1}, pi[] = {1};
+    LabFarkasCandidate r;
+    LabModel m = {0};
+    char path[64], *text = decimal_large(0);
+    read_model(&m, text, path); free(text);
+    for (size_t method = 0; method < sizeof constructors / sizeof *constructors; method++) {
+        require(constructors[method](&m, 1, source, scale, pi, lab_now() + 5, &r) == 1,
+                "all constructors prove against original decimal coefficient enclosures");
+        checker_replay(checker, path, &m, &r, 1);
+        lab_farkas_candidate_free(&r);
+    }
+    unlink(path); lab_model_free(&m);
+    text = decimal_large(1);
+    read_model(&m, text, path); free(text);
+    for (size_t method = 0; method < sizeof constructors / sizeof *constructors; method++) {
+        require(constructors[method](&m, 1, source, scale, pi, lab_now() + 5, &r) == 0,
+                "all constructors preserve exact feasibility at an uncertain decimal boundary");
+        lab_farkas_candidate_free(&r);
+    }
+    unlink(path); lab_model_free(&m);
+    read_model(&m,
+        "NAME REPLACE\nROWS\n N O\n G R\nCOLUMNS\n x O 0 R 1\n"
+        "RHS\n b R 2\nBOUNDS\n UP b x 1\nENDATA\n", path);
+    for (size_t method = 0; method < sizeof constructors / sizeof *constructors; method++) {
+        m.col_upper[0] = 3;
+        require(constructors[method](&m, 1, source, scale, pi, lab_now() + 5, &r) == 0,
+                "widened finite overlays replace the original bound for all constructors");
+        lab_farkas_candidate_free(&r);
+        m.col_upper[0] = INFINITY;
+        require(constructors[method](&m, 1, source, scale, pi, lab_now() + 5, &r) == 0,
+                "widened infinite overlays replace the original bound for all constructors");
+        lab_farkas_candidate_free(&r);
+        m.col_upper[0] = 1;
+        LabExactModel *exact = m.exact;
+        LabSourceEnvelope *envelope = m.envelope;
+        m.exact = NULL; m.envelope = NULL;
+        require(constructors[method](&m, 1, source, scale, pi, lab_now() + 5, &r) == 0,
+                "unknown parsed provenance abstains in all constructors");
+        lab_farkas_candidate_free(&r);
+        m.exact = exact; m.envelope = envelope;
+        m.col_upper[0] = 0;
+        require(constructors[method](&m, 1, source, scale, pi, lab_now() + 5, &r) == 1,
+                "changed narrowed overlays can prove only the current node box");
+        LabModel box = {0};
+        char box_path[64];
+        read_model(&box,
+            "NAME REPLACE\nROWS\n N O\n G R\nCOLUMNS\n x O 0 R 1\n"
+            "RHS\n b R 2\nBOUNDS\n UP b x 0\nENDATA\n", box_path);
+        checker_replay(checker, box_path, &box, &r, 0);
+        unlink(box_path); lab_model_free(&box); lab_farkas_candidate_free(&r);
+    }
+    unlink(path); lab_model_free(&m);
+}
+static void active_candidate_budget(void) {
+    double row_lower[] = {1}, row_upper[] = {INFINITY};
+    LabModel m = {.rows = 1, .row_lower = row_lower, .row_upper = row_upper};
+    const size_t count = 200000;
+    size_t *source = calloc(count, sizeof *source);
+    double *scale = calloc(count, sizeof *scale), *pi = calloc(count, sizeof *pi);
+    require(source && scale && pi, "budget fixture arrays");
+    for (size_t i = 0; i < count; i++)
+        scale[i] = pi[i] = 1;
+    for (size_t method = 0; method < sizeof constructors / sizeof *constructors; method++) {
+        LabFarkasCandidate r;
+        require(constructors[method](&m, count, source, scale, pi, lab_now() + .001, &r) == 0 &&
+                !r.multiplier && strstr(r.message, "deadline"),
+                "large otherwise-positive candidates stop on an active LP proof budget");
+        lab_farkas_candidate_free(&r);
+    }
+    free(source); free(scale); free(pi);
 }
 int main(int argc, char **argv) {
     const char *checker = argc > 1 ? argv[1] : NULL;
@@ -368,6 +543,9 @@ int main(int argc, char **argv) {
     feasible_oracles_and_malformed_input();
     masks_and_one_sided_infinity(checker);
     projected_wrong_sign_control(checker);
+    simplified_cutoffs_and_scope(checker);
+    all_constructor_source_and_overlay_guards(checker);
+    active_candidate_budget();
     puts("Source-envelope Farkas candidates, dyadic mapping and independent exact-margin replay pass.");
     return 0;
 }

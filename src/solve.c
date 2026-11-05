@@ -269,7 +269,8 @@ int main(int argc, char **argv) {
                "\"presolve_enabled\":%s,\"presolve_passes\":%zu,\"presolve_tightenings\":%zu,"
                "\"presolve_fixed\":%zu,\"presolve_rows\":%zu,\"branch_observations\":%zu,"
                "\"source_infeasibility_attempts\":%zu,\"source_infeasibilities\":%zu,"
-               "\"source_projected_rows\":%zu,\"primal_accepted_pivots\":%zu,"
+               "\"source_projected_rows\":%zu,\"source_removed_terms\":%zu,"
+               "\"primal_accepted_pivots\":%zu,"
                "\"primal_zero_steps\":%zu,\"primal_short_steps\":%zu,"
                "\"pricing_bland_fallbacks\":%zu,\"pricing_requested\":\"%s\"}\n",
                model.rows, model.cols, model.nnz, r.nodes, r.lp_solves, r.lp_iterations,
@@ -288,6 +289,7 @@ int main(int argc, char **argv) {
                no_presolve ? "false" : "true", r.presolve_passes, r.presolve_tightenings,
                r.presolve_fixed, r.presolve_rows, r.branch_observations,
                r.source_infeasibility_attempts, r.source_infeasibilities, r.source_projected_rows,
+               r.source_removed_terms,
                r.primal_accepted_pivots, r.primal_zero_steps, r.primal_short_steps,
                r.pricing_bland_fallbacks, options.bland_pricing ? "bland" : "most_negative");
         int code = status_code(r.status);
@@ -337,7 +339,7 @@ int main(int argc, char **argv) {
         "\"updates_enabled\":%s,\"basis_updates\":%zu,\"basis_update_rejections\":%zu,"
         "\"factor_core_peak\":%zu,\"singleton_eliminations_peak\":%zu,"
         "\"source_infeasibility_attempts\":%zu,\"source_infeasibilities\":%zu,"
-        "\"source_projected_rows\":%zu,"
+        "\"source_projected_rows\":%zu,\"source_removed_terms\":%zu,"
         "\"farkas_margin_kind\":\"%s\",\"primal_accepted_pivots\":%zu,"
         "\"primal_zero_steps\":%zu,\"primal_short_steps\":%zu,"
         "\"pricing_bland_fallbacks\":%zu,\"pricing_requested\":\"%s\"}\n",
@@ -355,6 +357,7 @@ int main(int argc, char **argv) {
         r.exact_primal_attempts, r.exact_primal_recoveries, options.no_updates ? "false" : "true",
         r.basis_updates, r.basis_update_rejections, r.factor_core_peak, r.singleton_eliminations_peak,
         r.source_infeasibility_attempts, r.source_infeasibilities, r.source_projected_rows,
+        r.source_removed_terms,
         !r.farkas ? "absent" : r.farkas_margin_is_lower_bound ? "source_enclosure" : "exact",
         r.primal_accepted_pivots, r.primal_zero_steps, r.primal_short_steps,
         r.pricing_bland_fallbacks, options.bland_pricing ? "bland" : "most_negative");
