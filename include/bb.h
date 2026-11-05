@@ -32,6 +32,7 @@ typedef struct {
     size_t factor_core_peak, singleton_eliminations_peak;
     size_t presolve_passes, presolve_tightenings, presolve_fixed, presolve_rows;
     size_t branch_observations;
+    size_t primal_accepted_pivots, primal_zero_steps, primal_short_steps, pricing_bland_fallbacks;
 } LabBbResult;
 
 void lab_bb_solve(const LabModel *model, const LabBbOptions *options, LabBbResult *result);

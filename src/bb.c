@@ -189,6 +189,10 @@ static int call_lp(Search *s, const double *lower, const double *upper, LabLpRes
     s->result->source_projected_rows += lp->source_projected_rows;
     s->result->rejected_pivots += lp->rejected_pivots;
     s->result->harris_rescues += lp->harris_rescues;
+    s->result->primal_accepted_pivots += lp->primal_accepted_pivots;
+    s->result->primal_zero_steps += lp->primal_zero_steps;
+    s->result->primal_short_steps += lp->primal_short_steps;
+    s->result->pricing_bland_fallbacks += lp->pricing_bland_fallbacks;
     s->result->primal_repairs += lp->primal_repairs;
     s->result->primal_repair_iterations += lp->primal_repair_iterations;
     s->result->exact_primal_attempts += lp->exact_primal_attempts;

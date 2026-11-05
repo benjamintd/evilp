@@ -4,6 +4,7 @@
 #include "exact.h"
 #include "rational.h"
 #include "pivot.h"
+#include "pricing.h"
 #include "farkas_candidate.h"
 #include <float.h>
 #include <math.h>
@@ -667,12 +668,37 @@ static int source_phase_one_certificate(Work *w) {
     lab_farkas_candidate_free(&candidate);
     return accepted == 1;
 }
+static int record_pricing_result(Work *w, LabPricing *pricing, LabPricingPending *pending) {
+    unsigned events;
+    int recorded = lab_pricing_finish(pricing, pending, 1, w->m, w->basis, w->xb,
+                                      LAB_PRIMAL_TOLERANCE, &events);
+    if (recorded < 0) {
+        message(w, "numerical_failure", "Invalid accepted primal pricing event");
+        return -1;
+    }
+    if (recorded) {
+        w->result->primal_accepted_pivots++;
+        w->result->primal_zero_steps += (events & LAB_PRICING_ZERO) != 0;
+        w->result->primal_short_steps += (events & LAB_PRICING_SHORT) != 0;
+        w->result->pricing_bland_fallbacks += (events & LAB_PRICING_FALLBACK) != 0;
+    }
+    return 0;
+}
 /* 0 optimum, 1 unbounded, -1 explicit failure/limit. Bland's normal leaving
  * order is preserved. A rejected basis can retry a validated Harris pivot. */
 static int simplex(Work *w, int phase_one) {
+    LabPricing pricing;
+    LabPricingPending pending = {0};
+    lab_pricing_begin(&pricing, w->options->bland_pricing);
     int factor_ready = 0;
     for (;;) {
+        /* Count a validated prior pivot before a possible budget exit. The
+         * deferred no-update/Bland-ratio path records only after refactoring. */
+        if (factor_ready && record_pricing_result(w, &pricing, &pending))
+            return -1;
         if (budget(w) || (!factor_ready && refactor(w, 1)))
+            return -1;
+        if (record_pricing_result(w, &pricing, &pending))
             return -1;
         factor_ready = 0;
         for (size_t i = 0; i < w->m; i++)
@@ -681,7 +707,8 @@ static int simplex(Work *w, int phase_one) {
             message(w, "numerical_failure", "Transpose basis solve failed");
             return -1;
         }
-        size_t entering = SIZE_MAX;
+        LabPricingChoice choice;
+        lab_pricing_scan_begin(&choice);
         double worst = 0;
         long double pi_norm = 0;
         for (size_t i = 0; i < w->m; i++)
@@ -704,10 +731,13 @@ static int simplex(Work *w, int phase_one) {
             worst = fmax(worst, (double)-reduced);
             /* An explicit cost with no dual contribution has no cancellation
              * to discount. Ignoring it can hide an improving unbounded ray. */
-            if (entering == SIZE_MAX &&
-                (reduced < -tolerance || (direct_cost < 0 && dot_magnitude == 0)))
-                entering = j;
+            if ((reduced < -tolerance || (direct_cost < 0 && dot_magnitude == 0)) &&
+                lab_pricing_consider(&pricing, &choice, j, reduced, 1) < 0) {
+                message(w, "numerical_failure", "Invalid primal pricing candidate");
+                return -1;
+            }
         }
+        size_t entering = choice.column;
         if (!phase_one)
             w->result->dual_residual = worst;
         if (entering == SIZE_MAX) {
@@ -756,6 +786,7 @@ static int simplex(Work *w, int phase_one) {
             lab_primal_ratio(w->m, w->xb, w->direction, w->basis, 0, &alternative))
             alternative = SIZE_MAX;
         size_t old_column = w->basis[leaving];
+        size_t accepted_position = leaving;
         const char *prior_status = w->result->status;
         char prior_message[sizeof w->result->message];
         memcpy(prior_message, w->result->message, sizeof prior_message);
@@ -776,6 +807,7 @@ static int simplex(Work *w, int phase_one) {
                     w->result->rejected_pivots++;
                     return -1;
                 }
+                accepted_position = alternative;
                 w->result->harris_rescues++;
                 w->result->status = prior_status;
                 memcpy(w->result->message, prior_message, sizeof prior_message);
@@ -785,6 +817,10 @@ static int simplex(Work *w, int phase_one) {
             if (update_basis(w, leaving, w->direction, 1))
                 return -1;
             factor_ready = 1;
+        }
+        if (lab_pricing_queue(&pending, accepted_position, entering)) {
+            message(w, "numerical_failure", "Invalid pending primal pricing event");
+            return -1;
         }
     }
 }

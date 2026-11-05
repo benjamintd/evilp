@@ -11,6 +11,7 @@ typedef struct {
     int no_scaling, no_refinement, no_exact, bland_ratio;
     int no_primal_repair;
     int no_updates;
+    int bland_pricing;
 } LabLpOptions;
 typedef struct {
     const char *status;
@@ -37,6 +38,7 @@ typedef struct {
     int primal_repair_required;
     size_t basis_updates, basis_update_rejections;
     size_t factor_core_peak, singleton_eliminations_peak;
+    size_t primal_accepted_pivots, primal_zero_steps, primal_short_steps, pricing_bland_fallbacks;
 } LabLpResult;
 void lab_lp_solve(const LabModel *m, const LabLpOptions *options, LabLpResult *result);
 void lab_lp_result_free(LabLpResult *result);
