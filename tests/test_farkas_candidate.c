@@ -176,6 +176,9 @@ static void free_columns_and_source_box(const char *checker) {
     require(lab_farkas_candidate(&m, 2, source, scale, pi, lab_now() + 5, &r) == 0,
             "a genuinely nonzero free-column coefficient is never rounded away");
     lab_farkas_candidate_free(&r);
+    require(lab_farkas_projected_candidate(&m, 2, source, scale, pi, lab_now() + 5, &r) == 0,
+            "row projection never clips a nonzero combined free-column coefficient");
+    lab_farkas_candidate_free(&r);
     unlink(path); lab_model_free(&m);
     read_model(&m,
         "NAME SOURCEBOX\nROWS\n N O\n G R\nCOLUMNS\n x O 0 R 1\n"
@@ -290,6 +293,9 @@ static void feasible_oracles_and_malformed_input(void) {
                 "1000 independent exact feasible points forbid a contradiction for arbitrary dyadic y");
         require(!r.multiplier && !r.margin_lower_bound, "unavailable result does not leak a witness");
         lab_farkas_candidate_free(&r);
+        require(lab_farkas_projected_candidate(&m, 8, source, scale, pi, lab_now() + 5, &r) == 0,
+                "1000 exact feasible points also forbid a projected-candidate contradiction");
+        lab_farkas_candidate_free(&r);
     }
     source[0] = 4;
     LabFarkasCandidate r;
@@ -333,6 +339,26 @@ static void masks_and_one_sided_infinity(const char *checker) {
     lab_farkas_candidate_free(&r);
     unlink(path); lab_model_free(&m);
 }
+static void projected_wrong_sign_control(const char *checker) {
+    LabModel m = {0};
+    char path[64];
+    read_model(&m,
+        "NAME PROJECT\nROWS\n N O\n G A\n G B\nCOLUMNS\n x O 0 A 1\n"
+        " x B 1\nRHS\n b A 2 B -100\nBOUNDS\n UP b x 1\nENDATA\n", path);
+    size_t source[] = {0, 1};
+    double scale[] = {1, 1}, pi[] = {1, -0x1p-60};
+    LabFarkasCandidate r;
+    require(lab_farkas_candidate(&m, 2, source, scale, pi, lab_now() + 5, &r) == 0,
+            "strict constructor still rejects a wrong-sign one-sided multiplier");
+    lab_farkas_candidate_free(&r);
+    require(lab_farkas_projected_candidate(&m, 2, source, scale, pi, lab_now() + 5, &r) == 1,
+            "projected constructor proposes a different fully validated row combination");
+    require(r.projected_rows == 1 && !strcmp(r.multiplier[1], "0") &&
+            !strcmp(r.margin_lower_bound, "1"), "projection is exact and recorded");
+    checker_replay(checker, path, &m, &r, 0);
+    lab_farkas_candidate_free(&r);
+    unlink(path); lab_model_free(&m);
+}
 int main(int argc, char **argv) {
     const char *checker = argc > 1 ? argv[1] : NULL;
     basic_and_dyadic_mapping(checker);
@@ -341,6 +367,7 @@ int main(int argc, char **argv) {
     overlays_and_unknown_sources(checker);
     feasible_oracles_and_malformed_input();
     masks_and_one_sided_infinity(checker);
+    projected_wrong_sign_control(checker);
     puts("Source-envelope Farkas candidates, dyadic mapping and independent exact-margin replay pass.");
     return 0;
 }

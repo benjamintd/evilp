@@ -266,7 +266,8 @@ int main(int argc, char **argv) {
                "\"factor_core_peak\":%zu,\"singleton_eliminations_peak\":%zu,"
                "\"presolve_enabled\":%s,\"presolve_passes\":%zu,\"presolve_tightenings\":%zu,"
                "\"presolve_fixed\":%zu,\"presolve_rows\":%zu,\"branch_observations\":%zu,"
-               "\"source_infeasibility_attempts\":%zu,\"source_infeasibilities\":%zu}\n",
+               "\"source_infeasibility_attempts\":%zu,\"source_infeasibilities\":%zu,"
+               "\"source_projected_rows\":%zu}\n",
                model.rows, model.cols, model.nnz, r.nodes, r.lp_solves, r.lp_iterations,
                r.refactorizations, r.warm_starts, r.cold_starts, r.pruned_nodes, r.dual_iterations,
                r.cold_fallbacks, r.factor_nnz_peak, r.standard_nnz_peak, r.elapsed,
@@ -282,7 +283,7 @@ int main(int argc, char **argv) {
                r.basis_update_rejections, r.factor_core_peak, r.singleton_eliminations_peak,
                no_presolve ? "false" : "true", r.presolve_passes, r.presolve_tightenings,
                r.presolve_fixed, r.presolve_rows, r.branch_observations,
-               r.source_infeasibility_attempts, r.source_infeasibilities);
+               r.source_infeasibility_attempts, r.source_infeasibilities, r.source_projected_rows);
         int code = status_code(r.status);
         lab_bb_result_free(&r);
         lab_model_free(&model);
@@ -330,6 +331,7 @@ int main(int argc, char **argv) {
         "\"updates_enabled\":%s,\"basis_updates\":%zu,\"basis_update_rejections\":%zu,"
         "\"factor_core_peak\":%zu,\"singleton_eliminations_peak\":%zu,"
         "\"source_infeasibility_attempts\":%zu,\"source_infeasibilities\":%zu,"
+        "\"source_projected_rows\":%zu,"
         "\"farkas_margin_kind\":\"%s\"}\n",
         model.rows, model.cols, model.nnz, r.standard_rows, r.standard_columns, r.redundant_rows,
         r.iterations, r.refactorizations, r.primal_residual, r.dual_residual, r.elapsed,
@@ -344,7 +346,7 @@ int main(int argc, char **argv) {
         options.no_primal_repair ? "false" : "true", r.primal_repairs, r.primal_repair_iterations,
         r.exact_primal_attempts, r.exact_primal_recoveries, options.no_updates ? "false" : "true",
         r.basis_updates, r.basis_update_rejections, r.factor_core_peak, r.singleton_eliminations_peak,
-        r.source_infeasibility_attempts, r.source_infeasibilities,
+        r.source_infeasibility_attempts, r.source_infeasibilities, r.source_projected_rows,
         !r.farkas ? "absent" : r.farkas_margin_is_lower_bound ? "source_enclosure" : "exact");
     int code = status_code(r.status);
     lab_lp_result_free(&r);

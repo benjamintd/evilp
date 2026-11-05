@@ -3,6 +3,7 @@
 #include "model.h"
 typedef struct {
     size_t rows;
+    size_t projected_rows;
     char **multiplier;
     char *margin_lower_bound;
     const char *margin_kind; /* source_enclosure; never an exact-margin claim */
@@ -22,5 +23,13 @@ typedef struct {
 int lab_farkas_candidate(const LabModel *model, size_t terms, const size_t *source_row,
                           const double *scale, const double *pi, double deadline,
                           LabFarkasCandidate *candidate);
+/* Alternate candidate constructor: after exact original-row aggregation,
+ * zero only multipliers whose sign selects an infinite CURRENT row side.
+ * The entire unchanged source-enclosure/support proof must then pass again.
+ * No combined-column residual is projected or rounded. */
+int lab_farkas_projected_candidate(const LabModel *model, size_t terms,
+                                    const size_t *source_row, const double *scale,
+                                    const double *pi, double deadline,
+                                    LabFarkasCandidate *candidate);
 void lab_farkas_candidate_free(LabFarkasCandidate *candidate);
 #endif

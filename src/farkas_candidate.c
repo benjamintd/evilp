@@ -139,9 +139,9 @@ static int support_product(const mpq_t q, const Endpoint *x, mpq_t product,
     }
     return 1;
 }
-int lab_farkas_candidate(const LabModel *m, size_t terms, const size_t *source_row,
-                          const double *scale, const double *pi, double deadline,
-                          LabFarkasCandidate *r) {
+static int construct_candidate(const LabModel *m, size_t terms, const size_t *source_row,
+                                 const double *scale, const double *pi, double deadline,
+                                 int project_rows, LabFarkasCandidate *r) {
     if (!r)
         return -1;
     memset(r, 0, sizeof *r);
@@ -245,6 +245,16 @@ int lab_farkas_candidate(const LabModel *m, size_t terms, const size_t *source_r
         if ((i & 1023U) == 0 && lab_now() >= deadline)
             goto cleanup;
     }
+    if (project_rows)
+        for (size_t i = 0; i < m->rows; i++) {
+            int sign = mpq_sgn(y[i]);
+            if (sign && !isfinite(sign > 0 ? m->row_lower[i] : m->row_upper[i])) {
+                mpq_set_ui(y[i], 0, 1);
+                r->projected_rows++;
+            }
+            if ((i & 1023U) == 0 && lab_now() >= deadline)
+                goto cleanup;
+        }
     for (size_t i = 0; i < m->rows; i++) {
         int sign = mpq_sgn(y[i]);
         if (sign) {
@@ -337,6 +347,16 @@ expired:
 done:
     r->elapsed = lab_now() - started;
     return outcome;
+}
+int lab_farkas_candidate(const LabModel *m, size_t terms, const size_t *source_row,
+                          const double *scale, const double *pi, double deadline,
+                          LabFarkasCandidate *r) {
+    return construct_candidate(m, terms, source_row, scale, pi, deadline, 0, r);
+}
+int lab_farkas_projected_candidate(const LabModel *m, size_t terms, const size_t *source_row,
+                                    const double *scale, const double *pi, double deadline,
+                                    LabFarkasCandidate *r) {
+    return construct_candidate(m, terms, source_row, scale, pi, deadline, 1, r);
 }
 void lab_farkas_candidate_free(LabFarkasCandidate *r) {
     if (!r)
