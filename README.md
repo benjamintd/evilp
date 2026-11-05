@@ -3,11 +3,13 @@
 A C17 laboratory for building and evaluating a new MILP solver.
 Milestone 1 implements the dataset import, independent primal checker,
 native benchmark runner and HiGHS / SCIP / Cbc baseline adapters.
-Milestone 2A adds the first native LP solver: bounded-variable transformations,
-two-phase revised simplex, a dense LU reference backend, and independent
-rational LP-bound validation. Integer search is the next milestone.
+The current prototype adds sparse LP storage and LU factorization, saved-basis
+dual reoptimization, and a minimal deterministic branch-and-bound MILP solver.
+The independent checker validates original-model witnesses and rational LP bounds.
 
-See [the LP engine and completed validation](docs/LP-ENGINE.md),
+See [the current solver contract](docs/MILESTONE-2BC.md).
+
+Milestone 2A is preserved in [the original LP engine contract](docs/LP-ENGINE.md),
 [the lab's LP report](results/lp-native-v2/lab/summary.html), and
 [the four-engine crosscheck](results/lp-native-v2/summary.json).
 
@@ -75,18 +77,40 @@ The separate checker certifies this example's exact LP optimum. In general,
 floating-point solutions are tolerance-accepted and their dual bounds can be
 unavailable; inspect both statuses. Output files must be new. `--relax` is
 required so fractional LP solutions cannot silently be presented as MILP results.
-The dense backend caps the expanded standard-form dimension at 512 by default.
+Sparse LU is the default. The expanded standard-form dimension limit is 4096
+by default (up to 32768 for sparse mode); `--backend dense` selects the reference
+backend, whose dimension ceiling is 4096.
 
 ~~~sh
 build/milpsolve tests/fixtures/tiny.mps --relax --read-basis work/tiny-lp.basis
 python3 tests/test_live_lp.py --out results/my-live-lp
 ~~~
 
-The optional live test requires the three installed baseline solvers. It runs
+The optional live LP test requires the three installed baseline solvers. It runs
 eight continuous models through all four engines and checks known objectives
 and the lab's independent bounds. Its generated lab configuration also shows
 how to use `milpbench --relax` with an LP-reference suite. Native baseline
 adapters operate on continuous MPS models in a separate run directory.
+
+## Solve a MILP
+
+~~~sh
+build/milpsolve tests/fixtures/tiny.mps --mip \
+  --solution work/tiny-mip.sol --trace work/tiny-mip-trace.jsonl
+build/milpcheck --model tests/fixtures/tiny.mps --solution work/tiny-mip.sol --exact
+build/milpsolve tests/fixtures/tiny.mps --mip --cold
+python3 tests/test_live_mip.py --out results/my-live-mip
+~~~
+
+The tiny integer optimum is 8.03. Search defaults to warm LP sessions; `--cold`
+rebuilds each LP for comparison. Use `--node-limit` and `--time-limit` to bound
+search. Limits retain any incumbent found so far. Search statuses and global
+bounds remain numerical claims: complete tree proof logging is not implemented.
+An unbounded LP relaxation returns `lp_unbounded`, without asserting MILP
+unboundedness. `--mip` and `--relax` are explicit, exclusive modes.
+
+The `lab` benchmark adapter accepts `milpbench --mip` alongside the native
+solvers. LP runs use `--relax` and LP reference objectives in separate suites.
 
 ## Run baselines
 
@@ -125,6 +149,7 @@ and 3. Inspect all validation failures before accepting performance changes.
 - src/common.c: allocation, JSON escaping, monotonic timing and SHA-256.
 - src/model.c: independent optimizer MPS reader and sparse CSC model.
 - src/lp.c, src/factor.c, src/solve.c: LP engine, LU backend and command line.
+- src/bb.c: branch-and-bound, integer repair, limits and deterministic traces.
 - config/: dataset locks, native assets, solver identities and smoke suite.
 - tests/: exact arithmetic oracle, adversarial cases and runner contracts.
 - data/, tools/, work/: locally fetched data/tools and build scratch; ignored.

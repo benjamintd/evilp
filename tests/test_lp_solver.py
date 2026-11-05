@@ -405,6 +405,16 @@ ENDATA
         self.assertEqual(values["x0"], 10**20, result)
         self.assertAlmostEqual(result["objective"], -10**9, delta=1e-6, msg=str(result))
 
+    def test_small_explicit_cost_cannot_hide_an_improving_ray(self):
+        # The x row creates a nonzero dual norm. It must not suppress a tiny
+        # independent negative cost on the unbounded y direction.
+        model = {"cost": [1, F('-1e-15')], "bounds": [(0, None), (0, None)],
+                 "rows": [([1, 0], 1, None)]}
+        for backend in ('sparse', 'dense'):
+            code, result, _, _ = self.invoke(model, ['--backend', backend])
+            self.assertEqual(code, 0, result)
+            self.assertEqual(result['status'], 'unbounded', result)
+
     def test_constant_small_nonzero_equality_is_not_feasible(self):
         model = {"cost": [-1], "bounds": [(0, 1)],
                  "rows": [([0], F(1, 10**12), F(1, 10**12))]}

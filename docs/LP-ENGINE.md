@@ -1,5 +1,9 @@
 # Milestone 2A: first native C LP engine
 
+This document describes the frozen milestone-2A checkpoint. The current
+[sparse engine, reoptimization and MILP contract](MILESTONE-2BC.md) supersedes
+its backend defaults and limitations. Original validation records are preserved.
+
 `milpsolve MODEL --relax` solves the continuous relaxation using project-owned
 C17 code. It does not call HiGHS, SCIP, Cbc or another optimizer. GMP belongs
 to the separate checker; the numerical solve uses floating-point arithmetic.

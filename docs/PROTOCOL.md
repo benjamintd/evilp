@@ -97,9 +97,12 @@ ignores OBJSENSE. Maximization regression tests guard this behavior. The pinned
 MIPLIB benchmark models use minimization; this adapter correction does not
 reinterpret their original timed runs.
 
-The milestone-2A lab adapter requires --relax and an LP-reference suite; this
-mode currently excludes native MILP adapters. Native LP crosschecks instead
-provide continuous MPS models to those adapters in a separate run directory.
+The lab adapter requires explicit --relax with LP references, or --mip with
+integer-model references. These modes are exclusive. LP mode excludes native
+MILP adapters; native LP crosschecks provide continuous MPS models in a separate
+run directory. MIP mode permits the lab alongside HiGHS, SCIP and Cbc and checks
+integrality normally. Lab MILP best_bound values remain uncertified numerical
+claims; no complete branch-and-bound proof is logged.
 
 ## Reproducibility boundaries
 

@@ -156,4 +156,65 @@ class Harness(unittest.TestCase):
                 root=pathlib.Path(td);args=self.lab_case(root,'print('+repr(text)+')\n')+['--relax']
                 p=subprocess.run(args,capture_output=True,text=True);self.assertEqual(p.returncode,0,p.stderr)
                 r=json.loads((root/'result/runs.jsonl').read_text());self.assertEqual(r['claimed_status'],'unknown',r)
+    def mip_case(self,root,body):
+        args=self.lab_case(root,body)
+        suite=root/'suite.tsv';suite.write_text(suite.read_text().replace('\t8.53\n','\t8.03\n'))
+        return args+['--mip']
+    def test_lab_mip_checks_integer_witness_without_relaxation_or_dual(self):
+        with tempfile.TemporaryDirectory(prefix='milp lab MIP ') as td:
+            root=pathlib.Path(td)
+            body='import json,pathlib,sys\nassert "--mip" in sys.argv\nassert "--relax" not in sys.argv\nassert "--dual" not in sys.argv\np=pathlib.Path(sys.argv[sys.argv.index("--solution")+1])\np.write_text("=obj= 8.03\\nx 1\\ny 0\\nz .3\\n")\nprint(json.dumps({"status":"optimal","certifies_optimality":False}))\n'
+            args=self.mip_case(root,body)
+            p=subprocess.run(args,capture_output=True,text=True);self.assertEqual(p.returncode,0,p.stderr)
+            r=json.loads((root/'result/runs.jsonl').read_text())
+            self.assertFalse(r['relaxation']);self.assertEqual(r['mode'],'mip')
+            self.assertFalse(r['checker']['relaxation']);self.assertTrue(r['checker']['checked_feasible'],r)
+            self.assertEqual(r['checker']['objective'],'803/100');self.assertFalse(r['checker']['certifies_optimality'])
+            self.assertIsNone(r['dual_file']);self.assertNotIn('--dual',r['argv']);self.assertIn('--mip',r['argv'])
+            env=json.loads((root/'result/environment.json').read_text())
+            self.assertEqual(env['mode'],'mip');self.assertFalse(env['relaxation'])
+            self.assertIn('reference_objectives=MIP',(root/'result/tiny/lab/seed-1/settings.txt').read_text())
+    def test_lab_mip_rejects_lp_fractional_candidate(self):
+        with tempfile.TemporaryDirectory() as td:
+            root=pathlib.Path(td)
+            body='import json,pathlib,sys\np=pathlib.Path(sys.argv[sys.argv.index("--solution")+1])\np.write_text("=obj= 8.53\\nx .5\\ny 1\\nz .3\\n")\nprint(json.dumps({"status":"optimal"}))\n'
+            p=subprocess.run(self.mip_case(root,body),capture_output=True,text=True);self.assertEqual(p.returncode,0,p.stderr)
+            r=json.loads((root/'result/runs.jsonl').read_text())
+            self.assertEqual(r['claimed_status'],'optimal');self.assertEqual(r['checker_exit_code'],1)
+            self.assertEqual(r['checker']['status'],'invalid');self.assertGreater(r['checker']['integrality_violations'],0)
+            self.assertFalse(r['checker']['checked_feasible']);self.assertFalse(r['checker']['relaxation'])
+    def test_lab_mip_limits_retain_and_check_incumbents(self):
+        for status in ['node_limit','time_limit','iteration_limit']:
+            with tempfile.TemporaryDirectory() as td:
+                root=pathlib.Path(td)
+                body='import json,pathlib,sys\np=pathlib.Path(sys.argv[sys.argv.index("--solution")+1])\np.write_text("=obj= 8.03\\nx 1\\nz .3\\n")\nprint(json.dumps({"status":'+repr(status)+'}))\nsys.exit(4)\n'
+                p=subprocess.run(self.mip_case(root,body),capture_output=True,text=True);self.assertEqual(p.returncode,0,p.stderr)
+                r=json.loads((root/'result/runs.jsonl').read_text())
+                self.assertEqual(r['claimed_status'],status,r);self.assertEqual(r['reported_solver_status'],status)
+                self.assertEqual(r['exit_code'],4);self.assertTrue(r['checker']['checked_feasible'],r)
+                self.assertFalse(r['checker']['relaxation']);self.assertIsNone(r['dual_file'])
+        with tempfile.TemporaryDirectory() as td:
+            root=pathlib.Path(td)
+            args=self.mip_case(root,'print(\'{"status":"lp_unbounded"}\')\nraise SystemExit(4)\n')
+            p=subprocess.run(args,capture_output=True,text=True);self.assertEqual(p.returncode,0,p.stderr)
+            r=json.loads((root/'result/runs.jsonl').read_text())
+            self.assertEqual(r['claimed_status'],'lp_unbounded');self.assertFalse(r['checker']['checked_feasible'])
+    def test_mip_and_relax_modes_are_exclusive(self):
+        with tempfile.TemporaryDirectory() as td:
+            root=pathlib.Path(td);args=self.mip_case(root,'print("must not run")\n')+['--relax']
+            p=subprocess.run(args,capture_output=True,text=True)
+            self.assertEqual(p.returncode,2);self.assertIn('mutually exclusive',p.stderr)
+            self.assertFalse((root/'result').exists())
+    def test_mip_mode_permits_native_and_lab_comparison(self):
+        with tempfile.TemporaryDirectory() as td:
+            root=pathlib.Path(td)
+            body='import json,pathlib,sys\nif "--mip" in sys.argv:\n p=pathlib.Path(sys.argv[sys.argv.index("--solution")+1]);p.write_text("=obj= 8.03\\nx 1\\ny 0\\nz .3\\n");print(json.dumps({"status":"optimal"}))\nelse:\n p=pathlib.Path(sys.argv[sys.argv.index("--options_file")+1]);s=[x.split(" = ",1)[1] for x in p.read_text().splitlines() if x.startswith("solution_file")][0];pathlib.Path(s).write_text("# Primal solution values\\nFeasible\\nObjective 8.03\\n# Columns 3\\nx 1\\ny 0\\nz .3\\n# Rows 0\\n");print("Model status : Optimal")\n'
+            args=self.mip_case(root,body)
+            cfg=root/'solvers.tsv';cfg.write_text(cfg.read_text()+cfg.read_text().splitlines()[1].replace('lab\t','highs\t',1)+'\n')
+            p=subprocess.run(args,capture_output=True,text=True);self.assertEqual(p.returncode,0,p.stderr)
+            records=[json.loads(line) for line in (root/'result/runs.jsonl').read_text().splitlines()]
+            self.assertEqual({r['solver'] for r in records},{'lab','highs'});self.assertEqual(len(records),2)
+            for r in records:
+                self.assertEqual(r['mode'],'mip');self.assertEqual(r['claimed_status'],'optimal',r)
+                self.assertFalse(r['checker']['relaxation']);self.assertTrue(r['checker']['checked_feasible'],r)
 unittest.main()

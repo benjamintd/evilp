@@ -339,7 +339,8 @@ static int json_value(const char **p, unsigned depth) {
 }
 static const char *lab_status(const char *p) {
     static const char *known[] = {"optimal",     "infeasible",  "unbounded",  "numerical_failure",
-                                  "unsupported", "input_error", "time_limit", "iteration_limit"};
+                                  "unsupported", "input_error", "time_limit", "iteration_limit",
+                                  "node_limit",  "lp_unbounded"};
     json_space(&p);
     if (*p++ != '{')
         return NULL;
@@ -611,17 +612,19 @@ static void one(const Instance *inst, const Solver *s, const char *checker, cons
         die("result directory is not new");
     if (!strcmp(s->name, "lab")) {
         args[k++] = inst->path;
-        args[k++] = "--relax";
+        args[k++] = relax ? "--relax" : "--mip";
         args[k++] = "--time-limit";
         args[k++] = secs;
         args[k++] = "--solution";
         args[k++] = sol;
-        args[k++] = "--dual";
-        args[k++] = dual;
+        if (relax) {
+            args[k++] = "--dual";
+            args[k++] = dual;
+        }
         fprintf(opt,
-                "relaxation=true\ntime_limit=%s\nthreads=1\nalgorithm=deterministic\n"
-                "seed_argument=none\nreference_objectives=LP\n",
-                secs);
+                "relaxation=%s\nmode=%s\ntime_limit=%s\nthreads=1\nalgorithm=deterministic\n"
+                "seed_argument=none\nreference_objectives=%s\n",
+                relax ? "true" : "false", relax ? "relax" : "mip", secs, relax ? "LP" : "MIP");
     } else if (!strcmp(s->name, "highs")) {
         fprintf(opt,
                 "time_limit = %s\nthreads = 1\nrandom_seed = %s\nmip_rel_gap = 0\nmip_abs_gap = "
@@ -690,7 +693,7 @@ static void one(const Instance *inst, const Solver *s, const char *checker, cons
     const char *claimed = status_from_log(s->name, log, p, &reported, bound);
     Process cp = {.code = -1};
     int has_solution = access(sol, R_OK) == 0;
-    int has_dual = !strcmp(s->name, "lab") && access(dual, R_OK) == 0;
+    int has_dual = relax && !strcmp(s->name, "lab") && access(dual, R_OK) == 0;
     int has_evidence = has_solution || has_dual;
     char *check = NULL;
     if (has_evidence && !interrupted) {
@@ -738,7 +741,8 @@ static void one(const Instance *inst, const Solver *s, const char *checker, cons
     lab_json_string(f, checker_sha);
     fprintf(f, ",\"runner_sha256\":");
     lab_json_string(f, runner_sha);
-    fprintf(f, ",\"relaxation\":%s,\"dual_file\":", relax ? "true" : "false");
+    fprintf(f, ",\"relaxation\":%s,\"mode\":\"%s\",\"dual_file\":", relax ? "true" : "false",
+            relax ? "relax" : "mip");
     if (has_dual)
         lab_json_string(f, dual);
     else
@@ -795,19 +799,24 @@ int main(int argc, char **argv) {
     if (argc == 2 && !strcmp(argv[1], "--help")) {
         puts("milpbench --suite FILE --out NEW_DIR [--solvers FILE] [--checker FILE]\n"
              "          [--limit SECONDS] [--grace SECONDS] [--seed POSITIVE_INT]\n"
-             "          [--max-instances N] [--relax]\n"
+             "          [--max-instances N] [--relax | --mip]\n"
              "--relax currently supports only lab; suite reference objectives must be LP values.\n"
+             "--mip permits lab/native mixed runs and keeps integrality checks enabled.\n"
              "Run from the project root. Results are immutable per output directory.");
         return 0;
     }
     const char *suite = NULL, *config = "config/solvers.tsv", *output = NULL,
                *checker_arg = "build/milpcheck";
     double limit = 2, grace = 15;
-    int seed = 1, relax = 0;
+    int seed = 1, relax = 0, mip = 0;
     size_t max = SIZE_MAX;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--relax")) {
             relax = 1;
+            continue;
+        }
+        if (!strcmp(argv[i], "--mip")) {
+            mip = 1;
             continue;
         }
         if (i + 1 >= argc)
@@ -846,14 +855,17 @@ int main(int argc, char **argv) {
     if (!suite || !output)
         die("usage: milpbench --suite FILE --out NEW_DIR [--limit SECONDS --seed N --solvers FILE "
             "--checker FILE]");
+    if (relax && mip)
+        die("--relax and --mip are mutually exclusive");
     Instance *instances = NULL;
     Solver *solvers = NULL;
     size_t ni = load_instances(suite, &instances), ns = load_solvers(config, &solvers);
     if (!ni || !ns)
         die("empty suite or solver list");
     for (size_t j = 0; j < ns; ++j) {
-        if (!strcmp(solvers[j].name, "lab") && !relax)
-            die("lab adapter requires --relax; use LP reference objectives in the suite");
+        if (!strcmp(solvers[j].name, "lab") && !relax && !mip)
+            die("lab adapter requires --relax or --mip; suite reference objectives must match the "
+                "mode");
         if (relax && strcmp(solvers[j].name, "lab"))
             die("--relax currently supports only lab; native MILP adapters cannot be mixed with LP "
                 "references");
@@ -901,10 +913,11 @@ int main(int argc, char **argv) {
     fprintf(env, ",\"checker_sha256\":");
     lab_json_string(env, checker_sha);
     fprintf(env,
-            ",\"relaxation\":%s,\"time_limit_s\":%.9g,\"seed\":%d,\"requested_threads\":1,\"solver_"
+            ",\"relaxation\":%s,\"mode\":\"%s\",\"time_limit_s\":%.9g,\"seed\":%d,\"requested_"
+            "threads\":1,\"solver_"
             "order\":\"rotated_"
             "by_instance\",\"timing\":\"end-to-end solver process; checker excluded\",\"argv\":",
-            relax ? "true" : "false", limit, seed);
+            relax ? "true" : "false", relax ? "relax" : "mip", limit, seed);
     argv_json(env, argv);
     fprintf(env, "}\n");
     fclose(env);

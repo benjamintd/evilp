@@ -1,3 +1,4 @@
+#include "bb.h"
 #include "common.h"
 #include "lp.h"
 #include <errno.h>
@@ -67,25 +68,41 @@ static int write_vector(const char *path, const LabModel *m, const LabLpResult *
         bad = 1;
     return bad ? -1 : 0;
 }
+static int status_code(const char *status) {
+    if (!strcmp(status, "input_error"))
+        return 2;
+    if (!strcmp(status, "unsupported"))
+        return 3;
+    if (!strcmp(status, "optimal") || !strcmp(status, "infeasible") || !strcmp(status, "unbounded"))
+        return 0;
+    return 4;
+}
 int main(int argc, char **argv) {
     if (argc == 2 && !strcmp(argv[1], "--help")) {
-        puts("milpsolve MODEL --relax [--solution NEW_FILE] [--dual NEW_FILE]\n"
+        puts("milpsolve MODEL (--relax | --mip) [--solution NEW_FILE]\n"
              "          [--time-limit SECONDS] [--iteration-limit N] [--max-dimension N]\n"
-             "          [--basis NEW_FILE] [--read-basis FILE]\n"
-             "C17 revised-simplex LP reference engine. Integrality is relaxed explicitly.\n"
+             "          [--backend sparse|dense]\n"
+             "          LP: [--dual NEW_FILE] [--basis NEW_FILE] [--read-basis FILE]\n"
+             "          MILP: [--node-limit N] [--cold] [--trace NEW_FILE]\n"
+             "C17 LP and numerical branch-and-bound prototype. Select problem mode explicitly.\n"
              "JSON statuses are numerical solver claims; use milpcheck for validation.\n"
-             "Dense backend: default maximum standard-form dimension 512, hard cap 4096.");
+             "Default standard-form dimension limit4096; sparse hard cap32768,dense hard cap4096.");
         return 0;
     }
-    const char *path = NULL, *solution = NULL, *dual = NULL;
-    int relax = 0;
-    LabLpOptions options = {60, 100000, 512, NULL, NULL, NULL};
+    const char *path = NULL, *solution = NULL, *dual = NULL, *trace_path = NULL;
+    int relax = 0, mip = 0, cold = 0, node_limit_set = 0;
+    size_t node_limit = 100000;
+    LabLpOptions options = {.time_limit = 60, .iteration_limit = 100000, .max_dimension = 4096};
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
         if (!strcmp(a, "--relax")) {
             relax = 1;
+        } else if (!strcmp(a, "--mip")) {
+            mip = 1;
+        } else if (!strcmp(a, "--cold")) {
+            cold = 1;
         } else if (!strcmp(a, "--solution") || !strcmp(a, "--dual") || !strcmp(a, "--basis") ||
-                   !strcmp(a, "--read-basis")) {
+                   !strcmp(a, "--read-basis") || !strcmp(a, "--trace")) {
             if (++i == argc)
                 return error("input_error", "Missing option value", 2);
             if (!strcmp(a, "--solution"))
@@ -94,8 +111,19 @@ int main(int argc, char **argv) {
                 dual = argv[i];
             else if (!strcmp(a, "--basis"))
                 options.basis_out = argv[i];
+            else if (!strcmp(a, "--trace"))
+                trace_path = argv[i];
             else
                 options.basis_in = argv[i];
+        } else if (!strcmp(a, "--backend")) {
+            if (++i == argc)
+                return error("input_error", "Missing backend name", 2);
+            if (!strcmp(argv[i], "dense"))
+                options.dense = 1;
+            else if (!strcmp(argv[i], "sparse"))
+                options.dense = 0;
+            else
+                return error("input_error", "Backend must be sparse or dense", 2);
         } else if (!strcmp(a, "--time-limit")) {
             if (++i == argc)
                 return error("input_error", "Missing time limit", 2);
@@ -105,12 +133,16 @@ int main(int argc, char **argv) {
             if (errno || end == argv[i] || *end || !isfinite(options.time_limit) ||
                 options.time_limit <= 0 || options.time_limit > 1e9)
                 return error("input_error", "Invalid time limit", 2);
-        } else if (!strcmp(a, "--iteration-limit") || !strcmp(a, "--max-dimension")) {
+        } else if (!strcmp(a, "--iteration-limit") || !strcmp(a, "--max-dimension") ||
+                   !strcmp(a, "--node-limit")) {
             if (++i == argc)
                 return error("input_error", "Missing integer limit", 2);
-            size_t *v =
-                !strcmp(a, "--iteration-limit") ? &options.iteration_limit : &options.max_dimension;
-            if (positive_size(argv[i], v, !strcmp(a, "--max-dimension") ? 4096 : SIZE_MAX))
+            size_t *v = !strcmp(a, "--iteration-limit") ? &options.iteration_limit
+                        : !strcmp(a, "--node-limit")    ? &node_limit
+                                                        : &options.max_dimension;
+            if (!strcmp(a, "--node-limit"))
+                node_limit_set = 1;
+            if (positive_size(argv[i], v, !strcmp(a, "--max-dimension") ? 32768 : SIZE_MAX))
                 return error("input_error", "Invalid positive integer limit", 2);
         } else if (a[0] == '-' || path) {
             return error("input_error", "Unknown option or extra model path", 2);
@@ -118,9 +150,15 @@ int main(int argc, char **argv) {
             path = a;
         }
     }
-    if (!path || !relax)
-        return error("input_error", "Provide a model and --relax; MILP search is not implemented",
-                     2);
+    if (!path || relax == mip)
+        return error("input_error", "Provide a model and exactly one of --relax or --mip", 2);
+    if (mip && (dual || options.basis_in || options.basis_out))
+        return error("input_error",
+                     "Dual/basis files are LP-only; MILP tree proofs are not implemented", 2);
+    if (!mip && (cold || node_limit_set || trace_path))
+        return error("input_error", "Cold search, node limits and traces require --mip", 2);
+    if (options.dense && options.max_dimension > 4096)
+        return error("input_error", "Dense backend hard dimension limit is4096", 2);
     double started = lab_now();
     char hash[65];
     if (lab_sha256(path, hash))
@@ -135,6 +173,55 @@ int main(int argc, char **argv) {
     }
     /* Reading counts toward the CLI budget; each simplex iteration checks it. */
     options.time_limit -= lab_now() - started;
+    if (mip) {
+        LabBbOptions bb_options = {.lp = options,
+                                   .time_limit = options.time_limit,
+                                   .node_limit = node_limit,
+                                   .cold = cold,
+                                   .trace_path = trace_path};
+        LabBbResult r;
+        lab_bb_solve(&model, &bb_options, &r);
+        if (r.has_primal) {
+            LabLpResult exported = {.objective = r.objective, .primal = r.primal};
+            if (write_vector(solution, &model, &exported, 0)) {
+                r.status = "input_error";
+                snprintf(r.message, sizeof r.message, "Cannot create fresh solution file");
+            }
+        }
+        printf("{\"schema\":1,\"solver\":\"milp-lab\",\"status\":");
+        lab_json_string(stdout, r.status);
+        printf(",\"message\":");
+        lab_json_string(stdout, r.message);
+        printf(",\"relaxation\":false,\"certifies_optimality\":false,\"bound_certified\":false,"
+               "\"solver_status_is_claim\":true,\"model_sha256\":");
+        lab_json_string(stdout, hash);
+        printf(",\"objective_sense\":\"%s\",\"has_primal\":%s,\"objective\":",
+               model.maximize ? "max" : "min", r.has_primal ? "true" : "false");
+        if (r.has_primal)
+            printf("%.17g", r.objective);
+        else
+            fputs("null", stdout);
+        printf(",\"best_bound\":");
+        if (r.has_bound && isfinite(r.best_bound))
+            printf("%.17g", r.best_bound);
+        else
+            fputs("null", stdout);
+        printf(",\"rows\":%zu,\"columns\":%zu,\"nonzeros\":%zu,\"nodes\":%zu,"
+               "\"lp_solves\":%zu,\"lp_iterations\":%zu,\"refactorizations\":%zu,"
+               "\"warm_starts\":%zu,\"cold_starts\":%zu,\"pruned_nodes\":%zu,"
+               "\"dual_iterations\":%zu,\"cold_fallbacks\":%zu,\"factor_nnz_peak\":%zu,"
+               "\"standard_nnz_peak\":%zu,"
+               "\"solve_wall_s\":%.9g,\"total_wall_s\":%.9g,\"backend\":\"%s\",\"cold\":%s}\n",
+               model.rows, model.cols, model.nnz, r.nodes, r.lp_solves, r.lp_iterations,
+               r.refactorizations, r.warm_starts, r.cold_starts, r.pruned_nodes, r.dual_iterations,
+               r.cold_fallbacks, r.factor_nnz_peak, r.standard_nnz_peak, r.elapsed,
+               lab_now() - started, options.dense ? "dense_lu_reference" : "sparse_lu",
+               cold ? "true" : "false");
+        int code = status_code(r.status);
+        lab_bb_result_free(&r);
+        lab_model_free(&model);
+        return code;
+    }
     LabLpResult r;
     lab_lp_solve(&model, &options, &r);
     if (r.has_primal &&
@@ -158,16 +245,15 @@ int main(int argc, char **argv) {
     printf(",\"rows\":%zu,\"columns\":%zu,\"nonzeros\":%zu,\"standard_rows\":%zu,"
            "\"standard_columns\":%zu,\"redundant_rows\":%zu,\"iterations\":%zu,"
            "\"refactorizations\":%zu,\"primal_residual\":%.17g,\"dual_residual\":%.17g,"
-           "\"solve_wall_s\":%.9g,\"total_wall_s\":%.9g,\"backend\":\"dense_lu_reference\"}\n",
+           "\"solve_wall_s\":%.9g,\"total_wall_s\":%.9g,\"backend\":\"%s\","
+           "\"warm_start\":%s,\"dual_iterations\":%zu,\"cold_fallbacks\":%zu,"
+           "\"factor_nnz_peak\":%zu,\"standard_nnz\":%zu}\n",
            model.rows, model.cols, model.nnz, r.standard_rows, r.standard_columns, r.redundant_rows,
            r.iterations, r.refactorizations, r.primal_residual, r.dual_residual, r.elapsed,
-           lab_now() - started);
-    int code = !strcmp(r.status, "input_error")   ? 2
-               : !strcmp(r.status, "unsupported") ? 3
-               : !strcmp(r.status, "optimal") || !strcmp(r.status, "infeasible") ||
-                       !strcmp(r.status, "unbounded")
-                   ? 0
-                   : 4;
+           lab_now() - started, options.dense ? "dense_lu_reference" : "sparse_lu",
+           r.warm_start ? "true" : "false", r.dual_iterations, r.cold_fallbacks, r.factor_nnz_peak,
+           r.standard_nnz);
+    int code = status_code(r.status);
     lab_lp_result_free(&r);
     lab_model_free(&model);
     return code;
