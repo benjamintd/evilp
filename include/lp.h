@@ -7,6 +7,7 @@ typedef struct {
     const char *basis_in, *basis_out, *model_sha256;
     int dense; /* zero: sparse LU; one: dense reference backend */
     int no_scaling, no_refinement, no_exact, bland_ratio;
+    int no_primal_repair;
 } LabLpOptions;
 typedef struct {
     const char *status;
@@ -25,6 +26,9 @@ typedef struct {
     char *farkas_margin;
     size_t farkas_rows, exact_attempts, exact_infeasibilities;
     size_t rejected_pivots, harris_rescues;
+    size_t primal_repairs, primal_repair_iterations;
+    size_t exact_primal_attempts, exact_primal_recoveries;
+    int primal_repair_required;
 } LabLpResult;
 void lab_lp_solve(const LabModel *m, const LabLpOptions *options, LabLpResult *result);
 void lab_lp_result_free(LabLpResult *result);

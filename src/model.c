@@ -398,14 +398,16 @@ static int entry_order(const void *left, const void *right) {
         return a->row < b->row ? -1 : 1;
     return 0;
 }
-static LabExactModel *prepare_exact(Reader *p, const size_t *index) {
+static LabExactModel *prepare_exact(Reader *p, const size_t *index, size_t objective) {
     LabModel *m = p->output;
     if (!p->exact_enabled || m->rows > 128 || m->cols > 256 || p->ne > 20000)
         return NULL;
     LabExactModel *x = lab_exact_model_new(m->rows, m->cols, p->ne);
     mpq_t rhs, range;
     mpq_inits(rhs, range, NULL);
-    int bad = 0;
+    const InputRow *cost = &p->rows[objective];
+    int bad = lab_exact_decimal(x->offset, cost->rhs_text ? cost->rhs_text : "0");
+    mpq_neg(x->offset, x->offset);
     for (size_t i = 0; i < p->nr && !bad; i++) {
         if (index[i] == SIZE_MAX)
             continue;
@@ -510,7 +512,7 @@ static int finish(Reader *p) {
         m->col_upper[j] = p->cols[j].upper;
         m->integer[j] = (unsigned char)p->cols[j].integer;
     }
-    m->exact = prepare_exact(p, index);
+    m->exact = prepare_exact(p, index, objective);
     /* Sorting gives deterministic coalescing even if a writer interleaves
      * column records. Rows within every final CSC column are sorted. */
     if (p->ne)
@@ -521,7 +523,7 @@ static int finish(Reader *p) {
     for (size_t e = 0; e < p->ne;) {
         Entry a = p->entries[e++];
         mpq_set_ui(sum, 0, 1);
-        if (m->exact && index[a.row] != SIZE_MAX) {
+        if (m->exact && (index[a.row] != SIZE_MAX || a.row == objective)) {
             if (!a.text || lab_exact_decimal(sum, a.text))
                 discard_exact(m);
         }
@@ -530,7 +532,7 @@ static int finish(Reader *p) {
         while (e < p->ne && a.column == p->entries[e].column && a.row == p->entries[e].row) {
             Entry *next = &p->entries[e++];
             a.value += next->value;
-            if (m->exact && index[a.row] != SIZE_MAX) {
+            if (m->exact && (index[a.row] != SIZE_MAX || a.row == objective)) {
                 if (!next->text || lab_exact_decimal(term, next->text))
                     discard_exact(m);
                 else
@@ -547,8 +549,18 @@ static int finish(Reader *p) {
         if (m->exact && index[a.row] != SIZE_MAX &&
             ((a.value == 0) != (mpq_sgn(sum) == 0)))
             discard_exact(m);
-        if (a.row == objective)
+        if (a.row == objective) {
             m->objective[a.column] = a.value;
+            if (m->exact) {
+                mpq_set(m->exact->objective[a.column], sum);
+                if (lab_exact_nearest(sum, &m->objective[a.column]) ||
+                    (m->objective[a.column] == 0 && mpq_sgn(sum))) {
+                    mpq_clears(sum, term, NULL);
+                    free(index);
+                    return problem(p, "exact objective sum is outside nonzero finite double range");
+                }
+            }
+        }
         else if (index[a.row] != SIZE_MAX && a.value != 0) {
             if (m->exact)
                 mpq_set(m->exact->value[unique], sum);

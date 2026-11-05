@@ -9,10 +9,13 @@ It also applies reversible power-of-two changes of units and compensated
 iterative refinement, with the original feasibility policies unchanged.
 Small uncertain Phase I solves can reconstruct exact original-decimal
 infeasibility witnesses; guarded pivots can retry a stronger leaving choice.
+Small-model primal recovery reconstructs original decimal arithmetic and can
+restore infeasible bases using feasibility thresholds in original units.
 The independent checker validates original-model witnesses, rational LP bounds
 and exact infeasibility certificates.
 
-See [pivot safeguards and infeasibility witnesses](docs/MILESTONE-2E.md),
+See [original-unit primal recovery](docs/MILESTONE-2F.md),
+[pivot safeguards and infeasibility witnesses](docs/MILESTONE-2E.md),
 [numerical scaling and refinement](docs/MILESTONE-2D.md), and
 [the integer-search contract](docs/MILESTONE-2BC.md).
 The [pivot and proof comparison](results/numerical-stability-v1/report.html),

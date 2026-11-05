@@ -1,6 +1,8 @@
 #define _POSIX_C_SOURCE 200809L
 #include "model.h"
 #include "exact.h"
+#include <fenv.h>
+#include <float.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -158,12 +160,141 @@ static void bounded_storage_and_cleanup(void) {
     lab_model_free(&m);
     free(text);
 }
+static void original_source_evaluation(void) {
+    LabModel m = {0};
+    read_text(&m,
+        "NAME FIXEDDECIMAL\nROWS\n N O\n G R\nCOLUMNS\n x O 1 R 1\n"
+        " z O 0 R .1\nRHS\n b R 900719925474099.25\nBOUNDS\n"
+        " UP b x 1\n FX b z 9007199254740992\nENDATA\n", 1);
+    double point[] = {0, 0x1p53}, objective, violation;
+    require(!lab_exact_evaluate(&m, point, &objective, &violation) && objective == 0 &&
+                violation >= .05 && violation <= nextafter(.05, INFINITY),
+            "decimal fixed contribution exposes the hidden one-twentieth violation");
+    point[0] = .05;
+    require(!lab_exact_evaluate(&m, point, &objective, &violation) && objective == .05 &&
+                violation == 0,
+            "one-twentieth point satisfies original decimal row");
+    lab_model_free(&m);
+    read_text(&m,
+        "NAME COSTCANCEL\nOBJNAME O\nROWS\n N IGNORED\n N O\nCOLUMNS\n"
+        " x O .1\n x O .2\n z O .1\n x IGNORED 99999999\n"
+        "RHS\n b O 900719925474099.25\nBOUNDS\n LO b x .1\n UP b x 2\n"
+        " FX b z 9007199254740992\nENDATA\n", 1);
+    require(m.exact && mpq_cmp_ui(m.exact->objective[0], 3, 10) == 0,
+            "selected objective duplicate coefficients retain decimal sums");
+    point[0] = 2;
+    require(!lab_exact_evaluate(&m, point, &objective, &violation) && objective == .55 &&
+                violation == 0,
+            "large fixed objective and offset cancellation retains the decimal remainder");
+    point[0] = .1;
+    require(!lab_exact_evaluate(&m, point, &objective, &violation) && violation == 0,
+            "unchanged decimal lower side uses source provenance");
+    m.col_lower[0] = .2;
+    require(!lab_exact_evaluate(&m, point, &objective, &violation) && violation >= .1,
+            "tightened lower overlay uses exact binary bound");
+    m.col_lower[0] = .1;
+    m.col_upper[0] = .2;
+    point[0] = .3;
+    require(!lab_exact_evaluate(&m, point, &objective, &violation) && violation > .09 &&
+                violation < .11,
+            "tightened upper overlay uses exact binary bound");
+    point[0] = INFINITY;
+    require(lab_exact_evaluate(&m, point, &objective, &violation) && isnan(objective) &&
+                isinf(violation), "nonfinite source point fails explicitly");
+    lab_model_free(&m);
+}
+static void compensated_binary_evaluation(void) {
+    double lower[] = {0}, upper[] = {INFINITY};
+    double column_lower[] = {-INFINITY, -INFINITY}, column_upper[] = {INFINITY, INFINITY};
+    double cost[] = {1 + 0x1p-27, -1}, value[] = {1 + 0x1p-27, -1};
+    size_t start[] = {0, 1, 2}, row[] = {0, 0};
+    LabModel m = {.rows = 1, .cols = 2, .nnz = 2, .row_lower = lower, .row_upper = upper,
+                  .col_lower = column_lower, .col_upper = column_upper, .objective = cost,
+                  .col_start = start, .row_index = row, .value = value};
+    double point[] = {1 - 0x1p-27, 1}, objective, violation;
+    require(!lab_exact_evaluate(&m, point, &objective, &violation) && objective == -0x1p-54 &&
+                violation >= 0x1p-54 && violation <= nextafter(0x1p-54, INFINITY),
+            "FMA product errors retain cancellation in binary activity and cost");
+    cost[0] = 0;
+    cost[1] = 0;
+    value[0] = DBL_MIN;
+    value[1] = 0;
+    point[0] = DBL_MIN;
+    upper[0] = 0;
+    lower[0] = -INFINITY;
+    require(!lab_exact_evaluate(&m, point, &objective, &violation) && violation > 0 &&
+                violation <= 8 * DBL_TRUE_MIN,
+            "unrepresentable product tails get a conservative subnormal enclosure");
+    cost[0] = DBL_MAX;
+    point[0] = 2;
+    require(lab_exact_evaluate(&m, point, &objective, &violation) && isnan(objective) &&
+                isinf(violation), "binary product overflow fails explicitly");
+    cost[0] = 0;
+    value[0] = 0;
+    point[0] = -DBL_MAX;
+    column_lower[0] = DBL_MAX;
+    require(lab_exact_evaluate(&m, point, &objective, &violation),
+            "bound subtraction overflow cannot disappear through maximum");
+    column_lower[0] = -INFINITY;
+    point[0] = 0;
+    int original_rounding = fegetround();
+    require(fesetround(FE_DOWNWARD) == 0, "set test rounding mode");
+    int rejected = lab_exact_evaluate(&m, point, &objective, &violation);
+    require(fesetround(original_rounding) == 0, "restore rounding mode");
+    require(rejected, "unsupported compensated rounding mode rejected");
+    double many_cost[] = {1e100, 1e50, 1, -1e100, -1e50};
+    double many_point[] = {1, 1, 1, 1, 1};
+    double many_lower[] = {-INFINITY, -INFINITY, -INFINITY, -INFINITY, -INFINITY};
+    double many_upper[] = {INFINITY, INFINITY, INFINITY, INFINITY, INFINITY};
+    size_t no_entries[] = {0, 0, 0, 0, 0, 0};
+    LabModel many = {.cols = 5, .objective = many_cost, .col_lower = many_lower,
+                     .col_upper = many_upper, .col_start = no_entries};
+    require(!lab_exact_evaluate(&many, many_point, &objective, &violation) && objective == 1 &&
+                violation == 0,
+            "discarded cost tails are recovered after cancellation across three scales");
+}
+static void original_objective_coalescing(void) {
+    LabModel m = {0};
+    read_text(&m,
+        "NAME LOSTCOST\nROWS\n N O\nCOLUMNS\n x O 10000000000000000\n"
+        " x O -10000000000000001\nBOUNDS\n UP b x 1\nENDATA\n", 1);
+    require(m.exact && m.objective[0] == -1 &&
+                mpq_cmp_si(m.exact->objective[0], -1, 1) == 0,
+            "decision cost uses original decimal duplicate sum before binary rounding");
+    lab_model_free(&m);
+    read_text(&m,
+        "NAME NEAREST\nROWS\n N O\nCOLUMNS\n x O .1\n"
+        " x O .2\n x O -.2\nBOUNDS\n UP b x 1\nENDATA\n", 1);
+    require(m.exact && m.objective[0] == .1,
+            "source objective sum converts to nearest rather than truncating");
+    lab_model_free(&m);
+    read_text(&m,
+        "NAME EXACTZERO\nROWS\n N O\nCOLUMNS\n x O .1\n"
+        " x O .2\n x O -.3\nBOUNDS\n UP b x 1\nENDATA\n", 1);
+    require(m.exact && m.objective[0] == 0 && mpq_sgn(m.exact->objective[0]) == 0,
+            "exact zero objective is not a spurious cancellation residual");
+    lab_model_free(&m);
+    char text[2048];
+    const char *prefix = "NAME UNDERFLOW\nROWS\n N O\nCOLUMNS\n x O 1.";
+    size_t at = strlen(prefix);
+    memcpy(text, prefix, at);
+    memset(text + at, '0', 400);
+    at += 400;
+    snprintf(text + at, sizeof text - at, "1\n x O -1\nENDATA\n");
+    read_text(&m, text, 0);
+    require(strstr(m.error, "objective sum") != NULL,
+            "nonzero exact objective underflow fails explicitly");
+    lab_model_free(&m);
+}
 int main(void) {
     decimal_parser();
     source_arithmetic();
     topology_disagreement();
     defaults_and_nonconstraints();
     bounded_storage_and_cleanup();
+    original_source_evaluation();
+    compensated_binary_evaluation();
+    original_objective_coalescing();
     puts("Original-decimal provenance, exact arithmetic, topology and resource contracts passed.");
     return 0;
 }

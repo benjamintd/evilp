@@ -97,6 +97,7 @@ int main(int argc, char **argv) {
              "          [--time-limit SECONDS] [--iteration-limit N] [--max-dimension N]\n"
              "          [--backend sparse|dense]\n"
              "          [--no-scaling] [--no-refinement] [--no-exact] [--bland-ratio]\n"
+             "          [--no-primal-repair]\n"
              "          LP: [--dual NEW_FILE] [--farkas NEW_FILE] [--basis NEW_FILE] [--read-basis FILE]\n"
              "          MILP: [--node-limit N] [--cold] [--trace NEW_FILE]\n"
              "C17 LP and numerical branch-and-bound prototype. Select problem mode explicitly.\n"
@@ -124,6 +125,8 @@ int main(int argc, char **argv) {
             options.no_exact = 1;
         } else if (!strcmp(a, "--bland-ratio")) {
             options.bland_ratio = 1;
+        } else if (!strcmp(a, "--no-primal-repair")) {
+            options.no_primal_repair = 1;
         } else if (!strcmp(a, "--solution") || !strcmp(a, "--dual") || !strcmp(a, "--basis") ||
                    !strcmp(a, "--read-basis") || !strcmp(a, "--trace") || !strcmp(a, "--farkas")) {
             if (++i == argc)
@@ -241,7 +244,9 @@ int main(int argc, char **argv) {
                "\"scaled_rows\":%zu,\"scaled_columns\":%zu,\"initial_backward_error\":%.17g,"
                "\"max_backward_error\":%.17g,\"exact_enabled\":%s,\"exact_attempts\":%zu,"
                "\"exact_infeasibilities\":%zu,\"ratio_test\":\"%s\",\"exact_model_available\":%s,"
-               "\"rejected_pivots\":%zu,\"harris_rescues\":%zu}\n",
+               "\"rejected_pivots\":%zu,\"harris_rescues\":%zu,"
+               "\"primal_repair_enabled\":%s,\"primal_repairs\":%zu,\"primal_repair_iterations\":%zu,"
+               "\"exact_primal_attempts\":%zu,\"exact_primal_recoveries\":%zu}\n",
                model.rows, model.cols, model.nnz, r.nodes, r.lp_solves, r.lp_iterations,
                r.refactorizations, r.warm_starts, r.cold_starts, r.pruned_nodes, r.dual_iterations,
                r.cold_fallbacks, r.factor_nnz_peak, r.standard_nnz_peak, r.elapsed,
@@ -251,7 +256,9 @@ int main(int argc, char **argv) {
                r.scaled_columns, r.initial_backward_error, r.max_backward_error,
                options.no_exact ? "false" : "true", r.exact_attempts, r.exact_infeasibilities,
                options.bland_ratio ? "bland" : "guarded_bland_harris", model.exact ? "true" : "false",
-               r.rejected_pivots, r.harris_rescues);
+               r.rejected_pivots, r.harris_rescues, options.no_primal_repair ? "false" : "true",
+               r.primal_repairs, r.primal_repair_iterations, r.exact_primal_attempts,
+               r.exact_primal_recoveries);
         int code = status_code(r.status);
         lab_bb_result_free(&r);
         lab_model_free(&model);
@@ -293,7 +300,9 @@ int main(int argc, char **argv) {
         "\"exact_enabled\":%s,\"exact_attempts\":%zu,\"exact_infeasibilities\":%zu,"
         "\"has_farkas_candidate\":%s,\"certifies_infeasibility\":false,"
         "\"ratio_test\":\"%s\",\"exact_model_available\":%s,"
-        "\"rejected_pivots\":%zu,\"harris_rescues\":%zu}\n",
+        "\"rejected_pivots\":%zu,\"harris_rescues\":%zu,"
+        "\"primal_repair_enabled\":%s,\"primal_repairs\":%zu,\"primal_repair_iterations\":%zu,"
+        "\"exact_primal_attempts\":%zu,\"exact_primal_recoveries\":%zu}\n",
         model.rows, model.cols, model.nnz, r.standard_rows, r.standard_columns, r.redundant_rows,
         r.iterations, r.refactorizations, r.primal_residual, r.dual_residual, r.elapsed,
         lab_now() - started, options.dense ? "dense_lu_reference" : "sparse_lu",
@@ -303,7 +312,9 @@ int main(int argc, char **argv) {
         r.scaled_columns, r.initial_backward_error, r.max_backward_error,
         options.no_exact ? "false" : "true", r.exact_attempts, r.exact_infeasibilities,
         r.farkas ? "true" : "false", options.bland_ratio ? "bland" : "guarded_bland_harris",
-        model.exact ? "true" : "false", r.rejected_pivots, r.harris_rescues);
+        model.exact ? "true" : "false", r.rejected_pivots, r.harris_rescues,
+        options.no_primal_repair ? "false" : "true", r.primal_repairs, r.primal_repair_iterations,
+        r.exact_primal_attempts, r.exact_primal_recoveries);
     int code = status_code(r.status);
     lab_lp_result_free(&r);
     lab_model_free(&model);

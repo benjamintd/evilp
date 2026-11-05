@@ -9,4 +9,11 @@
 #define LAB_RATIONAL_MAX_DIMENSION 128
 #define LAB_RATIONAL_MAX_BITS 8192
 int lab_rational_solve(size_t n, mpq_t *a, mpq_t *rhs, double deadline);
+/* Read-only canonical-rational CSC input, distinct initialized output x.
+ * Singleton peeling precedes a dense remaining core of at most128. Duplicate
+ * row entries within a column are rejected. x is unchanged on failure. */
+#define LAB_RATIONAL_SPARSE_MAX_DIMENSION 1024
+#define LAB_RATIONAL_SPARSE_MAX_NONZEROS 100000
+int lab_rational_sparse_solve(size_t n, const size_t *start, const size_t *row,
+                              mpq_t *value, mpq_t *rhs, mpq_t *x, double deadline);
 #endif

@@ -178,6 +178,10 @@ static int call_lp(Search *s, const double *lower, const double *upper, LabLpRes
     s->result->exact_infeasibilities += lp->exact_infeasibilities;
     s->result->rejected_pivots += lp->rejected_pivots;
     s->result->harris_rescues += lp->harris_rescues;
+    s->result->primal_repairs += lp->primal_repairs;
+    s->result->primal_repair_iterations += lp->primal_repair_iterations;
+    s->result->exact_primal_attempts += lp->exact_primal_attempts;
+    s->result->exact_primal_recoveries += lp->exact_primal_recoveries;
     s->result->refinement_steps += lp->refinement_steps;
     if (lp->scaled_rows > s->result->scaled_rows)
         s->result->scaled_rows = lp->scaled_rows;
@@ -244,6 +248,13 @@ static int call_lp(Search *s, const double *lower, const double *upper, LabLpRes
 static int unresolved(Search *s, const LabLpResult *lp) {
     if (!strcmp(lp->status, "optimal") || !strcmp(lp->status, "infeasible"))
         return 0;
+    if (lp->primal)
+        for (size_t j = 0; j < s->model->cols; j++)
+            if (s->model->integer[j] && isfinite(lp->primal[j]) &&
+                fabs(lp->primal[j]) > 9007199254740991.0) {
+                outcome(s, "unsupported", "Integer values exceed the exactly spaced double range");
+                return -1;
+            }
     if (!strcmp(lp->status, "unbounded"))
         outcome(s, "lp_unbounded", "An LP relaxation is unbounded; MILP unboundedness is unproved");
     else if (!strcmp(lp->status, "time_limit"))
@@ -258,29 +269,17 @@ static int unresolved(Search *s, const LabLpResult *lp) {
 }
 static int valid_candidate(Search *s, const double *value, int require_integer, double *objective) {
     const LabModel *m = s->model;
-    long double result = m->offset;
-    long double *activity = lab_alloc(m->rows, sizeof(long double));
-    int valid = 1;
     for (size_t j = 0; j < m->cols; j++) {
         double x = value[j];
         if (!isfinite(x) || x < s->lower[j] - 1e-7 || x > s->upper[j] + 1e-7 ||
-            (require_integer && m->integer[j] && x != round(x))) {
-            valid = 0;
-            break;
-        }
-        result += (long double)m->objective[j] * x;
-        for (size_t k = m->col_start[j]; k < m->col_start[j + 1]; k++)
-            activity[m->row_index[k]] += (long double)m->value[k] * x;
+            (require_integer && m->integer[j] && x != round(x)))
+            return 0;
     }
-    for (size_t i = 0; i < m->rows && valid; i++)
-        if (!isfinite(activity[i]) || activity[i] < (long double)m->row_lower[i] - 1e-7L ||
-            activity[i] > (long double)m->row_upper[i] + 1e-7L)
-            valid = 0;
-    free(activity);
-    if (!isfinite((double)result))
-        valid = 0;
-    *objective = (double)result;
-    return valid;
+    LabModel view = *m;
+    view.col_lower = s->lower;
+    view.col_upper = s->upper;
+    double residual;
+    return !lab_exact_evaluate(&view, value, objective, &residual) && residual <= 1e-7;
 }
 /* Fix and resolve integer values. Simply rounding the LP vector can violate
  * rows that couple its continuous variables to the integers. */

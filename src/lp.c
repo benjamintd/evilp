@@ -25,6 +25,7 @@ typedef struct {
     size_t *source_row;
     double *row_scale;
     double *equation_scale;
+    unsigned char *row_upper;
     unsigned char *artificial;
     size_t *lower_row, *upper_row;
     unsigned char *transform;
@@ -115,6 +116,15 @@ static int budget(Work *w) {
     }
     return 0;
 }
+static double original_basic_tolerance(const Work *w, size_t position) {
+    size_t j = w->basis[position];
+    double tolerance = LAB_PRIMAL_TOLERANCE;
+    if (j < w->structural)
+        tolerance = fmin(tolerance, 1e-7 / fabs(w->sign[j]));
+    else if (!w->artificial[j] && w->a[j].count == 1)
+        tolerance = fmin(tolerance, 1e-7 * w->equation_scale[w->a[j].row[0]]);
+    return tolerance;
+}
 static int refactor(Work *w, int primal_required) {
     w->result->refactorizations++;
     int failed;
@@ -200,6 +210,224 @@ static void exact_column_bound(const LabModel *m, size_t j, int upper, mpq_t q) 
         mpq_set(q, upper ? m->exact->col_upper[j] : m->exact->col_lower[j]);
     else
         mpq_set_d(q, current);
+}
+static int exact_source(const LabModel *m) {
+    return m->exact || (!m->parsed_decimal && m->rows <= 128 && m->cols <= 256 &&
+                       m->nnz <= 20000);
+}
+static void exact_shift(const Work *w, size_t j, mpq_t q) {
+    const LabModel *m = w->model;
+    int upper = w->transform[j] == 'U';
+    if (w->transform[j] == 'F')
+        mpq_set_ui(q, 0, 1);
+    else if (m->exact && w->shift[j] == (upper ? m->exact->col_upper_source[j]
+                                              : m->exact->col_lower_source[j]))
+        mpq_set(q, upper ? m->exact->col_upper[j] : m->exact->col_lower[j]);
+    else
+        mpq_set_d(q, w->shift[j]);
+}
+static mpq_t *exact_shift_activity(const Work *w) {
+    const LabModel *m = w->model;
+    mpq_t *activity = lab_alloc(m->rows, sizeof(mpq_t));
+    for (size_t i = 0; i < m->rows; i++)
+        mpq_init(activity[i]);
+    mpq_t shift, value;
+    mpq_inits(shift, value, NULL);
+    for (size_t j = 0; j < m->cols; j++) {
+        exact_shift(w, j, shift);
+        for (size_t k = m->col_start[j]; k < m->col_start[j + 1]; k++) {
+            exact_coefficient(m, k, value);
+            mpq_mul(value, value, shift);
+            mpq_add(activity[m->row_index[k]], activity[m->row_index[k]], value);
+        }
+    }
+    mpq_clears(shift, value, NULL);
+    return activity;
+}
+static void exact_row_bound(const LabModel *m, size_t i, int upper, mpq_t q) {
+    if (m->exact)
+        mpq_set(q, upper ? m->exact->row_upper[i] : m->exact->row_lower[i]);
+    else
+        mpq_set_d(q, upper ? m->row_upper[i] : m->row_lower[i]);
+}
+static int exact_basis_value(const Work *w, size_t j, size_t entry, mpq_t value) {
+    const LabModel *m = w->model;
+    const Column *c = &w->a[j];
+    size_t i = c->row[entry];
+    if (j >= w->structural || w->source_row[i] == SIZE_MAX) {
+        mpq_set_d(value, c->value[entry]);
+        return 0;
+    }
+    size_t col = w->original[j], source = w->source_row[i];
+    size_t lo = m->col_start[col], hi = m->col_start[col + 1];
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if (m->row_index[mid] < source)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    if (lo == m->col_start[col + 1] || m->row_index[lo] != source)
+        return -1;
+    exact_coefficient(m, lo, value);
+    mpq_t multiplier;
+    mpq_init(multiplier);
+    mpq_set_d(multiplier, w->sign[j]);
+    mpq_mul(value, value, multiplier);
+    mpq_set_d(multiplier, w->row_scale[i]);
+    mpq_mul(value, value, multiplier);
+    mpq_clear(multiplier);
+    return 0;
+}
+static void exact_rhs(const Work *w, mpq_t *rhs) {
+    const LabModel *m = w->model;
+    mpq_t *activity = exact_shift_activity(w);
+    mpq_t side, scale, shift;
+    mpq_inits(side, scale, shift, NULL);
+    for (size_t i = 0; i < w->m; i++)
+        if (w->source_row[i] != SIZE_MAX) {
+            size_t source = w->source_row[i];
+            exact_row_bound(m, source, w->row_upper[i], side);
+            mpq_sub(rhs[i], side, activity[source]);
+            mpq_set_d(scale, w->row_scale[i]);
+            mpq_mul(rhs[i], rhs[i], scale);
+        }
+    for (size_t j = 0; j < m->cols; j++) {
+        exact_shift(w, j, shift);
+        for (size_t i = 0; i < w->m; i++) {
+            int upper = w->row_id[i] == w->upper_row[j];
+            if (!upper && w->row_id[i] != w->lower_row[j])
+                continue;
+            exact_column_bound(m, j, upper, side);
+            if (upper)
+                mpq_sub(rhs[i], side, shift);
+            else
+                mpq_sub(rhs[i], shift, side);
+            mpq_set_d(scale, w->equation_scale[i]);
+            mpq_mul(rhs[i], rhs[i], scale);
+        }
+    }
+    for (size_t i = 0; i < m->rows; i++)
+        mpq_clear(activity[i]);
+    free(activity);
+    mpq_clears(side, scale, shift, NULL);
+}
+/* Reconstruct the original point before converting it to doubles. Singleton
+ * elimination removes the many trivial bound/slack rows before the bounded
+ * dense exact core. A genuinely negative basic value requires a basis repair. */
+static int exact_primal(Work *w, double *point) {
+    const LabModel *m = w->model;
+    if (w->options->no_exact || !exact_source(m))
+        return 0;
+    w->result->exact_primal_attempts++;
+    size_t n = w->m, nnz = 0;
+    for (size_t t = 0; t < n; t++)
+        nnz += w->a[w->basis[t]].count;
+    if (n > 1024 || nnz > 100000)
+        return -1;
+    double deadline = fmin(w->started + w->options->time_limit, lab_now() + 1);
+    size_t *start = lab_alloc(n + 1, sizeof(size_t));
+    size_t *row = lab_alloc(nnz, sizeof(size_t));
+    mpq_t *value = lab_alloc(nnz, sizeof(mpq_t));
+    mpq_t *rhs = lab_alloc(n, sizeof(mpq_t)), *z = lab_alloc(n, sizeof(mpq_t));
+    mpq_t *x = lab_alloc(m->cols, sizeof(mpq_t));
+    mpq_t *activity = lab_alloc(m->rows, sizeof(mpq_t));
+    for (size_t k = 0; k < nnz; k++)
+        mpq_init(value[k]);
+    for (size_t i = 0; i < n; i++) {
+        mpq_init(rhs[i]);
+        mpq_init(z[i]);
+    }
+    for (size_t j = 0; j < m->cols; j++)
+        mpq_init(x[j]);
+    for (size_t i = 0; i < m->rows; i++)
+        mpq_init(activity[i]);
+    size_t at = 0;
+    int valid = 1;
+    for (size_t t = 0; t < n; t++) {
+        start[t] = at;
+        size_t j = w->basis[t];
+        for (size_t k = 0; k < w->a[j].count; k++) {
+            row[at] = w->a[j].row[k];
+            if (exact_basis_value(w, j, k, value[at]))
+                valid = 0;
+            at++;
+        }
+    }
+    start[n] = at;
+    exact_rhs(w, rhs);
+    if (valid && lab_rational_sparse_solve(n, start, row, value, rhs, z, deadline))
+        valid = 0;
+    for (size_t i = 0; i < n && valid; i++)
+        if (w->artificial[w->basis[i]] || mpq_sgn(z[i]) < 0)
+            valid = 0;
+    mpq_t term, bound;
+    mpq_inits(term, bound, NULL);
+    for (size_t j = 0; j < m->cols; j++)
+        exact_shift(w, j, x[j]);
+    for (size_t i = 0; i < n && valid; i++) {
+        size_t j = w->basis[i];
+        if (j < w->structural) {
+            mpq_set_d(term, w->sign[j]);
+            mpq_mul(term, term, z[i]);
+            mpq_add(x[w->original[j]], x[w->original[j]], term);
+        }
+    }
+    for (size_t j = 0; j < m->cols && valid; j++) {
+        if (isfinite(m->col_lower[j])) {
+            exact_column_bound(m, j, 0, bound);
+            if (mpq_cmp(x[j], bound) < 0)
+                valid = 0;
+        }
+        if (isfinite(m->col_upper[j])) {
+            exact_column_bound(m, j, 1, bound);
+            if (mpq_cmp(x[j], bound) > 0)
+                valid = 0;
+        }
+        for (size_t k = m->col_start[j]; k < m->col_start[j + 1]; k++) {
+            exact_coefficient(m, k, term);
+            mpq_mul(term, term, x[j]);
+            mpq_add(activity[m->row_index[k]], activity[m->row_index[k]], term);
+        }
+    }
+    for (size_t i = 0; i < m->rows && valid; i++) {
+        if (isfinite(m->row_lower[i])) {
+            exact_row_bound(m, i, 0, bound);
+            if (mpq_cmp(activity[i], bound) < 0)
+                valid = 0;
+        }
+        if (isfinite(m->row_upper[i])) {
+            exact_row_bound(m, i, 1, bound);
+            if (mpq_cmp(activity[i], bound) > 0)
+                valid = 0;
+        }
+    }
+    if (lab_now() >= deadline)
+        valid = 0;
+    double *candidate = lab_alloc(m->cols, sizeof(double));
+    for (size_t j = 0; j < m->cols && valid; j++) {
+        if (lab_exact_nearest(x[j], &candidate[j]) ||
+            (mpq_sgn(x[j]) && candidate[j] == 0))
+            valid = 0;
+    }
+    if (valid) {
+        memcpy(point, candidate, m->cols * sizeof(double));
+        w->result->exact_primal_recoveries++;
+    }
+    free(candidate);
+    for (size_t k = 0; k < nnz; k++)
+        mpq_clear(value[k]);
+    for (size_t i = 0; i < n; i++) {
+        mpq_clear(rhs[i]);
+        mpq_clear(z[i]);
+    }
+    for (size_t j = 0; j < m->cols; j++)
+        mpq_clear(x[j]);
+    for (size_t i = 0; i < m->rows; i++)
+        mpq_clear(activity[i]);
+    free(start); free(row); free(value); free(rhs); free(z); free(x); free(activity);
+    mpq_clears(term, bound, NULL);
+    return valid ? 1 : -1;
 }
 /* Reconstruct a small Phase I basis over original decimal coefficients, then
  * validate the resulting row combination against the original model and box.
@@ -455,6 +683,7 @@ static void remove_row(Work *w, size_t row, size_t basis_position) {
         w->source_row[i] = w->source_row[i + 1];
         w->row_scale[i] = w->row_scale[i + 1];
         w->equation_scale[i] = w->equation_scale[i + 1];
+        w->row_upper[i] = w->row_upper[i + 1];
     }
     for (size_t i = basis_position; i + 1 < w->m; i++)
         w->basis[i] = w->basis[i + 1];
@@ -685,6 +914,7 @@ static int build(Work *w, const LabModel *m) {
     w->source_row = lab_alloc(cap, sizeof(size_t));
     w->row_scale = lab_alloc(cap, sizeof(double));
     w->equation_scale = lab_alloc(cap, sizeof(double));
+    w->row_upper = lab_alloc(cap, 1);
     for (size_t i = 0; i < nr; i++)
         w->equation_scale[i] = 1;
     w->row_id = lab_alloc(cap, sizeof(size_t));
@@ -727,6 +957,9 @@ static int build(Work *w, const LabModel *m) {
         for (size_t k = m->col_start[j]; k < m->col_start[j + 1]; k++)
             shifted[m->row_index[k]] += (long double)m->value[k] * w->shift[j];
     }
+    mpq_t *precise_shift = exact_source(m) ? exact_shift_activity(w) : NULL;
+    mpq_t precise_rhs, precise_bound;
+    mpq_inits(precise_rhs, precise_bound, NULL);
     size_t r = 0;
     for (size_t i = 0; i < m->rows; i++) {
         lower[i] = upper[i] = SIZE_MAX;
@@ -740,9 +973,17 @@ static int build(Work *w, const LabModel *m) {
             else
                 lower[i] = r;
             long double rhs = bound - shifted[i];
+            if (precise_shift) {
+                exact_row_bound(m, i, side, precise_rhs);
+                mpq_sub(precise_rhs, precise_rhs, precise_shift[i]);
+                rhs = mpq_get_d(precise_rhs);
+            }
             double flip = rhs < 0 ? -1 : 1;
+            if (precise_shift && mpq_sgn(precise_rhs) < 0)
+                flip = -1;
             w->b[r] = (double)(flip * rhs);
             w->source_row[r] = i;
+            w->row_upper[r] = (unsigned char)side;
             w->row_scale[r] = flip;
             w->row_id[r] = r;
             double slack = equality ? 0 : flip * (side ? 1 : -1);
@@ -776,6 +1017,12 @@ static int build(Work *w, const LabModel *m) {
         if (isfinite(m->col_lower[j])) {
             w->lower_row[j] = r;
             w->b[r] = 0;
+            if (precise_shift) {
+                exact_shift(w, j, precise_rhs);
+                exact_column_bound(m, j, 0, precise_bound);
+                mpq_sub(precise_rhs, precise_rhs, precise_bound);
+                w->b[r] = mpq_get_d(precise_rhs);
+            }
             put(w, r, first[j], -1);
             put(w, r, nz + r, 1);
             put(w, r, nz + nr + r, 1);
@@ -789,6 +1036,12 @@ static int build(Work *w, const LabModel *m) {
         if (isfinite(m->col_upper[j])) {
             w->upper_row[j] = r;
             w->b[r] = w->transform[j] == 'U' ? 0 : m->col_upper[j] - w->shift[j];
+            if (precise_shift) {
+                exact_column_bound(m, j, 1, precise_rhs);
+                exact_shift(w, j, precise_bound);
+                mpq_sub(precise_rhs, precise_rhs, precise_bound);
+                w->b[r] = mpq_get_d(precise_rhs);
+            }
             put(w, r, first[j], w->transform[j] == 'U' ? -1 : 1);
             put(w, r, nz + r, 1);
             put(w, r, nz + nr + r, 1);
@@ -805,6 +1058,12 @@ static int build(Work *w, const LabModel *m) {
     free(lower);
     free(upper);
     free(shifted);
+    if (precise_shift) {
+        for (size_t i = 0; i < m->rows; i++)
+            mpq_clear(precise_shift[i]);
+        free(precise_shift);
+    }
+    mpq_clears(precise_rhs, precise_bound, NULL);
     for (size_t i = 0; i < nr; i++) {
         if (!isfinite(w->b[i])) {
             message(w, "numerical_failure", "Bound transformation overflow");
@@ -905,8 +1164,92 @@ static int save_basis(Work *w) {
     }
     return 0;
 }
+/* Evaluate the existing support-gap safeguard in source arithmetic. This is
+ * an optimizer rejection test, separate from the independent bound checker. */
+static int exact_support_gap_bad(const Work *w, const double *primal, const double *dual,
+                                 int *available) {
+    const LabModel *m = w->model;
+    mpq_t *activity = lab_alloc(m->rows, sizeof(mpq_t));
+    for (size_t i = 0; i < m->rows; i++)
+        mpq_init(activity[i]);
+    mpq_t x, y, value, reduced, side, gap, variation, shift, threshold;
+    mpq_inits(x, y, value, reduced, side, gap, variation, shift, threshold, NULL);
+    for (size_t j = 0; j < m->cols; j++) {
+        mpq_set_d(x, primal[j]);
+        for (size_t k = m->col_start[j]; k < m->col_start[j + 1]; k++) {
+            exact_coefficient(m, k, value);
+            mpq_mul(value, value, x);
+            mpq_add(activity[m->row_index[k]], activity[m->row_index[k]], value);
+        }
+        if (w->transform[j] != 'X') {
+            exact_shift(w, j, shift);
+            mpq_sub(value, x, shift);
+            if (m->exact)
+                mpq_set(reduced, m->exact->objective[j]);
+            else
+                mpq_set_d(reduced, m->objective[j]);
+            mpq_mul(value, value, reduced);
+            mpq_abs(value, value);
+            mpq_add(variation, variation, value);
+        }
+    }
+    *available = 1;
+    for (size_t i = 0; i < m->rows && *available; i++) {
+        int sign = (dual[i] > 0) - (dual[i] < 0);
+        if (!sign)
+            continue;
+        if (!isfinite(sign > 0 ? m->row_lower[i] : m->row_upper[i])) {
+            *available = 0;
+            break;
+        }
+        exact_row_bound(m, i, sign < 0, side);
+        mpq_sub(value, activity[i], side);
+        mpq_set_d(y, dual[i]);
+        mpq_mul(value, value, y);
+        mpq_abs(value, value);
+        mpq_add(gap, gap, value);
+    }
+    for (size_t j = 0; j < m->cols && *available; j++) {
+        if (m->exact)
+            mpq_set(reduced, m->exact->objective[j]);
+        else
+            mpq_set_d(reduced, m->objective[j]);
+        if (m->maximize)
+            mpq_neg(reduced, reduced);
+        for (size_t k = m->col_start[j]; k < m->col_start[j + 1]; k++) {
+            exact_coefficient(m, k, value);
+            mpq_set_d(y, dual[m->row_index[k]]);
+            mpq_mul(value, value, y);
+            mpq_sub(reduced, reduced, value);
+        }
+        int sign = mpq_sgn(reduced);
+        if (!sign)
+            continue;
+        if (!isfinite(sign > 0 ? m->col_lower[j] : m->col_upper[j])) {
+            *available = 0;
+            break;
+        }
+        exact_column_bound(m, j, sign < 0, side);
+        mpq_set_d(x, primal[j]);
+        mpq_sub(value, x, side);
+        mpq_mul(value, value, reduced);
+        mpq_abs(value, value);
+        mpq_add(gap, gap, value);
+    }
+    mpq_set_ui(threshold, 1, 1);
+    mpq_add(threshold, threshold, variation);
+    mpq_set_ui(value, 1, 10000000);
+    mpq_mul(threshold, threshold, value);
+    int bad = *available && mpq_cmp(gap, threshold) > 0;
+    for (size_t i = 0; i < m->rows; i++)
+        mpq_clear(activity[i]);
+    free(activity);
+    mpq_clears(x, y, value, reduced, side, gap, variation, shift, threshold, NULL);
+    return bad;
+}
 static int recover(Work *w, const LabModel *m) {
     LabLpResult *r = w->result;
+    r->primal_repair_required = 0;
     r->primal = lab_alloc(m->cols, sizeof(double));
     r->dual = lab_alloc(m->rows, sizeof(double));
     memcpy(r->primal, w->shift, m->cols * sizeof(double));
@@ -917,7 +1260,15 @@ static int recover(Work *w, const LabModel *m) {
         if (w->source_row[i] != SIZE_MAX)
             r->dual[w->source_row[i]] += w->row_scale[i] * w->pi[i];
     }
-    long double objective = m->offset, variation = 0;
+    if (exact_primal(w, r->primal) < 0) {
+        r->primal_repair_required = 1;
+        if (lab_exact_evaluate(m, r->primal, &r->objective, &r->primal_residual))
+            r->primal_residual = DBL_MAX;
+        if (!budget(w))
+            message(w, "numerical_failure", "Exact primal reconstruction unavailable or infeasible");
+        return -1;
+    }
+    long double variation = 0;
     double residual = 0;
     long double *activity = lab_alloc(m->rows, sizeof(long double));
     for (size_t j = 0; j < m->cols; j++) {
@@ -927,7 +1278,6 @@ static int recover(Work *w, const LabModel *m) {
             message(w, "numerical_failure", "Primal reconstruction overflow");
             return -1;
         }
-        objective += (long double)m->objective[j] * x;
         variation += fabsl((long double)m->objective[j] * (x - w->shift[j]));
         residual = fmax(residual, m->col_lower[j] - x);
         residual = fmax(residual, x - m->col_upper[j]);
@@ -943,7 +1293,15 @@ static int recover(Work *w, const LabModel *m) {
         residual = fmax(residual, (double)(m->row_lower[i] - activity[i]));
         residual = fmax(residual, (double)(activity[i] - m->row_upper[i]));
     }
-    r->objective = (double)objective;
+    double evaluated_objective, evaluated_residual;
+    if (lab_exact_evaluate(m, r->primal, &evaluated_objective, &evaluated_residual)) {
+        free(activity);
+        r->primal_residual = DBL_MAX;
+        message(w, "numerical_failure", "Original-model evaluation overflow or uncertainty");
+        return -1;
+    }
+    r->objective = evaluated_objective;
+    residual = evaluated_residual;
     r->primal_residual = residual;
     if (!isfinite(r->objective) || !isfinite(residual) || residual > 1e-7) {
         free(activity);
@@ -983,7 +1341,10 @@ static int recover(Work *w, const LabModel *m) {
     free(activity);
     /* Complementarity differences avoid subtracting large nearly equal totals.
      * Fixed-variable contributions and objective offsets cannot hide a gap. */
-    if (available && (!isfinite(gap) || !isfinite(variation) || gap > 1e-7L * (1 + variation))) {
+    int gap_bad = exact_source(m) ? exact_support_gap_bad(w, r->primal, r->dual, &available)
+                                 : available && (!isfinite(gap) || !isfinite(variation) ||
+                                                 gap > 1e-7L * (1 + variation));
+    if (gap_bad) {
         message(w, "numerical_failure", "Primal/support-bound gap exceeds stopping tolerance");
         return -1;
     }
@@ -1018,6 +1379,7 @@ static void work_free(Work *w) {
     free(w->source_row);
     free(w->row_scale);
     free(w->equation_scale);
+    free(w->row_upper);
     free(w->artificial);
     free(w->lower_row);
     free(w->upper_row);
@@ -1028,6 +1390,24 @@ static void work_free(Work *w) {
     free(w->direction);
     free(w->column);
     memset(w, 0, sizeof *w);
+}
+static int dual_simplex(Work *w, int original_units);
+static int restore_primal(Work *w, const LabModel *m) {
+    if (recover(w, m) == 0)
+        return 0;
+    if (w->options->no_primal_repair ||
+        (!w->result->primal_repair_required && !(w->result->primal_residual > 1e-7)))
+        return -1;
+    free(w->result->primal);
+    free(w->result->dual);
+    w->result->primal = w->result->dual = NULL;
+    w->result->primal_repairs++;
+    size_t before = w->result->dual_iterations;
+    int status = dual_simplex(w, 1);
+    w->result->primal_repair_iterations += w->result->dual_iterations - before;
+    if (status)
+        return -1;
+    return recover(w, m);
 }
 static int cold_solve(Work *w, const LabModel *m) {
     w->model = m;
@@ -1046,7 +1426,7 @@ static int cold_solve(Work *w, const LabModel *m) {
     if (remove_artificials(w) || load_basis(w) < 0)
         return -1;
     int status = simplex(w, 0);
-    if (status < 0 || recover(w, m))
+    if (status < 0 || restore_primal(w, m))
         return -1;
     if (status)
         message(w, "unbounded", "Improving LP ray found (numerical claim)");
@@ -1059,7 +1439,7 @@ static int cold_solve(Work *w, const LabModel *m) {
 }
 /* Dual revised simplex repairs primal infeasibility caused by RHS changes while
  * preserving a dual-feasible basis. No new matrix or Phase I is needed. */
-static int dual_simplex(Work *w) {
+static int dual_simplex(Work *w, int original_units) {
     double *reduced = lab_alloc(w->n, sizeof(double));
     int outcome = -1;
     for (;;) {
@@ -1097,7 +1477,8 @@ static int dual_simplex(Work *w) {
         }
         size_t leaving = SIZE_MAX;
         for (size_t i = 0; i < w->m; i++)
-            if (w->xb[i] < -1e-8 && (leaving == SIZE_MAX || w->basis[i] < w->basis[leaving]))
+            if (w->xb[i] < -(original_units ? original_basic_tolerance(w, i) : 1e-8) &&
+                (leaving == SIZE_MAX || w->basis[i] < w->basis[leaving]))
                 leaving = i;
         if (leaving == SIZE_MAX) {
             for (size_t i = 0; i < w->m; i++)
@@ -1291,7 +1672,7 @@ void lab_lp_session_solve(LabLpSession *s, LabLpResult *result) {
         result->standard_rows = w->total_rows;
         result->standard_columns = w->n;
         result->redundant_rows = w->total_rows - w->m;
-        int status = dual_simplex(w);
+        int status = dual_simplex(w, 0);
         if (status == 1) {
             s->ready = 0;
             goto done;

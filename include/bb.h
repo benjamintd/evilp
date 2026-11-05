@@ -25,6 +25,8 @@ typedef struct {
     double initial_backward_error, max_backward_error;
     size_t exact_attempts, exact_infeasibilities;
     size_t rejected_pivots, harris_rescues;
+    size_t primal_repairs, primal_repair_iterations;
+    size_t exact_primal_attempts, exact_primal_recoveries;
 } LabBbResult;
 
 void lab_bb_solve(const LabModel *model, const LabBbOptions *options, LabBbResult *result);
