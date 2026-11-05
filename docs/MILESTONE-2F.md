@@ -89,3 +89,59 @@ JSON objectives remain binary64 values. Beside large fixed objective constants,
 the regressions compare the exact cost of the exported point and check that
 point without its rounded objective claim. They do not assert exact objective
 serialization at magnitudes where binary64 cannot represent the small change.
+
+## Recorded results
+
+The evaluated engine is frozen at `6d5298c`. The selected campaign's source
+snapshots are clean and identical before and after all fourteen runs; binary
+hashes, commands, raw witnesses and checker records are retained. All campaigns
+completed successfully as validation procedures. This does not mean all of
+their MILP instances were solved.
+
+- [Release and sanitizer contracts](../results/milestone-2f-contracts-v1/summary.json):
+  all eighteen suites pass in both builds, with zero failed or skipped tests.
+- [Paired primal regressions](../results/primal-regressions-v1/summary.json):
+  the previous frozen engine has 39 failed assertion subcases; the new contract
+  has none. Of its 58 Python runs, eighteen require successful optimal outcomes
+  and forty permit explicit numerical failure. All 176 C session outcomes pass.
+- [Selected comparison](../results/primal-recovery-v1/report.html): all fourteen
+  runs are retained and all predeclared assertions pass, including the old false optimum and its checker
+  rejection as evidence. These are development cases, not a holdout.
+- [Native MILP crosscheck](../results/mip-native-v5/summary.json): all forty
+  expected outcomes match across eight models; all 35 feasible candidates pass
+  independent checking.
+
+On the full `mas74` model, the default engine reaches the 1,000-node limit and
+retains a checked incumbent of 19563.4046944. The previous engine and the new
+`--no-primal-repair` control stop numerically at node 345. Default search uses
+two restoration calls and four dual repair pivots. The isolated node LP needs
+two pivots, passes the original-model checker, and agrees with HiGHS within
+`1e-7`. Its [separate dual check](../results/primal-recovery-v1/isolated_node/default/dual-checker.json)
+has a valid rational LP lower bound, but does not certify exact optimality.
+This isolated LP evidence does not prove the original integer model or tree.
+
+Default `gen-ip054` also reaches 1,000 nodes with a checked incumbent,
+8852.207808267. Its 217 recorded LP infeasibility certificates replay correctly.
+The old, default and no-repair profiles together retain 651 valid individual
+LP certificates, with matching exact contradiction margins; these are not
+complete tree proofs. Disabling exact reconstruction still stops at node 35.
+Neither full MILP reaches its pinned reference optimum in this campaign.
+
+The serial comparison requests one thread and gives each MILP fifteen seconds
+and 1,000 nodes. In this run, `mas74` default solver time is 9.640494 seconds,
+versus 7.030875 with exact reconstruction disabled. The old engine takes
+3.367941 seconds before failing at 345 nodes, so it performs different work.
+Default `gen-ip054` takes 3.213296 seconds versus the old engine's 2.511301 for
+the same node limit. Per-LP GMP reconstruction has a measurable cost; these
+single development runs do not establish a performance ranking.
+
+The [two-second MIPLIB smoke](../results/miplib-smoke-2s-v4/runs/summary.html)
+retains four checked incumbents: `gen-ip054`, `mas76`, `neos5` and `pk1`.
+Six cases exceed the configured size cap and six hit the time limit, with no
+invalid candidates, checker errors or reached reference optima. `mas74` has
+no incumbent at this budget. The short `gen-ip054` incumbent is 15019.62685667,
+worse than the longer controlled run, so there is no uniform short-budget gain.
+
+The [autoresearch gate](AUTORESEARCH.md) remains closed. Time, node and iteration
+limits, unsupported cases and numerical failures are unresolved problem
+outcomes, even when the harness correctly records them and its assertions pass.

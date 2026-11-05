@@ -13,5 +13,8 @@
 - Preserve minimized regressions and record unsupported formats explicitly.
   Do not weaken tolerances or skip failing cases to make a benchmark look better.
 - Do not specialize algorithms using benchmark filenames, hashes or stored answers.
+- Paper-driven autoresearch starts only after the full existing benchmark gate
+  in docs/AUTORESEARCH.md passes. Unsupported cases, time/node/iteration limits,
+  numerical failures and unchecked or invalid witnesses are not benchmark passes.
 - Keep fetched datasets, binaries and build trees outside the tracked source set.
   Imported artifacts retain their own licenses; do not relabel them as MIT.
