@@ -5,9 +5,12 @@ Milestone 1 implements the dataset import, independent primal checker,
 native benchmark runner and HiGHS / SCIP / Cbc baseline adapters.
 The current prototype adds sparse LP storage and LU factorization, saved-basis
 dual reoptimization, and a minimal deterministic branch-and-bound MILP solver.
+It also applies reversible power-of-two changes of units and compensated
+iterative refinement, with the original feasibility policies unchanged.
 The independent checker validates original-model witnesses and rational LP bounds.
 
-See [the current solver contract](docs/MILESTONE-2BC.md).
+See [numerical scaling and refinement](docs/MILESTONE-2D.md) and
+[the integer-search contract](docs/MILESTONE-2BC.md).
 The [40-case MILP report](results/mip-native-v2/report.html) and
 [MIPLIB smoke report](results/miplib-smoke-2s-v1/runs/summary.html) preserve
 successful witnesses, numerical failures and capacity limits.
@@ -83,6 +86,8 @@ required so fractional LP solutions cannot silently be presented as MILP results
 Sparse LU is the default. The expanded standard-form dimension limit is 4096
 by default (up to 32768 for sparse mode); `--backend dense` selects the reference
 backend, whose dimension ceiling is 4096.
+Scaling and refinement are enabled by default. `--no-scaling` and
+`--no-refinement` select controlled ablations; the residual guard still applies.
 
 ~~~sh
 build/milpsolve tests/fixtures/tiny.mps --relax --read-basis work/tiny-lp.basis
@@ -152,6 +157,7 @@ and 3. Inspect all validation failures before accepting performance changes.
 - src/common.c: allocation, JSON escaping, monotonic timing and SHA-256.
 - src/model.c: independent optimizer MPS reader and sparse CSC model.
 - src/lp.c, src/factor.c, src/solve.c: LP engine, LU backend and command line.
+- src/linear.c: equilibrated basis solves, compensated residuals and refinement.
 - src/bb.c: branch-and-bound, integer repair, limits and deterministic traces.
 - config/: dataset locks, native assets, solver identities and smoke suite.
 - tests/: exact arithmetic oracle, adversarial cases and runner contracts.

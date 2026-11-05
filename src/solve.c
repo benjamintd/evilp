@@ -82,6 +82,7 @@ int main(int argc, char **argv) {
         puts("milpsolve MODEL (--relax | --mip) [--solution NEW_FILE]\n"
              "          [--time-limit SECONDS] [--iteration-limit N] [--max-dimension N]\n"
              "          [--backend sparse|dense]\n"
+             "          [--no-scaling] [--no-refinement]\n"
              "          LP: [--dual NEW_FILE] [--basis NEW_FILE] [--read-basis FILE]\n"
              "          MILP: [--node-limit N] [--cold] [--trace NEW_FILE]\n"
              "C17 LP and numerical branch-and-bound prototype. Select problem mode explicitly.\n"
@@ -101,6 +102,10 @@ int main(int argc, char **argv) {
             mip = 1;
         } else if (!strcmp(a, "--cold")) {
             cold = 1;
+        } else if (!strcmp(a, "--no-scaling")) {
+            options.no_scaling = 1;
+        } else if (!strcmp(a, "--no-refinement")) {
+            options.no_refinement = 1;
         } else if (!strcmp(a, "--solution") || !strcmp(a, "--dual") || !strcmp(a, "--basis") ||
                    !strcmp(a, "--read-basis") || !strcmp(a, "--trace")) {
             if (++i == argc)
@@ -211,12 +216,17 @@ int main(int argc, char **argv) {
                "\"warm_starts\":%zu,\"cold_starts\":%zu,\"pruned_nodes\":%zu,"
                "\"dual_iterations\":%zu,\"cold_fallbacks\":%zu,\"factor_nnz_peak\":%zu,"
                "\"standard_nnz_peak\":%zu,"
-               "\"solve_wall_s\":%.9g,\"total_wall_s\":%.9g,\"backend\":\"%s\",\"cold\":%s}\n",
+               "\"solve_wall_s\":%.9g,\"total_wall_s\":%.9g,\"backend\":\"%s\",\"cold\":%s,"
+               "\"scaling_enabled\":%s,\"refinement_enabled\":%s,\"refinement_steps\":%zu,"
+               "\"scaled_rows\":%zu,\"scaled_columns\":%zu,\"initial_backward_error\":%.17g,"
+               "\"max_backward_error\":%.17g}\n",
                model.rows, model.cols, model.nnz, r.nodes, r.lp_solves, r.lp_iterations,
                r.refactorizations, r.warm_starts, r.cold_starts, r.pruned_nodes, r.dual_iterations,
                r.cold_fallbacks, r.factor_nnz_peak, r.standard_nnz_peak, r.elapsed,
                lab_now() - started, options.dense ? "dense_lu_reference" : "sparse_lu",
-               cold ? "true" : "false");
+               cold ? "true" : "false", options.no_scaling ? "false" : "true",
+               options.no_refinement ? "false" : "true", r.refinement_steps, r.scaled_rows,
+               r.scaled_columns, r.initial_backward_error, r.max_backward_error);
         int code = status_code(r.status);
         lab_bb_result_free(&r);
         lab_model_free(&model);
@@ -242,17 +252,22 @@ int main(int argc, char **argv) {
         printf("%.17g", r.objective);
     else
         printf("null");
-    printf(",\"rows\":%zu,\"columns\":%zu,\"nonzeros\":%zu,\"standard_rows\":%zu,"
-           "\"standard_columns\":%zu,\"redundant_rows\":%zu,\"iterations\":%zu,"
-           "\"refactorizations\":%zu,\"primal_residual\":%.17g,\"dual_residual\":%.17g,"
-           "\"solve_wall_s\":%.9g,\"total_wall_s\":%.9g,\"backend\":\"%s\","
-           "\"warm_start\":%s,\"dual_iterations\":%zu,\"cold_fallbacks\":%zu,"
-           "\"factor_nnz_peak\":%zu,\"standard_nnz\":%zu}\n",
-           model.rows, model.cols, model.nnz, r.standard_rows, r.standard_columns, r.redundant_rows,
-           r.iterations, r.refactorizations, r.primal_residual, r.dual_residual, r.elapsed,
-           lab_now() - started, options.dense ? "dense_lu_reference" : "sparse_lu",
-           r.warm_start ? "true" : "false", r.dual_iterations, r.cold_fallbacks, r.factor_nnz_peak,
-           r.standard_nnz);
+    printf(
+        ",\"rows\":%zu,\"columns\":%zu,\"nonzeros\":%zu,\"standard_rows\":%zu,"
+        "\"standard_columns\":%zu,\"redundant_rows\":%zu,\"iterations\":%zu,"
+        "\"refactorizations\":%zu,\"primal_residual\":%.17g,\"dual_residual\":%.17g,"
+        "\"solve_wall_s\":%.9g,\"total_wall_s\":%.9g,\"backend\":\"%s\","
+        "\"warm_start\":%s,\"dual_iterations\":%zu,\"cold_fallbacks\":%zu,"
+        "\"factor_nnz_peak\":%zu,\"standard_nnz\":%zu,\"scaling_enabled\":%s,"
+        "\"refinement_enabled\":%s,\"refinement_steps\":%zu,\"scaled_rows\":%zu,"
+        "\"scaled_columns\":%zu,\"initial_backward_error\":%.17g,\"max_backward_error\":%.17g}\n",
+        model.rows, model.cols, model.nnz, r.standard_rows, r.standard_columns, r.redundant_rows,
+        r.iterations, r.refactorizations, r.primal_residual, r.dual_residual, r.elapsed,
+        lab_now() - started, options.dense ? "dense_lu_reference" : "sparse_lu",
+        r.warm_start ? "true" : "false", r.dual_iterations, r.cold_fallbacks, r.factor_nnz_peak,
+        r.standard_nnz, options.no_scaling ? "false" : "true",
+        options.no_refinement ? "false" : "true", r.refinement_steps, r.scaled_rows,
+        r.scaled_columns, r.initial_backward_error, r.max_backward_error);
     int code = status_code(r.status);
     lab_lp_result_free(&r);
     lab_model_free(&model);

@@ -1,6 +1,6 @@
 #include "lp.h"
 #include "common.h"
-#include "factor.h"
+#include "linear.h"
 #include <float.h>
 #include <math.h>
 #include <stdint.h>
@@ -21,11 +21,13 @@ typedef struct {
     size_t *basis, *original, *row_id, *art_row;
     size_t *source_row;
     double *row_scale;
+    double *equation_scale;
     unsigned char *artificial;
     size_t *lower_row, *upper_row;
     unsigned char *transform;
-    LabFactor factor;
-    double *matrix, *xb, *pi, *cb, *direction, *column;
+    LabLinear linear;
+    double *xb, *pi, *cb, *direction, *column;
+    size_t scaled_rows, scaled_columns;
     const LabLpOptions *options;
     LabLpResult *result;
     double started;
@@ -70,8 +72,20 @@ static long double column_norm(const Work *w, size_t j) {
         norm = fmaxl(norm, fabs(w->a[j].value[k]));
     return norm;
 }
+static int linear_solve(Work *w, const double *rhs, double *x, int transpose) {
+    size_t before = w->linear.refinement_steps;
+    int failed = lab_linear_solve(&w->linear, rhs, x, transpose);
+    w->result->refinement_steps += w->linear.refinement_steps - before;
+    if (isfinite(w->linear.initial_backward_error))
+        w->result->initial_backward_error =
+            fmax(w->result->initial_backward_error, w->linear.initial_backward_error);
+    if (isfinite(w->linear.max_backward_error))
+        w->result->max_backward_error =
+            fmax(w->result->max_backward_error, w->linear.max_backward_error);
+    return failed;
+}
 static int transpose_solve(Work *w, const double *rhs, double *x) {
-    if (lab_factor_solve(&w->factor, rhs, x, 1))
+    if (linear_solve(w, rhs, x, 1))
         return -1;
     for (size_t j = 0; j < w->m; j++) {
         long double magnitude = fabs(rhs[j]);
@@ -100,15 +114,7 @@ static int budget(Work *w) {
 static int refactor(Work *w, int primal_required) {
     w->result->refactorizations++;
     int failed;
-    if (w->options->dense) {
-        memset(w->matrix, 0, w->m * w->m * sizeof(double));
-        for (size_t j = 0; j < w->m; j++) {
-            const Column *c = &w->a[w->basis[j]];
-            for (size_t k = 0; k < c->count; k++)
-                w->matrix[c->row[k] * w->m + j] += c->value[k];
-        }
-        failed = lab_factorize(&w->factor, w->matrix, w->m);
-    } else {
+    {
         size_t nnz = 0;
         for (size_t j = 0; j < w->m; j++)
             nnz += w->a[w->basis[j]].count;
@@ -125,14 +131,17 @@ static int refactor(Work *w, int primal_required) {
             }
         }
         start[w->m] = at;
-        failed = lab_factorize_sparse(&w->factor, w->m, start, row, value);
+        failed = lab_linear_factorize_ex(&w->linear, w->m, start, row, value, w->options->dense,
+                                         !w->options->no_scaling, !w->options->no_refinement);
         free(start);
         free(row);
         free(value);
     }
-    if (w->factor.peak_nnz > w->result->factor_nnz_peak)
-        w->result->factor_nnz_peak = w->factor.peak_nnz;
-    if (failed || lab_factor_solve(&w->factor, w->b, w->xb, 0)) {
+    if (w->linear.factor.peak_nnz > w->result->factor_nnz_peak)
+        w->result->factor_nnz_peak = w->linear.factor.peak_nnz;
+    if (!failed)
+        failed = linear_solve(w, w->b, w->xb, 0);
+    if (failed) {
         message(w, "numerical_failure", "Singular or ill-conditioned basis");
         return -1;
     }
@@ -230,7 +239,7 @@ static int simplex(Work *w, int phase_one) {
             return 0;
         }
         scatter(w, entering, w->column);
-        if (lab_factor_solve(&w->factor, w->column, w->direction, 0)) {
+        if (linear_solve(w, w->column, w->direction, 0)) {
             message(w, "numerical_failure", "Pivot direction solve failed");
             return -1;
         }
@@ -283,6 +292,7 @@ static void remove_row(Work *w, size_t row, size_t basis_position) {
         w->row_id[i] = w->row_id[i + 1];
         w->source_row[i] = w->source_row[i + 1];
         w->row_scale[i] = w->row_scale[i + 1];
+        w->equation_scale[i] = w->equation_scale[i + 1];
     }
     for (size_t i = basis_position; i + 1 < w->m; i++)
         w->basis[i] = w->basis[i + 1];
@@ -349,6 +359,126 @@ static int remove_artificials(Work *w) {
     }
     return 0;
 }
+/* All chosen changes of units are exact powers of two. Exponents are clipped
+ * toward zero to retain finite, reversible coefficients; scaling never drops
+ * a nonzero or changes the caller's original model. */
+static int limit_exponent(double value, int exponent) {
+    if (value == 0)
+        return exponent;
+    int q = ilogb(fabs(value));
+    if (exponent > 0 && q + exponent > DBL_MAX_EXP - 2)
+        exponent = DBL_MAX_EXP - 2 - q > 0 ? DBL_MAX_EXP - 2 - q : 0;
+    if (exponent < 0 && q + exponent < DBL_MIN_EXP - 1) {
+        int minimum = DBL_MIN_EXP - 1 - q;
+        exponent = minimum < 0 ? minimum : 0;
+    }
+    return exponent;
+}
+static int bounded_exponent(int exponent) {
+    return exponent < -256 ? -256 : exponent > 256 ? 256 : exponent;
+}
+static int scale_form(Work *w, const LabModel *m) {
+    if (w->options->no_scaling)
+        return 0;
+    double *norm = lab_alloc(w->m, sizeof(double));
+    int *column_exp = lab_alloc(m->cols, sizeof(int));
+    int *row_exp = lab_alloc(w->m, sizeof(int));
+    for (size_t j = 0; j < w->structural; j++)
+        for (size_t k = 0; k < w->a[j].count; k++) {
+            size_t i = w->a[j].row[k];
+            norm[i] = fmax(norm[i], fabs(w->a[j].value[k]));
+        }
+    for (size_t j = 0; j < m->cols; j++) {
+        if (m->col_lower[j] == m->col_upper[j])
+            continue;
+        double width = m->col_upper[j] - m->col_lower[j];
+        if (isfinite(width) && width > 0)
+            column_exp[j] = bounded_exponent(ilogb(width));
+    }
+    for (size_t j = 0; j < w->structural; j++) {
+        size_t original = w->original[j];
+        if (!isfinite(m->col_lower[original]) || !isfinite(m->col_upper[original])) {
+            double largest = 0;
+            for (size_t k = 0; k < w->a[j].count; k++) {
+                size_t i = w->a[j].row[k];
+                if (w->source_row[i] != SIZE_MAX && norm[i] > 0)
+                    largest = fmax(largest, fabs(w->a[j].value[k]) / norm[i]);
+            }
+            if (largest > 0)
+                column_exp[original] = bounded_exponent(-ilogb(largest));
+        }
+    }
+    /* One original free variable uses the same scale in both split columns. */
+    for (size_t j = 0; j < w->structural; j++) {
+        int e = column_exp[w->original[j]];
+        e = limit_exponent(w->cost[j], e);
+        for (size_t k = 0; k < w->a[j].count; k++)
+            e = limit_exponent(w->a[j].value[k], e);
+        column_exp[w->original[j]] = e;
+    }
+    int bad = 0;
+    memset(norm, 0, w->m * sizeof(double));
+    for (size_t j = 0; j < w->structural; j++) {
+        int e = column_exp[w->original[j]];
+        if (e)
+            w->scaled_columns++;
+        w->sign[j] = scalbn(w->sign[j], e);
+        double cost = scalbn(w->cost[j], e);
+        if (!isfinite(cost) || scalbn(cost, -e) != w->cost[j])
+            bad = 1;
+        w->cost[j] = cost;
+        for (size_t k = 0; k < w->a[j].count; k++) {
+            double old = w->a[j].value[k], value = scalbn(old, e);
+            if (!isfinite(value) || scalbn(value, -e) != old)
+                bad = 1;
+            w->a[j].value[k] = value;
+            norm[w->a[j].row[k]] = fmax(norm[w->a[j].row[k]], fabs(value));
+        }
+    }
+    if (bad) {
+        free(norm);
+        free(column_exp);
+        free(row_exp);
+        message(w, "numerical_failure", "Irreversible or nonfinite column transformation");
+        return -1;
+    }
+    for (size_t i = 0; i < w->m; i++) {
+        int e = norm[i] > 0 ? bounded_exponent(-ilogb(norm[i])) : 0;
+        row_exp[i] = limit_exponent(w->b[i], e);
+    }
+    for (size_t j = 0; j < w->structural; j++)
+        for (size_t k = 0; k < w->a[j].count; k++) {
+            size_t i = w->a[j].row[k];
+            row_exp[i] = limit_exponent(w->a[j].value[k], row_exp[i]);
+        }
+    for (size_t j = 0; j < w->structural; j++)
+        for (size_t k = 0; k < w->a[j].count; k++) {
+            size_t i = w->a[j].row[k];
+            double old = w->a[j].value[k], value = scalbn(old, row_exp[i]);
+            if (!isfinite(value) || scalbn(value, -row_exp[i]) != old)
+                bad = 1;
+            w->a[j].value[k] = value;
+        }
+    for (size_t i = 0; i < w->m; i++) {
+        int e = row_exp[i];
+        if (e)
+            w->scaled_rows++;
+        double rhs = scalbn(w->b[i], e);
+        if (!isfinite(rhs) || scalbn(rhs, -e) != w->b[i])
+            bad = 1;
+        w->b[i] = rhs;
+        w->equation_scale[i] = scalbn(1, e);
+        w->row_scale[i] *= w->equation_scale[i];
+    }
+    free(norm);
+    free(column_exp);
+    free(row_exp);
+    if (bad) {
+        message(w, "numerical_failure", "Irreversible or nonfinite scaling transformation");
+        return -1;
+    }
+    return 0;
+}
 static int build(Work *w, const LabModel *m) {
     size_t dim = w->options->max_dimension, nz = 0, nr = 0;
     if (dim > 32768 || (w->options->dense && dim > 4096)) {
@@ -392,6 +522,9 @@ static int build(Work *w, const LabModel *m) {
     w->basis = lab_alloc(cap, sizeof(size_t));
     w->source_row = lab_alloc(cap, sizeof(size_t));
     w->row_scale = lab_alloc(cap, sizeof(double));
+    w->equation_scale = lab_alloc(cap, sizeof(double));
+    for (size_t i = 0; i < nr; i++)
+        w->equation_scale[i] = 1;
     w->row_id = lab_alloc(cap, sizeof(size_t));
     w->artificial = lab_alloc(n, 1);
     w->art_row = lab_alloc(n, sizeof(size_t));
@@ -535,7 +668,8 @@ static int build(Work *w, const LabModel *m) {
                 return -1;
             }
     }
-    w->matrix = w->options->dense ? lab_alloc(cap * cap, sizeof(double)) : NULL;
+    if (scale_form(w, m))
+        return -1;
     w->xb = lab_alloc(cap, sizeof(double));
     w->pi = lab_alloc(cap, sizeof(double));
     w->cb = lab_alloc(cap, sizeof(double));
@@ -700,7 +834,7 @@ void lab_lp_result_free(LabLpResult *result) {
     memset(result, 0, sizeof *result);
 }
 static void work_free(Work *w) {
-    lab_factor_free(&w->factor);
+    lab_linear_free(&w->linear);
     if (w->a)
         for (size_t j = 0; j < w->n; j++) {
             free(w->a[j].row);
@@ -717,11 +851,11 @@ static void work_free(Work *w) {
     free(w->art_row);
     free(w->source_row);
     free(w->row_scale);
+    free(w->equation_scale);
     free(w->artificial);
     free(w->lower_row);
     free(w->upper_row);
     free(w->transform);
-    free(w->matrix);
     free(w->xb);
     free(w->pi);
     free(w->cb);
@@ -932,11 +1066,14 @@ static int update_rhs(LabLpSession *s) {
                 bad = 1;
                 break;
             }
-            w->b[i] = w->shift[j] - m->col_lower[j];
-            if (!isfinite(w->b[i])) {
+            double raw = w->shift[j] - m->col_lower[j];
+            int e = ilogb(w->equation_scale[i]);
+            double scaled = scalbn(raw, e);
+            if (!isfinite(raw) || !isfinite(scaled) || scalbn(scaled, -e) != raw) {
                 bad = 1;
                 break;
             }
+            w->b[i] = scaled;
         }
         if (w->upper_row[j] != SIZE_MAX) {
             size_t i = position[w->upper_row[j]];
@@ -944,11 +1081,14 @@ static int update_rhs(LabLpSession *s) {
                 bad = 1;
                 break;
             }
-            w->b[i] = m->col_upper[j] - w->shift[j];
-            if (!isfinite(w->b[i])) {
+            double raw = m->col_upper[j] - w->shift[j];
+            int e = ilogb(w->equation_scale[i]);
+            double scaled = scalbn(raw, e);
+            if (!isfinite(raw) || !isfinite(scaled) || scalbn(scaled, -e) != raw) {
                 bad = 1;
                 break;
             }
+            w->b[i] = scaled;
         }
     }
     free(position);
@@ -1022,6 +1162,8 @@ void lab_lp_session_solve(LabLpSession *s, LabLpResult *result) {
     (void)cold_solve(w, &s->model);
     s->ready = !strcmp(result->status, "optimal");
 done:
+    result->scaled_rows = w->scaled_rows;
+    result->scaled_columns = w->scaled_columns;
     if (w->a)
         for (size_t j = 0; j < w->n; j++)
             result->standard_nnz += w->a[j].count;

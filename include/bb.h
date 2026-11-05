@@ -21,6 +21,8 @@ typedef struct {
     size_t nodes, lp_solves, lp_iterations, refactorizations;
     size_t warm_starts, cold_starts, pruned_nodes;
     size_t dual_iterations, cold_fallbacks, factor_nnz_peak, standard_nnz_peak;
+    size_t refinement_steps, scaled_rows, scaled_columns;
+    double initial_backward_error, max_backward_error;
 } LabBbResult;
 
 void lab_bb_solve(const LabModel *model, const LabBbOptions *options, LabBbResult *result);

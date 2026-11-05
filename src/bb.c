@@ -173,6 +173,14 @@ static int call_lp(Search *s, const double *lower, const double *upper, LabLpRes
 #ifdef LAB_LP_SESSION_API
     s->result->dual_iterations += lp->dual_iterations;
     s->result->cold_fallbacks += lp->cold_fallbacks;
+    s->result->refinement_steps += lp->refinement_steps;
+    if (lp->scaled_rows > s->result->scaled_rows)
+        s->result->scaled_rows = lp->scaled_rows;
+    if (lp->scaled_columns > s->result->scaled_columns)
+        s->result->scaled_columns = lp->scaled_columns;
+    s->result->initial_backward_error =
+        fmax(s->result->initial_backward_error, lp->initial_backward_error);
+    s->result->max_backward_error = fmax(s->result->max_backward_error, lp->max_backward_error);
     if (lp->factor_nnz_peak > s->result->factor_nnz_peak)
         s->result->factor_nnz_peak = lp->factor_nnz_peak;
     if (lp->standard_nnz > s->result->standard_nnz_peak)

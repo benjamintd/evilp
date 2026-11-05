@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 #include "lp.h"
 #include <errno.h>
+#include <float.h>
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -297,6 +298,66 @@ static void generated_bound_sequences(int dense) {
     }
     lab_lp_session_free(s);
 }
+static void warm_rhs_must_not_underflow_to_zero(int dense) {
+    /* In original units, x >= DBL_MIN and x - DBL_MIN*y <= 0 imply y >= 1.
+     * A cached row scaling can multiply that tiny bound delta into zero. The
+     * usual absolute primal tolerance cannot detect the lost RHS; objective
+     * and equivalent well-scaled inequalities must therefore be checked too. */
+    char *row_names[] = {"tiny_coupling"}, *col_names[] = {"x", "y"};
+    double row_lo[] = {-INFINITY}, row_hi[] = {0};
+    double original_lo[] = {0, 0}, original_hi[] = {1e100, INFINITY}, cost[] = {0, 1};
+    size_t start[] = {0, 1, 2}, index[] = {0, 0};
+    double value[] = {1, -DBL_MIN};
+    unsigned char integer[] = {0, 0};
+    LabModel m = {.rows = 1,
+                  .cols = 2,
+                  .nnz = 2,
+                  .row_name = row_names,
+                  .col_name = col_names,
+                  .row_lower = row_lo,
+                  .row_upper = row_hi,
+                  .col_lower = original_lo,
+                  .col_upper = original_hi,
+                  .objective = cost,
+                  .integer = integer,
+                  .col_start = start,
+                  .row_index = index,
+                  .value = value};
+    LabLpOptions opt = options(dense);
+    LabLpSession *s = lab_lp_session_create(&m, &opt);
+    require(s != NULL, "tiny warm-RHS session creation");
+    LabLpResult root = {0}, changed = {0}, restored = {0};
+    lab_lp_session_solve(s, &root);
+    require(!strcmp(root.status, "optimal") && root.has_primal && root.objective == 0,
+            "original tiny-coupling model has optimum zero");
+    lab_lp_result_free(&root);
+    require(lab_lp_session_set_bounds(s, 0, DBL_MIN, 1e100) == 0,
+            "tiny representable bound tightening must be accepted");
+    lab_lp_session_solve(s, &changed);
+    if (!strcmp(changed.status, "optimal")) {
+        require(changed.has_primal && fabs(changed.objective - 1) <= 1e-7,
+                "warm RHS underflow must not hide the true objective one");
+        require(changed.primal[0] >= DBL_MIN && changed.primal[1] >= 1 - 1e-7,
+                "tiny bound update must not silently retain the old zero vector");
+        require(isfinite(changed.primal[0] / DBL_MIN) &&
+                    changed.primal[0] / DBL_MIN - changed.primal[1] <= 1e-7,
+                "tiny coupling must hold in equivalent well-scaled units");
+    } else {
+        require(!strcmp(changed.status, "numerical_failure") && !changed.has_primal,
+                "unsafe warm scaling must stop explicitly instead of claiming a wrong optimum");
+    }
+    lab_lp_result_free(&changed);
+    require(original_lo[0] == 0 && original_lo[1] == 0 && original_hi[0] == 1e100 &&
+                isinf(original_hi[1]) && value[0] == 1 && value[1] == -DBL_MIN,
+            "tiny overlays/scaling must preserve original bounds and coefficients");
+    require(lab_lp_session_set_bounds(s, 0, 0, 1e100) == 0,
+            "original domain must remain restorable after a failed tiny update");
+    lab_lp_session_solve(s, &restored);
+    require(!strcmp(restored.status, "optimal") && restored.has_primal && restored.objective == 0,
+            "session must recover the original optimum after tiny-update uncertainty");
+    lab_lp_result_free(&restored);
+    lab_lp_session_free(s);
+}
 int main(void) {
     for (int dense = 0; dense <= 1; dense++) {
         bounded_sequence(dense);
@@ -304,6 +365,7 @@ int main(void) {
         generated_bound_sequences(dense);
         cumulative_deadline(dense);
         basis_identity_is_required_before_io(dense);
+        warm_rhs_must_not_underflow_to_zero(dense);
     }
     puts("Cold/warm reoptimization, bound overlays, dual pivots and deadline contracts passed.");
     return 0;
