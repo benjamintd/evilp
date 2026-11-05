@@ -1,4 +1,4 @@
 solver	binary	sha256	version
-cbc	tools/cbc-native/bin/cbc	9f2236dc8e05c9179fe47a0003e94785187f40f838a3c99a2fac2d5c214efb4a	2.10.13 (Apple Clang source build)
+cbc	tools/cbc-native/bin/cbc	9f2236dc8e05c9179fe47a0003e94785187f40f838a3c99a2fac2d5c214efb4a	2.10.13 (local source build)
 highs	tools/highs/bin/highs	d412a14d71b59c3ef3fef614e8089000963b8b637920c49b40018b85c645b8a2	v1.15.1
 scip	tools/scip/scipoptsuite-10.1.0-macos13-arm64/bin/scip	c972dd60086381fea17f1b4b00de196c2f1e538e785ed99c0fa2d07b43ea0ed7	v10.1.0

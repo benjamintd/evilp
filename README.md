@@ -5,6 +5,13 @@ Milestone 1 implements the dataset import, independent primal checker,
 native benchmark runner and HiGHS / SCIP / Cbc baseline adapters.
 It does not contain a new optimization solver yet.
 
+Milestone 1 is implemented and exercised on all 240 MIPLIB benchmark instances.
+See [the baseline summary](docs/BASELINES.md),
+[the complete 720-run report](results/miplib-2s-seed1/validated.html), and
+[the 36-run smoke report](results/smoke-5s-seed1/validated-final.html).
+Reports, downloaded models and native tools are present in this local project;
+the source archive excludes these fetched/generated artifacts.
+
 ## Build and test
 
 Requirements: C17 compiler, CMake 3.20+, GMP, zlib, Python 3.12+ for setup

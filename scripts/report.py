@@ -30,15 +30,15 @@ def report(root,runs_file='runs.jsonl',prefix='summary'):
           'summary':summary,'contradictions':contradictions,'attempts':len(rows),'instances':len({r['instance'] for r in rows}),'environment':json.loads((root/'environment.json').read_text())}
     data['run_records']=runs_file
     if (root/'host.json').exists():data['host']=json.loads((root/'host.json').read_text())
-    if any('revalidation' in r for r in rows):data['revalidation']={'checker_sha256':sorted({r['checker_sha256'] for r in rows}),'solver_times_unchanged':True}
+    if any('revalidation' in r for r in rows):data['revalidation']={'checker_sha256':sorted({r['checker_sha256'] for r in rows}),'driver_sha256':sorted({r['revalidation']['driver_sha256'] for r in rows if 'revalidation' in r}),'solver_times_unchanged':True}
     (root/(prefix+'.json')).write_text(json.dumps(data,indent=2)+'\n')
     E=lambda x:html.escape(str(x))
     parts=['<!doctype html><meta charset="utf-8"><title>MILP baseline report</title><style>body{font:16px system-ui;max-width:1200px;margin:40px auto;padding:0 24px;color:#102a43}table{border-collapse:collapse;width:100%;font-size:13px;margin:24px 0}th,td{text-align:left;padding:9px;border-bottom:1px solid #ccd}th{background:#102a43;color:white}tr:nth-child(even){background:#eff5f7}code{overflow-wrap:anywhere}.bad{color:#b22}a{color:#087f8c}</style><h1>MILP baseline report</h1>']
     env=data['environment'];parts.append(f'<p>{data["instances"]} instances, {len(rows)} runs. Requested one thread; seed {env["seed"]}; internal solve limit {env["time_limit_s"]} seconds. Process wall time includes startup, input parsing and output; checking is separate.</p>')
     parts.append('<p><strong>This short-budget run validates the laboratory. It does not establish a performance ranking or certify optimality.</strong> A checked feasible solution satisfies the original model under the recorded tolerances. Reference agreement is a comparison with versioned metadata.</p>')
-    parts.append('<p>Validation uses absolute row/bound tolerance 1e-4 and integer tolerance 1e-5. With large coefficients, a point accepted under solver scaling/tolerances can fail this absolute policy. Such a failure alone does not establish a solver bug.</p>')
+    parts.append('<p>The checker requires absolute row/bound tolerance 1e-4, integer tolerance 1e-5, and claimed-objective consistency 1e-4. A rejection can involve feasibility or objective consistency. With large coefficients, a point accepted under solver scaling/tolerances can fail this absolute policy. Such a failure alone does not establish a solver bug.</p>')
     if 'revalidation' in data:parts.append('<p>Independent validation was rerun from retained solution files. Original solver timings and raw run records are unchanged. Each row links to the newer validation record.</p>')
-    parts.append('<table><tr><th>Solver</th><th>Attempts</th><th>Checked feasible</th><th>Reached reference</th><th>Invalid candidates</th><th>Checker errors</th><th>Claimed statuses</th><th>Solver wall seconds</th></tr>')
+    parts.append('<table><tr><th>Solver</th><th>Attempts</th><th>Passed checker</th><th>Reached reference</th><th>Invalid candidates</th><th>Checker errors</th><th>Claimed statuses</th><th>Solver wall seconds</th></tr>')
     for name,s in summary.items():parts.append('<tr>'+''.join(f'<td>{E(x)}</td>' for x in [name,s['attempts'],s['checked_feasible'],s['reached_reference'],s['invalid_candidates'],s['checker_errors'],s['claimed_statuses'],round(s['total_solver_wall_s'],2)])+'</tr>')
     parts.append('</table><p>Reference matching: absolute 1e-4 + relative 1e-9, for pinned =opt= records only. No comparisons use a solver unvalidated dual bound as truth. All failures and missing candidates remain in the table.</p>')
     parts.append('<h2>Individual runs</h2><table><tr><th>Instance</th><th>Solver</th><th>Claimed status</th><th>Checker</th><th>Checked objective</th><th>Reference reached</th><th>Wall seconds</th><th>Evidence</th></tr>')
@@ -47,7 +47,8 @@ def report(root,runs_file='runs.jsonl',prefix='summary'):
         values=[r['instance'],r['solver'],r['claimed_status'],r['checker']['status'],r['validated_objective_decimal'],r['reached_reference'],round(r['wall_s'],4)]
         validation=f' / <a href="{E(relative_run)}/{E(r["revalidation"].get("record","checker-revalidated.json"))}">validation</a>' if 'revalidation' in r else ''
         parts.append('<tr>'+''.join(f'<td>{E(x)}</td>' for x in values)+f'<td><a href="{E(relative_run)}/run.json">record</a> / <a href="{E(relative_run)}/solver.log">log</a>{validation}</td></tr>')
-    parts.append('</table><h2>Environment and provenance</h2><pre><code>'+E(json.dumps(env,indent=2))+'</code></pre>')
+    parts.append('</table><h2>Original timed evaluator</h2><pre><code>'+E(json.dumps(env,indent=2))+'</code></pre>')
+    if 'revalidation' in data:parts.append('<h2>Final independent validation</h2><pre><code>'+E(json.dumps(data['revalidation'],indent=2))+'</code></pre>')
     if 'host' in data:parts.append('<h2>Host and measurement conditions</h2><pre><code>'+E(json.dumps(data['host'],indent=2))+'</code></pre>')
     (root/(prefix+'.html')).write_text('\n'.join(parts)+'\n')
     print(json.dumps(data['summary'],indent=2))
