@@ -9,15 +9,17 @@ It also applies reversible power-of-two changes of units and compensated
 iterative refinement, with the original feasibility policies unchanged.
 Small uncertain Phase I solves can reconstruct exact original-decimal
 infeasibility witnesses; guarded pivots can retry a stronger leaving choice.
-The independent checker validates original-model witnesses and rational LP bounds.
+The independent checker validates original-model witnesses, rational LP bounds
+and exact infeasibility certificates.
 
 See [pivot safeguards and infeasibility witnesses](docs/MILESTONE-2E.md),
 [numerical scaling and refinement](docs/MILESTONE-2D.md), and
 [the integer-search contract](docs/MILESTONE-2BC.md).
-The [numerical ablations](results/numerics-roots-v1/report.html),
-[40-case MILP crosscheck](results/mip-native-v3/summary.json), and
-[MIPLIB smoke report](results/miplib-smoke-2s-v2/runs/summary.html) preserve
+The [pivot and proof comparison](results/numerical-stability-v1/report.html),
+[40-case MILP crosscheck](results/mip-native-v4/summary.json), and
+[MIPLIB smoke report](results/miplib-smoke-2s-v3/runs/summary.html) preserve
 successful witnesses, numerical failures and capacity limits. The earlier
+[numerical ablations](results/numerics-roots-v1/report.html),
 [MILP report](results/mip-native-v2/report.html) and
 [MIPLIB smoke](results/miplib-smoke-2s-v1/runs/summary.html) remain available.
 
@@ -164,6 +166,8 @@ and 3. Inspect all validation failures before accepting performance changes.
 - src/model.c: independent optimizer MPS reader and sparse CSC model.
 - src/lp.c, src/factor.c, src/solve.c: LP engine, LU backend and command line.
 - src/linear.c: equilibrated basis solves, compensated residuals and refinement.
+- src/exact.c, src/rational.c: original decimals and bounded exact reconstruction.
+- src/pivot.c: deterministic ratio choices for validated pivot retries.
 - src/bb.c: branch-and-bound, integer repair, limits and deterministic traces.
 - config/: dataset locks, native assets, solver identities and smoke suite.
 - tests/: exact arithmetic oracle, adversarial cases and runner contracts.

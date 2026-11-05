@@ -113,3 +113,56 @@ path avoids this new root regression.
 `--bland-ratio` preserves the earlier policy without a Harris retry for
 controlled comparisons. Bland's full anti-cycling theorem is not claimed for
 paths that use the rescue. Pivot and time budgets remain explicit limits.
+
+## Recorded validation and remaining failures
+
+The evaluated engine is frozen at `eaf03d4` (`milestone-2e-evaluator`).
+The [contract evidence](../results/milestone-2e-contracts-v1/summary.json)
+records all sixteen suites passing in both Release and ASan/UBSan builds,
+with zero skipped or failed tests. Existing exact LP/MILP oracles and scaled
+regressions remain in the suite. New coverage includes 180 independent
+Farkas-oracle cases, 36 generated decimal reconstruction cases, parser/resource
+limits, malformed witnesses, replay adversaries and the two pivot mechanisms.
+
+The [controlled comparison](../results/numerical-stability-v1/report.html)
+retains eight MILP runs: two declared development models, the frozen 0.4
+binary, the new default and two ablations. Each has a ten-second budget and
+1,000-node cap. Source snapshots before and after are identical and clean;
+binary/model hashes, exact evaluator source, commands and raw records are
+retained. This is a correctness comparison on observed failures, not a holdout
+or a speed ranking.
+
+`gen-ip054` previously stopped at node 35 with uncertain Phase I signs. The
+new default reaches the 1,000-node limit and retains a separately checked
+integer incumbent with objective approximately 8852.207808267. All 217 recorded
+LP certificates pass independent exact replay with matching contradiction
+margins. Disabling reconstruction reproduces the failure at node 35. Disabling
+Harris retries still reaches 1,000 nodes with the same 217 checked certificates,
+isolating the effect of reconstruction. The pinned reference optimum remains
+unreached; these individual contradictions do not certify the entire tree.
+
+`mas74` remains numerically unresolved at node 345. The guarded policy makes
+three successful Harris rescues, then stops at the unchanged original-model
+`1e-7` primal check. The earlier policy stops at the basis primal guard. Both
+retain the independently checked incumbent near 19563.4046944. Moving the stop
+to a later check is not a completed numerical repair. Original-unit feasibility
+restoration and accurate primal reconstruction are the next work here.
+
+The [native crosscheck](../results/mip-native-v4/summary.json) again matches all
+forty known reference outcomes across HiGHS, SCIP, Cbc and warm/cold lab search;
+all 35 feasible candidates pass the independent checker.
+
+The [twelve-instance two-second MIPLIB smoke](../results/miplib-smoke-2s-v3/runs/summary.html)
+records six size limits and six time limits, with valid incumbents on
+`gen-ip054`, `mas76`, `neos5` and `pk1`. There are no invalid candidates,
+checker errors, reference contradictions or reached reference optima. The
+short budget stops `mas74` before its known later failure and yields no
+incumbent there. Absence of numerical failures in that short run is therefore
+not evidence that the remaining numerical issue is fixed, nor a uniform
+performance improvement over the prior version.
+
+Constant-row and conflicting-bound presolve outcomes can still be numerical
+claims without an exported solver witness. The checker can validate explicit
+certificates for those cases, but solver export does not yet cover every
+presolve path. Larger exact reconstructions, complete tree proofs and the
+standard-form capacity bottleneck remain separate work.
