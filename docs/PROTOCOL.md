@@ -39,8 +39,16 @@ Conflicting integer-marker declarations for the same column are rejected.
 Default absolute tolerances: linear rows/bounds 1e-4; integrality 1e-5;
 claimed-objective consistency 1e-4. All comparisons use rationals.
 --exact sets all three tolerances to zero; this checks a supplied finite-decimal
-witness exactly. It does not prove optimality or infeasibility.
+witness exactly. By itself it does not prove optimality or infeasibility.
 Missing variable assignments mean zero (sparse SOL convention).
+
+Milestone 2A adds explicit --relax checking, --format rational for fractional
+witnesses, and --dual for independently recomputed LP support bounds. Exact
+feasible primal and matching dual witnesses can certify optimality; tolerant
+acceptance and reference agreement cannot. Bound-only checks never claim primal
+feasibility, and infinite selected sides make a bound unavailable. See the
+[LP contract](LP-ENGINE.md) for proof scope and limitations. Historical baseline
+evaluator tags and records retain their original primal-only semantics.
 
 Exit codes: 0 valid/supported; 1 invalid candidate; 2 malformed/input error;
 3 unsupported model; 4 no candidate. JSON includes every violation count,
@@ -68,6 +76,10 @@ Release-archive digests and source-build provenance complement binary hashes;
 hashing only an executable does not freeze its system libraries.
 
 Reported dual bounds and optimal/infeasible statuses remain solver claims.
+The lab's separately checked certified_bound field is distinct from a solver's
+reported_dual_bound. The raw reported_solver_status is also distinct from the
+effective claimed_status, which can be process_error after a nonzero exit.
+Raw exit codes and signals are preserved even when a retained witness validates.
 Reference matching uses 1e-4 absolute + 1e-9 relative error on =opt= objectives.
 It is not an optimality certificate. Contradictions remain visible in reports.
 Reference metadata can be revised upstream; upgrades require a new lock
@@ -84,6 +96,10 @@ The Cbc adapter explicitly passes the MPS objective sense, because Cbc's reader
 ignores OBJSENSE. Maximization regression tests guard this behavior. The pinned
 MIPLIB benchmark models use minimization; this adapter correction does not
 reinterpret their original timed runs.
+
+The milestone-2A lab adapter requires --relax and an LP-reference suite; this
+mode currently excludes native MILP adapters. Native LP crosschecks instead
+provide continuous MPS models to those adapters in a separate run directory.
 
 ## Reproducibility boundaries
 

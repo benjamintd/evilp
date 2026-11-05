@@ -3,7 +3,11 @@
 A C17 laboratory for building and evaluating a new MILP solver.
 Milestone 1 implements the dataset import, independent primal checker,
 native benchmark runner and HiGHS / SCIP / Cbc baseline adapters.
-It does not contain a new optimization solver yet.
+Milestone 2A adds the first native LP solver: bounded-variable transformations,
+two-phase revised simplex, a dense LU reference backend, and independent
+rational LP-bound validation. Integer search is the next milestone.
+
+See [the LP engine and validation contract](docs/LP-ENGINE.md).
 
 Milestone 1 is implemented and exercised on all 240 MIPLIB benchmark instances.
 See [the baseline summary](docs/BASELINES.md),
@@ -54,6 +58,34 @@ Use --format highs, scip, or cbc for native solution files.
 See [the protocol](docs/PROTOCOL.md) for accepted MPS features, exact arithmetic,
 absolute tolerances, and the difference between feasible witnesses and proof.
 
+## Solve an LP relaxation
+
+~~~sh
+mkdir -p work
+build/milpsolve tests/fixtures/tiny.mps --relax \
+  --solution work/tiny-lp.sol --dual work/tiny-lp.dual --basis work/tiny-lp.basis
+build/milpcheck --model tests/fixtures/tiny.mps --relax \
+  --solution work/tiny-lp.sol --dual work/tiny-lp.dual --exact
+~~~
+
+The example's LP optimum is 8.53; the original integer optimum is 8.03.
+The separate checker certifies this example's exact LP optimum. In general,
+floating-point solutions are tolerance-accepted and their dual bounds can be
+unavailable; inspect both statuses. Output files must be new. `--relax` is
+required so fractional LP solutions cannot silently be presented as MILP results.
+The dense backend caps the expanded standard-form dimension at 512 by default.
+
+~~~sh
+build/milpsolve tests/fixtures/tiny.mps --relax --read-basis work/tiny-lp.basis
+python3 tests/test_live_lp.py --out results/my-live-lp
+~~~
+
+The optional live test requires the three installed baseline solvers. It runs
+eight continuous models through all four engines and checks known objectives
+and the lab's independent bounds. Its generated lab configuration also shows
+how to use `milpbench --relax` with an LP-reference suite. Native baseline
+adapters operate on continuous MPS models in a separate run directory.
+
 ## Run baselines
 
 ~~~sh
@@ -89,6 +121,8 @@ and 3. Inspect all validation failures before accepting performance changes.
 - src/check.c: independent streaming MPS/solution checker using GMP rationals.
 - src/bench.c: POSIX C process control, adapters, watchdog, provenance records.
 - src/common.c: allocation, JSON escaping, monotonic timing and SHA-256.
+- src/model.c: independent optimizer MPS reader and sparse CSC model.
+- src/lp.c, src/factor.c, src/solve.c: LP engine, LU backend and command line.
 - config/: dataset locks, native assets, solver identities and smoke suite.
 - tests/: exact arithmetic oracle, adversarial cases and runner contracts.
 - data/, tools/, work/: locally fetched data/tools and build scratch; ignored.

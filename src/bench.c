@@ -212,16 +212,218 @@ static void argv_json(FILE *f, char *const args[]) {
     }
     fputc(']', f);
 }
+/* The lab adapter emits one JSON result object. Parse its top-level status,
+ * rather than matching words inside an explanatory message. Other values are
+ * structurally validated but do not become independent numerical evidence. */
+static void json_space(const char **p) {
+    while (isspace((unsigned char)**p))
+        ++*p;
+}
+static int json_string(const char **p, char *out, size_t cap) {
+    if (**p != '"')
+        return -1;
+    ++*p;
+    size_t n = 0;
+    while (**p && **p != '"') {
+        unsigned c = (unsigned char)*(*p)++;
+        if (c < 32)
+            return -1;
+        if (c == '\\') {
+            c = (unsigned char)*(*p)++;
+            if (!c)
+                return -1;
+            if (c == 'u') {
+                c = 0;
+                for (int i = 0; i < 4; ++i) {
+                    unsigned h = (unsigned char)**p;
+                    if (!isxdigit((unsigned char)h))
+                        return -1;
+                    c = 16 * c + (h <= '9' ? h - '0' : (unsigned)tolower((int)h) - 'a' + 10);
+                    ++*p;
+                }
+            } else if (strchr("\"\\/", (int)c)) {
+                /* Literal escaped punctuation. */
+            } else if (strchr("bfnrt", (int)c)) {
+                c = 128;
+            } else {
+                return -1;
+            }
+        }
+        /* Status names and keys are ASCII. Preserve non-ASCII/control escapes
+         * as a nonmatching byte, never an embedded C-string terminator. */
+        if (out && n + 1 < cap)
+            out[n] = (char)(c >= 32 && c < 127 ? c : 128);
+        ++n;
+    }
+    if (**p != '"')
+        return -1;
+    ++*p;
+    if (out && cap) {
+        if (n >= cap)
+            out[0] = 0;
+        else
+            out[n] = 0;
+    }
+    return 0;
+}
+static int json_value(const char **p, unsigned depth) {
+    if (depth > 64)
+        return -1;
+    json_space(p);
+    if (**p == '"')
+        return json_string(p, NULL, 0);
+    if (**p == '{' || **p == '[') {
+        int object = **p == '{';
+        char end = object ? '}' : ']';
+        ++*p;
+        json_space(p);
+        if (**p == end) {
+            ++*p;
+            return 0;
+        }
+        for (;;) {
+            if (object) {
+                if (json_string(p, NULL, 0))
+                    return -1;
+                json_space(p);
+                if (*(*p)++ != ':')
+                    return -1;
+            }
+            if (json_value(p, depth + 1))
+                return -1;
+            json_space(p);
+            if (**p == end) {
+                ++*p;
+                return 0;
+            }
+            if (*(*p)++ != ',')
+                return -1;
+            json_space(p);
+        }
+    }
+    static const char *literals[] = {"true", "false", "null"};
+    for (size_t i = 0; i < 3; ++i) {
+        size_t n = strlen(literals[i]);
+        if (!strncmp(*p, literals[i], n)) {
+            *p += n;
+            return 0;
+        }
+    }
+    if (**p == '-')
+        ++*p;
+    if (**p == '0')
+        ++*p;
+    else {
+        if (**p < '1' || **p > '9')
+            return -1;
+        while (isdigit((unsigned char)**p))
+            ++*p;
+    }
+    if (**p == '.') {
+        ++*p;
+        if (!isdigit((unsigned char)**p))
+            return -1;
+        while (isdigit((unsigned char)**p))
+            ++*p;
+    }
+    if (**p == 'e' || **p == 'E') {
+        ++*p;
+        if (**p == '-' || **p == '+')
+            ++*p;
+        if (!isdigit((unsigned char)**p))
+            return -1;
+        while (isdigit((unsigned char)**p))
+            ++*p;
+    }
+    return 0;
+}
+static const char *lab_status(const char *p) {
+    static const char *known[] = {"optimal",     "infeasible",  "unbounded",  "numerical_failure",
+                                  "unsupported", "input_error", "time_limit", "iteration_limit"};
+    json_space(&p);
+    if (*p++ != '{')
+        return NULL;
+    char value[64] = "";
+    int seen = 0;
+    json_space(&p);
+    if (*p == '}')
+        return NULL;
+    for (;;) {
+        char key[64];
+        if (json_string(&p, key, sizeof key))
+            return NULL;
+        json_space(&p);
+        if (*p++ != ':')
+            return NULL;
+        json_space(&p);
+        if (!strcmp(key, "status")) {
+            if (seen++ || json_string(&p, value, sizeof value))
+                return NULL;
+        } else if (json_value(&p, 0)) {
+            return NULL;
+        }
+        json_space(&p);
+        if (*p == '}') {
+            ++p;
+            break;
+        }
+        if (*p++ != ',')
+            return NULL;
+        json_space(&p);
+    }
+    json_space(&p);
+    if (*p || !seen)
+        return NULL;
+    for (size_t i = 0; i < sizeof known / sizeof *known; ++i)
+        if (!strcmp(value, known[i]))
+            return known[i];
+    return NULL;
+}
+static int cbc_lp_optimal_line(const char *line) {
+    const char *value;
+    int summary = 0;
+    if (!strncmp(line, "Optimal - objective value ", 26))
+        value = line + 26;
+    else if (!strncmp(line, "Optimal objective ", 18)) {
+        value = line + 18;
+        summary = 1;
+    } else {
+        return 0;
+    }
+    char *end;
+    double objective = strtod(value, &end);
+    if (end == value || !isfinite(objective))
+        return 0;
+    if (summary)
+        return !strncmp(end, " - ", 3) && strstr(end, " iterations time ") != NULL;
+    while (isspace((unsigned char)*end))
+        ++end;
+    return !*end;
+}
 static const char *status_from_log(const char *solver, const char *path, Process p,
-                                   char bound[128]) {
+                                   const char **reported, char bound[128]) {
+    *reported = "unknown";
+    bound[0] = 0;
     FILE *f = fopen(path, "r");
     if (!f)
         return "launch_error";
     char line[16384];
     const char *status = "unknown";
-    bound[0] = 0;
-    int highs_report = 0, input_timeout = 0;
+    int highs_report = 0, input_timeout = 0, cbc_lp_optimal = 0, cbc_mip = 0;
     while (fgets(line, sizeof line, f)) {
+        if (!strcmp(solver, "lab")) {
+            size_t length = strlen(line);
+            if (length == sizeof line - 1 && line[length - 1] != '\n') {
+                int c;
+                while ((c = fgetc(f)) != EOF && c != '\n') {
+                }
+                continue;
+            }
+            const char *parsed = lab_status(line);
+            if (parsed)
+                status = parsed;
+            continue;
+        }
         if (!strcmp(solver, "highs") && strstr(line, "Solving report"))
             highs_report = 1;
         if (!strcmp(solver, "highs") && strstr(line, "Parser reached timeout"))
@@ -252,6 +454,11 @@ static const char *status_from_log(const char *solver, const char *path, Process
             else if (strstr(line, "time limit"))
                 status = "time_limit";
         } else if (!strcmp(solver, "cbc")) {
+            if ((!strncmp(line, "Cbc", 3) && isdigit((unsigned char)line[3])) ||
+                !strncmp(line, "Continuous objective value is ", 30))
+                cbc_mip = 1;
+            if (cbc_lp_optimal_line(line))
+                cbc_lp_optimal = 1;
             if (strstr(line, "Result - Optimal solution found"))
                 status = "optimal";
             else if (strstr(line, "Result - Problem proven infeasible") ||
@@ -279,6 +486,14 @@ static const char *status_from_log(const char *solver, const char *path, Process
         }
     }
     fclose(f);
+    /* A continuous-only Cbc solve uses Clp's terminal output, without Cbc's
+     * MILP result block. Do not promote a root LP message from a MIP run. */
+    if (!strcmp(solver, "cbc") && !strcmp(status, "unknown") && cbc_lp_optimal && !cbc_mip)
+        status = "optimal";
+    /* Preserve the solver's report independently of interruption, watchdog or
+     * exit-code classification. A successful-looking report cannot erase a
+     * failed process outcome; neither is an independent proof. */
+    *reported = status;
     if (interrupted)
         return "interrupted";
     if (p.timed_out)
@@ -287,7 +502,11 @@ static const char *status_from_log(const char *solver, const char *path, Process
         return "launch_error";
     if (input_timeout)
         return "input_time_limit";
-    if (p.signal || p.code != 0)
+    if (p.signal)
+        return "process_error";
+    if (!strcmp(solver, "lab") && strcmp(status, "unknown"))
+        return status;
+    if (p.code != 0)
         return "process_error";
     return status;
 }
@@ -350,7 +569,8 @@ static size_t load_solvers(const char *path, Solver **out) {
             continue;
         if (split(line, v, 4) != 4)
             die("malformed solvers config");
-        if (strcmp(v[0], "highs") && strcmp(v[0], "scip") && strcmp(v[0], "cbc"))
+        if (strcmp(v[0], "highs") && strcmp(v[0], "scip") && strcmp(v[0], "cbc") &&
+            strcmp(v[0], "lab"))
             die("unsupported solver adapter");
         Solver *next = realloc(a, (n + 1) * sizeof *a);
         if (!next)
@@ -370,14 +590,14 @@ static size_t load_solvers(const char *path, Solver **out) {
 }
 static void one(const Instance *inst, const Solver *s, const char *checker, const char *checker_sha,
                 const char *runner_sha, const char *out, double limit, double grace, int seed,
-                FILE *all) {
+                int relax, FILE *all) {
     char id[1024];
     snprintf(id, sizeof id, "%s/%s/seed-%d", inst->id, s->name, seed);
     char *dir = pathcat(out, id);
     mkdirs(dir);
     char *log = pathcat(dir, "solver.log"), *sol = pathcat(dir, "solution.sol"),
          *options = pathcat(dir, "settings.txt"), *result = pathcat(dir, "run.json"),
-         *checklog = pathcat(dir, "checker.json");
+         *checklog = pathcat(dir, "checker.json"), *dual = pathcat(dir, "dual.sol");
     char secs[64], seedstr[32];
     snprintf(secs, sizeof secs, "%.9g", limit);
     snprintf(seedstr, sizeof seedstr, "%d", seed);
@@ -389,7 +609,20 @@ static void one(const Instance *inst, const Solver *s, const char *checker, cons
     FILE *opt = fopen(options, "wx");
     if (!opt)
         die("result directory is not new");
-    if (!strcmp(s->name, "highs")) {
+    if (!strcmp(s->name, "lab")) {
+        args[k++] = inst->path;
+        args[k++] = "--relax";
+        args[k++] = "--time-limit";
+        args[k++] = secs;
+        args[k++] = "--solution";
+        args[k++] = sol;
+        args[k++] = "--dual";
+        args[k++] = dual;
+        fprintf(opt,
+                "relaxation=true\ntime_limit=%s\nthreads=1\nalgorithm=deterministic\n"
+                "seed_argument=none\nreference_objectives=LP\n",
+                secs);
+    } else if (!strcmp(s->name, "highs")) {
         fprintf(opt,
                 "time_limit = %s\nthreads = 1\nrandom_seed = %s\nmip_rel_gap = 0\nmip_abs_gap = "
                 "0\nwrite_solution_to_file = true\nwrite_solution_style = 0\nsolution_file = "
@@ -453,13 +686,29 @@ static void one(const Instance *inst, const Solver *s, const char *checker, cons
     args[k] = NULL;
     Process p = run(args, log, limit + grace);
     char bound[128];
-    const char *claimed = status_from_log(s->name, log, p, bound);
+    const char *reported;
+    const char *claimed = status_from_log(s->name, log, p, &reported, bound);
     Process cp = {.code = -1};
     int has_solution = access(sol, R_OK) == 0;
+    int has_dual = !strcmp(s->name, "lab") && access(dual, R_OK) == 0;
+    int has_evidence = has_solution || has_dual;
     char *check = NULL;
-    if (has_solution && !interrupted) {
-        char *ca[] = {(char *)checker, "--model", inst->path, "--solution", sol,
-                      "--format",      s->name,   NULL};
+    if (has_evidence && !interrupted) {
+        char *ca[16] = {(char *)checker, "--model", inst->path};
+        int c = 3;
+        if (has_solution) {
+            ca[c++] = "--solution";
+            ca[c++] = sol;
+            ca[c++] = "--format";
+            ca[c++] = !strcmp(s->name, "lab") ? "simple" : s->name;
+        }
+        if (relax)
+            ca[c++] = "--relax";
+        if (has_dual) {
+            ca[c++] = "--dual";
+            ca[c++] = dual;
+        }
+        ca[c] = NULL;
         cp = run(ca, checklog, 120);
         check = readfile(checklog);
     }
@@ -489,6 +738,11 @@ static void one(const Instance *inst, const Solver *s, const char *checker, cons
     lab_json_string(f, checker_sha);
     fprintf(f, ",\"runner_sha256\":");
     lab_json_string(f, runner_sha);
+    fprintf(f, ",\"relaxation\":%s,\"dual_file\":", relax ? "true" : "false");
+    if (has_dual)
+        lab_json_string(f, dual);
+    else
+        fputs("null", f);
     fprintf(f,
             ",\"seed\":%d,\"requested_threads\":1,\"time_limit_s\":%.9g,\"watchdog_grace_s\":%.9g,"
             "\"wall_s\":%.9g,\"cpu_s\":%.9g,\"peak_rss_kib\":%ld,\"exit_code\":%d,\"signal\":%d,"
@@ -497,6 +751,8 @@ static void one(const Instance *inst, const Solver *s, const char *checker, cons
             p.timed_out ? "true" : "false");
     fprintf(f, ",\"claimed_status\":");
     lab_json_string(f, claimed);
+    fprintf(f, ",\"reported_solver_status\":");
+    lab_json_string(f, reported);
     fprintf(f, ",\"reported_dual_bound\":");
     if (bound[0])
         lab_json_string(f, bound);
@@ -509,7 +765,7 @@ static void one(const Instance *inst, const Solver *s, const char *checker, cons
     fprintf(f, ",\"argv\":");
     argv_json(f, args);
     fprintf(f, ",\"checker_exit_code\":");
-    if (has_solution)
+    if (has_evidence)
         fprintf(f, "%d", cp.code);
     else
         fputs("null", f);
@@ -520,7 +776,7 @@ static void one(const Instance *inst, const Solver *s, const char *checker, cons
     fflush(all);
     printf("%s %s seed=%d status=%s wall=%.3fs check=%s\n", inst->id, s->name, seed, claimed,
            p.wall,
-           has_solution ? (cp.code == 0   ? "valid"
+           has_evidence ? (cp.code == 0   ? "valid"
                            : cp.code == 1 ? "invalid"
                                           : "unavailable")
                         : "no_solution");
@@ -533,21 +789,27 @@ static void one(const Instance *inst, const Solver *s, const char *checker, cons
     free(options);
     free(result);
     free(checklog);
+    free(dual);
 }
 int main(int argc, char **argv) {
     if (argc == 2 && !strcmp(argv[1], "--help")) {
         puts("milpbench --suite FILE --out NEW_DIR [--solvers FILE] [--checker FILE]\n"
              "          [--limit SECONDS] [--grace SECONDS] [--seed POSITIVE_INT]\n"
-             "          [--max-instances N]\n"
+             "          [--max-instances N] [--relax]\n"
+             "--relax currently supports only lab; suite reference objectives must be LP values.\n"
              "Run from the project root. Results are immutable per output directory.");
         return 0;
     }
     const char *suite = NULL, *config = "config/solvers.tsv", *output = NULL,
                *checker_arg = "build/milpcheck";
     double limit = 2, grace = 15;
-    int seed = 1;
+    int seed = 1, relax = 0;
     size_t max = SIZE_MAX;
     for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "--relax")) {
+            relax = 1;
+            continue;
+        }
         if (i + 1 >= argc)
             die("missing argument value");
         const char *key = argv[i], *value = argv[++i];
@@ -589,6 +851,13 @@ int main(int argc, char **argv) {
     size_t ni = load_instances(suite, &instances), ns = load_solvers(config, &solvers);
     if (!ni || !ns)
         die("empty suite or solver list");
+    for (size_t j = 0; j < ns; ++j) {
+        if (!strcmp(solvers[j].name, "lab") && !relax)
+            die("lab adapter requires --relax; use LP reference objectives in the suite");
+        if (relax && strcmp(solvers[j].name, "lab"))
+            die("--relax currently supports only lab; native MILP adapters cannot be mixed with LP "
+                "references");
+    }
     size_t loaded_instances = ni;
     struct sigaction action = {0};
     action.sa_handler = on_signal;
@@ -632,9 +901,10 @@ int main(int argc, char **argv) {
     fprintf(env, ",\"checker_sha256\":");
     lab_json_string(env, checker_sha);
     fprintf(env,
-            ",\"time_limit_s\":%.9g,\"seed\":%d,\"requested_threads\":1,\"solver_order\":\"rotated_"
+            ",\"relaxation\":%s,\"time_limit_s\":%.9g,\"seed\":%d,\"requested_threads\":1,\"solver_"
+            "order\":\"rotated_"
             "by_instance\",\"timing\":\"end-to-end solver process; checker excluded\",\"argv\":",
-            limit, seed);
+            relax ? "true" : "false", limit, seed);
     argv_json(env, argv);
     fprintf(env, "}\n");
     fclose(env);
@@ -644,7 +914,7 @@ int main(int argc, char **argv) {
         verify(instances[i].path, instances[i].sha);
         for (size_t j = 0; j < ns && !interrupted; j++)
             one(&instances[i], &solvers[(j + i) % ns], checker, checker_sha, runner_sha, out, limit,
-                grace, seed, all);
+                grace, seed, relax, all);
     }
     fclose(all);
     for (size_t i = 0; i < loaded_instances; i++) {

@@ -1,0 +1,27 @@
+#ifndef LAB_MODEL_H
+#define LAB_MODEL_H
+
+#include <stddef.h>
+
+/* Original (unscaled) bounded-row model. The matrix is compressed by column.
+ * Bounds use +/-INFINITY; every stored coefficient and objective is finite.
+ * Integer flags are metadata: the LP engine must explicitly relax them. */
+typedef struct {
+    size_t rows, cols, nnz;
+    char **row_name, **col_name;
+    double *row_lower, *row_upper, *col_lower, *col_upper, *objective;
+    unsigned char *integer;
+    size_t *col_start, *row_index;
+    double *value;
+    double offset;
+    int maximize;
+    char error[512];
+    int unsupported;
+} LabModel;
+
+/* Start from a zero-initialized model. On failure the diagnostic stays in
+ * model->error; lab_model_free is valid after either success or failure. */
+int lab_model_read(LabModel *model, const char *path);
+void lab_model_free(LabModel *model);
+
+#endif

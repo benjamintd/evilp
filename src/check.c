@@ -12,12 +12,12 @@
 typedef struct {
     char *name;
     char type;
-    mpq_t rhs, range, activity;
-    int has_range, has_rhs;
+    mpq_t rhs, range, activity, dual;
+    int has_range, has_rhs, dual_seen;
 } Row;
 typedef struct {
     char *name;
-    mpq_t lo, hi, value;
+    mpq_t lo, hi, value, residual;
     int lf, hf, integer, bounded, explicit_lo, seen;
 } Col;
 typedef struct {
@@ -34,7 +34,7 @@ typedef struct {
     char *objname;
     mpq_t obj;
     char error[512];
-    int unsupported;
+    int unsupported, dual_enabled;
 } Model;
 static void fail(Model *m, const char *fmt, ...) {
     if (m->error[0])
@@ -145,6 +145,32 @@ static int number(mpq_t q, const char *s) {
     mpz_clear(power);
     return 0;
 }
+/* Certificate files may contain fractions. MPS and native SOL remain decimal-only. */
+static int rational(mpq_t q, const char *s) {
+    if (!s || strlen(s) > 4096)
+        return -1;
+    const char *slash = strchr(s, '/');
+    if (!slash)
+        return number(q, s);
+    const char *p = s;
+    if (*p == '+' || *p == '-')
+        p++;
+    if (p == slash)
+        return -1;
+    while (p < slash)
+        if (!isdigit((unsigned char)*p++))
+            return -1;
+    p = slash + 1;
+    if (!*p)
+        return -1;
+    while (*p)
+        if (!isdigit((unsigned char)*p++))
+            return -1;
+    if (mpq_set_str(q, *s == '+' ? s + 1 : s, 10) || mpz_sgn(mpq_denref(q)) == 0)
+        return -1;
+    mpq_canonicalize(q);
+    return 0;
+}
 static int tokens(char *s, char **v, int cap) {
     int n = 0;
     char *save;
@@ -176,7 +202,7 @@ static size_t column(Model *m, const char *s, int integer) {
     Col *c = &m->c[i];
     memset(c, 0, sizeof *c);
     c->name = lab_strdup(s);
-    mpq_inits(c->lo, c->hi, c->value, NULL);
+    mpq_inits(c->lo, c->hi, c->value, c->residual, NULL);
     c->lf = 1;
     c->integer = integer > 0;
     if (c->integer) {
@@ -320,7 +346,7 @@ static int read_mps(Model *m, const char *path, int evaluate) {
             memset(r, 0, sizeof *r);
             r->name = lab_strdup(v[1]);
             r->type = v[0][0];
-            mpq_inits(r->rhs, r->range, r->activity, NULL);
+            mpq_inits(r->rhs, r->range, r->activity, r->dual, NULL);
             if (r->type == 'N' && m->objective == SIZE_MAX)
                 m->objective = m->nr;
             insert(&m->rows, r->name, m->nr++);
@@ -363,6 +389,17 @@ static int read_mps(Model *m, const char *path, int evaluate) {
                 if (evaluate) {
                     mpq_mul(t, a, m->c[c].value);
                     mpq_add(m->r[r].activity, m->r[r].activity, t);
+                    if (m->dual_enabled) {
+                        if (r == m->objective) {
+                            if (m->maximize)
+                                mpq_sub(m->c[c].residual, m->c[c].residual, a);
+                            else
+                                mpq_add(m->c[c].residual, m->c[c].residual, a);
+                        } else if (m->r[r].type != 'N') {
+                            mpq_mul(t, a, m->r[r].dual);
+                            mpq_sub(m->c[c].residual, m->c[c].residual, t);
+                        }
+                    }
                 } else
                     m->nnz++;
             }
@@ -495,11 +532,11 @@ static int read_mps(Model *m, const char *path, int evaluate) {
 static void cleanup(Model *m) {
     for (size_t i = 0; i < m->nr; i++) {
         free(m->r[i].name);
-        mpq_clears(m->r[i].rhs, m->r[i].range, m->r[i].activity, NULL);
+        mpq_clears(m->r[i].rhs, m->r[i].range, m->r[i].activity, m->r[i].dual, NULL);
     }
     for (size_t i = 0; i < m->nc; i++) {
         free(m->c[i].name);
-        mpq_clears(m->c[i].lo, m->c[i].hi, m->c[i].value, NULL);
+        mpq_clears(m->c[i].lo, m->c[i].hi, m->c[i].value, m->c[i].residual, NULL);
     }
     free(m->r);
     free(m->c);
@@ -519,19 +556,40 @@ static int solution(Model *m, const char *path, const char *format, mpq_t claime
     }
     char line[16384], copy[16384], *v[12];
     int active = strcmp(format, "highs") != 0, marked = 0, no_solution = 0;
+    int highs_primal = 0, highs_finished = 0;
     size_t assigned = 0;
     while (fgets(line, sizeof line, f) && !m->error[0]) {
         if (strlen(line) == sizeof line - 1 && !strchr(line, '\n')) {
             fail(m, "solution line too long");
             break;
         }
-        if (!strncmp(line, "# Columns", 9)) {
-            active = 1;
-            continue;
-        }
-        if (!strncmp(line, "# Rows", 6) || !strncmp(line, "# Dual", 6)) {
-            active = 0;
-            continue;
+        if (!strcmp(format, "highs")) {
+            /* HiGHS repeats Columns/Rows headers for primal, dual and basis
+             * data. Only the first primal block defines this witness. */
+            if (!strncmp(line, "# Primal solution values", 24)) {
+                if (highs_primal || highs_finished) {
+                    fail(m, "duplicate/out-of-order HiGHS primal block");
+                    break;
+                }
+                highs_primal = 1;
+                active = 0;
+                continue;
+            }
+            if (!strncmp(line, "# Dual", 6) || !strncmp(line, "# Basis", 7)) {
+                highs_finished = 1;
+                active = 0;
+                continue;
+            }
+            if (highs_finished)
+                continue;
+            if (!strncmp(line, "# Columns", 9)) {
+                active = highs_primal;
+                continue;
+            }
+            if (!strncmp(line, "# Rows", 6)) {
+                active = 0;
+                continue;
+            }
         }
         if (!strncmp(line, "=infeas=", 8) ||
             (!strcmp(format, "scip") &&
@@ -556,11 +614,11 @@ static int solution(Model *m, const char *path, const char *format, mpq_t claime
             continue;
         const char *name = NULL, *value = NULL, *obj = NULL;
         if (!strcmp(format, "highs")) {
-            if (!strcmp(v[0], "Feasible")) {
+            if (highs_primal && !strcmp(v[0], "Feasible")) {
                 marked = 1;
                 continue;
             }
-            if (n == 2 && !strcmp(v[0], "Objective"))
+            if (highs_primal && n == 2 && !strcmp(v[0], "Objective"))
                 obj = v[1];
             else if (active && n == 2 && v[0][0] != '#') {
                 name = v[0];
@@ -605,7 +663,8 @@ static int solution(Model *m, const char *path, const char *format, mpq_t claime
                 fail(m, "malformed simple solution record");
         }
         if (obj) {
-            if (*has_claimed || number(claimed, obj)) {
+            if (*has_claimed ||
+                (!strcmp(format, "rational") ? rational(claimed, obj) : number(claimed, obj))) {
                 fail(m, "invalid/duplicate claimed objective");
                 break;
             }
@@ -618,7 +677,8 @@ static int solution(Model *m, const char *path, const char *format, mpq_t claime
                 fail(m, "unknown solution variable %s", name);
                 break;
             }
-            if (m->c[c].seen || number(m->c[c].value, value)) {
+            if (m->c[c].seen || (!strcmp(format, "rational") ? rational(m->c[c].value, value)
+                                                             : number(m->c[c].value, value))) {
                 fail(m, "duplicate/invalid value for %s", name);
                 break;
             }
@@ -635,6 +695,103 @@ static int solution(Model *m, const char *path, const char *format, mpq_t claime
         fail(m, "empty solution");
     return m->error[0] ? -1 : 0;
 }
+static int read_dual(Model *m, const char *path) {
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        fail(m, "cannot open dual certificate");
+        return -1;
+    }
+    char line[16384], *v[4];
+    while (fgets(line, sizeof line, f) && !m->error[0]) {
+        if (strlen(line) == sizeof line - 1 && !strchr(line, '\n')) {
+            fail(m, "dual certificate line too long");
+            break;
+        }
+        char *start = line;
+        while (isspace((unsigned char)*start))
+            start++;
+        if (*start == '#')
+            continue;
+        int n = tokens(line, v, 4);
+        if (!n || (n > 0 && v[0][0] == '#'))
+            continue;
+        if (n != 2) {
+            fail(m, "malformed dual certificate record");
+            break;
+        }
+        size_t r = lookup(&m->rows, v[0]);
+        if (r == SIZE_MAX || m->r[r].type == 'N') {
+            fail(m, "unknown/nonconstraint dual row %s", v[0]);
+            break;
+        }
+        if (m->r[r].dual_seen || rational(m->r[r].dual, v[1])) {
+            fail(m, "duplicate/invalid dual multiplier for %s", v[0]);
+            break;
+        }
+        m->r[r].dual_seen = 1;
+    }
+    if (ferror(f))
+        fail(m, "dual certificate read error");
+    fclose(f);
+    m->dual_enabled = !m->error[0];
+    return m->error[0] ? -1 : 0;
+}
+static void row_bounds(const Row *r, mpq_t lo, mpq_t hi, int *lf, int *hf, mpq_t scratch) {
+    *lf = r->type != 'L';
+    *hf = r->type != 'G';
+    mpq_set(lo, r->rhs);
+    mpq_set(hi, r->rhs);
+    if (r->has_range) {
+        mpq_abs(scratch, r->range);
+        *lf = *hf = 1;
+        if (r->type == 'L' || (r->type == 'E' && mpq_sgn(r->range) < 0))
+            mpq_sub(lo, lo, scratch);
+        else
+            mpq_add(hi, hi, scratch);
+    }
+}
+/* Any rational y gives a safe support-function bound when all selected sides
+ * are finite. Reduced costs are recomputed from original input, never trusted. */
+static int certified_bound(Model *m, mpq_t bound, char message[512]) {
+    mpq_t lo, hi, t;
+    mpq_inits(lo, hi, t, NULL);
+    mpq_set(bound, m->r[m->objective].rhs);
+    if (!m->maximize)
+        mpq_neg(bound, bound);
+    int available = 1;
+    for (size_t i = 0; i < m->nr && available; i++) {
+        Row *r = &m->r[i];
+        int sign = mpq_sgn(r->dual);
+        if (r->type == 'N' || !sign)
+            continue;
+        int lf, hf;
+        row_bounds(r, lo, hi, &lf, &hf, t);
+        if ((sign > 0 && !lf) || (sign < 0 && !hf)) {
+            snprintf(message, 512, "multiplier selects infinite side of row %s", r->name);
+            available = 0;
+            break;
+        }
+        mpq_mul(t, r->dual, sign > 0 ? lo : hi);
+        mpq_add(bound, bound, t);
+    }
+    for (size_t i = 0; i < m->nc && available; i++) {
+        Col *c = &m->c[i];
+        int sign = mpq_sgn(c->residual);
+        if (!sign)
+            continue;
+        if ((sign > 0 && !c->lf) || (sign < 0 && !c->hf)) {
+            snprintf(message, 512, "reduced cost selects infinite side of column %s", c->name);
+            available = 0;
+            break;
+        }
+        mpq_mul(t, c->residual, sign > 0 ? c->lo : c->hi);
+        mpq_add(bound, bound, t);
+    }
+    if (m->maximize)
+        mpq_neg(bound, bound);
+    mpq_clears(lo, hi, t, NULL);
+    return available;
+}
 static void maximum(mpq_t max, const mpq_t a) {
     if (mpq_cmp(a, max) > 0)
         mpq_set(max, a);
@@ -646,23 +803,29 @@ static void json_q(const mpq_t q) {
 }
 int main(int argc, char **argv) {
     if (argc == 2 && !strcmp(argv[1], "--help")) {
-        puts("milpcheck --model FILE [--inspect | --solution FILE --format simple|highs|scip|cbc]\n"
+        puts("milpcheck --model FILE [--inspect | --solution FILE | --dual FILE]\n"
+             "          [--format simple|rational|highs|scip|cbc] [--relax] [--dual FILE]\n"
              "          [--lin-tol DECIMAL] [--int-tol DECIMAL] [--obj-tol DECIMAL] [--exact]\n"
-             "Independent primal feasibility checking; no optimality/infeasibility proof.");
+             "Independent primal and LP-bound checking. Exact matching primal/dual witnesses\n"
+             "can certify optimality; no infeasibility/unboundedness proof is implemented.");
         return 0;
     }
-    const char *model = NULL, *sol = NULL, *format = "simple", *lt = "1e-4", *it = "1e-5",
-               *ot = "1e-4";
-    int inspect = 0;
+    const char *model = NULL, *sol = NULL, *dual = NULL, *format = "simple", *lt = "1e-4",
+               *it = "1e-5", *ot = "1e-4";
+    int inspect = 0, relax = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--inspect"))
             inspect = 1;
+        else if (!strcmp(argv[i], "--relax"))
+            relax = 1;
         else if (!strcmp(argv[i], "--exact"))
             lt = it = ot = "0";
         else if (i + 1 < argc && !strcmp(argv[i], "--model"))
             model = argv[++i];
         else if (i + 1 < argc && !strcmp(argv[i], "--solution"))
             sol = argv[++i];
+        else if (i + 1 < argc && !strcmp(argv[i], "--dual"))
+            dual = argv[++i];
         else if (i + 1 < argc && !strcmp(argv[i], "--format"))
             format = argv[++i];
         else if (i + 1 < argc && !strcmp(argv[i], "--lin-tol"))
@@ -676,115 +839,127 @@ int main(int argc, char **argv) {
             return 64;
         }
     }
-    if (!model || (!inspect && !sol) ||
+    if (!model || (!inspect && !sol && !dual) || (inspect && (sol || dual)) ||
         (strcmp(format, "simple") && strcmp(format, "highs") && strcmp(format, "scip") &&
-         strcmp(format, "cbc"))) {
-        fputs("usage: milpcheck --model FILE [--inspect | --solution FILE --format "
-              "simple|highs|scip|cbc] [--exact]\n",
+         strcmp(format, "cbc") && strcmp(format, "rational"))) {
+        fputs("usage: milpcheck --model FILE [--inspect | --solution FILE | --dual FILE] "
+              "[--format simple|rational|highs|scip|cbc] [--relax] [--dual FILE] [--exact]\n",
               stderr);
         return 64;
     }
     Model m = {0};
     m.objective = SIZE_MAX;
     mpq_init(m.obj);
-    mpq_t lin, integ, objtol, claimed, lo, hi, t, u, maxrow, maxbound, maxint, objerr;
-    mpq_inits(lin, integ, objtol, claimed, lo, hi, t, u, maxrow, maxbound, maxint, objerr, NULL);
+    mpq_t lin, integ, objtol, claimed, lo, hi, t, u, maxrow, maxbound, maxint, objerr, bound;
+    mpq_inits(lin, integ, objtol, claimed, lo, hi, t, u, maxrow, maxbound, maxint, objerr, bound,
+              NULL);
     if (number(lin, lt) || number(integ, it) || number(objtol, ot) || mpq_sgn(lin) < 0 ||
         mpq_sgn(integ) < 0 || mpq_sgn(objtol) < 0)
         fail(&m, "invalid tolerance");
     if (!m.error[0])
         read_mps(&m, model, 0);
-    int exitcode = 0, has_claimed = 0, nosol = 0;
+    if (!m.error[0] && dual)
+        read_dual(&m, dual);
+    int exitcode = 0, has_claimed = 0, nosol = 0, bound_valid = 0;
+    char bound_message[512] = "";
     size_t rb = 0, bb = 0, ib = 0;
-    if (!m.error[0] && !inspect) {
+    if (!m.error[0] && sol)
         nosol = solution(&m, sol, format, claimed, &has_claimed);
-        if (!nosol && !m.error[0])
-            read_mps(&m, model, 1);
-        if (!nosol && !m.error[0]) {
-            for (size_t i = 0; i < m.nc; i++) {
-                Col *c = &m.c[i];
-                mpq_set_ui(t, 0, 1);
-                if (c->lf) {
-                    mpq_sub(u, c->lo, c->value);
-                    maximum(t, u);
-                }
-                if (c->hf) {
-                    mpq_sub(u, c->value, c->hi);
-                    maximum(t, u);
-                }
-                maximum(maxbound, t);
-                if (mpq_cmp(t, lin) > 0)
-                    bb++;
-                if (c->integer) {
-                    mpz_t z;
-                    mpz_init(z);
-                    mpz_fdiv_q(z, mpq_numref(c->value), mpq_denref(c->value));
-                    mpq_set_z(t, z);
-                    mpq_sub(t, c->value, t);
-                    mpq_set_ui(u, 1, 1);
-                    mpq_sub(u, u, t);
-                    if (mpq_cmp(u, t) < 0)
-                        mpq_set(t, u);
-                    maximum(maxint, t);
-                    if (mpq_cmp(t, integ) > 0)
-                        ib++;
-                    mpz_clear(z);
-                }
+    if (!m.error[0] && !inspect && ((!nosol && sol) || dual))
+        read_mps(&m, model, 1);
+    if (!m.error[0] && dual)
+        bound_valid = certified_bound(&m, bound, bound_message);
+    if (!m.error[0] && sol && !nosol) {
+        for (size_t i = 0; i < m.nc; i++) {
+            Col *c = &m.c[i];
+            mpq_set_ui(t, 0, 1);
+            if (c->lf) {
+                mpq_sub(u, c->lo, c->value);
+                maximum(t, u);
             }
-            for (size_t i = 0; i < m.nr; i++) {
-                Row *r = &m.r[i];
-                if (r->type == 'N')
-                    continue;
-                int lf = r->type != 'L', hf = r->type != 'G';
-                mpq_set(lo, r->rhs);
-                mpq_set(hi, r->rhs);
-                if (r->has_range) {
-                    mpq_abs(t, r->range);
-                    lf = hf = 1;
-                    if (r->type == 'L' || (r->type == 'E' && mpq_sgn(r->range) < 0))
-                        mpq_sub(lo, lo, t);
-                    else
-                        mpq_add(hi, hi, t);
-                }
-                mpq_set_ui(t, 0, 1);
-                if (lf) {
-                    mpq_sub(u, lo, r->activity);
-                    maximum(t, u);
-                }
-                if (hf) {
-                    mpq_sub(u, r->activity, hi);
-                    maximum(t, u);
-                }
-                maximum(maxrow, t);
-                if (mpq_cmp(t, lin) > 0)
-                    rb++;
+            if (c->hf) {
+                mpq_sub(u, c->value, c->hi);
+                maximum(t, u);
             }
-            mpq_sub(m.obj, m.r[m.objective].activity, m.r[m.objective].rhs);
-            if (has_claimed) {
-                mpq_sub(objerr, m.obj, claimed);
-                mpq_abs(objerr, objerr);
+            maximum(maxbound, t);
+            if (mpq_cmp(t, lin) > 0)
+                bb++;
+            if (c->integer && !relax) {
+                mpz_t z;
+                mpz_init(z);
+                mpz_fdiv_q(z, mpq_numref(c->value), mpq_denref(c->value));
+                mpq_set_z(t, z);
+                mpq_sub(t, c->value, t);
+                mpq_set_ui(u, 1, 1);
+                mpq_sub(u, u, t);
+                if (mpq_cmp(u, t) < 0)
+                    mpq_set(t, u);
+                maximum(maxint, t);
+                if (mpq_cmp(t, integ) > 0)
+                    ib++;
+                mpz_clear(z);
             }
-            if (rb || bb || ib || (has_claimed && mpq_cmp(objerr, objtol) > 0))
-                exitcode = 1;
         }
+        for (size_t i = 0; i < m.nr; i++) {
+            Row *r = &m.r[i];
+            if (r->type == 'N')
+                continue;
+            int lf, hf;
+            row_bounds(r, lo, hi, &lf, &hf, t);
+            mpq_set_ui(t, 0, 1);
+            if (lf) {
+                mpq_sub(u, lo, r->activity);
+                maximum(t, u);
+            }
+            if (hf) {
+                mpq_sub(u, r->activity, hi);
+                maximum(t, u);
+            }
+            maximum(maxrow, t);
+            if (mpq_cmp(t, lin) > 0)
+                rb++;
+        }
+        mpq_sub(m.obj, m.r[m.objective].activity, m.r[m.objective].rhs);
+        if (has_claimed) {
+            mpq_sub(objerr, m.obj, claimed);
+            mpq_abs(objerr, objerr);
+        }
+        if (rb || bb || ib || (has_claimed && mpq_cmp(objerr, objtol) > 0))
+            exitcode = 1;
     }
     if (m.error[0])
         exitcode = m.unsupported ? 3 : 2;
     else if (nosol)
         exitcode = 4;
+    else if (dual && !sol && !bound_valid)
+        exitcode = 4;
+    int primal_valid = sol && !inspect && !exitcode;
+    int optimal = primal_valid && bound_valid && !mpq_sgn(lin) && !mpq_sgn(integ) &&
+                  !mpq_sgn(objtol) && !mpq_cmp(m.obj, bound);
     printf("{\"schema\":1,\"status\":");
     lab_json_string(stdout, m.error[0] ? (m.unsupported ? "unsupported" : "error")
                             : nosol    ? "no_solution"
                             : inspect  ? "supported"
-                            : exitcode ? "invalid"
-                                       : "valid");
+                            : dual && !sol && !bound_valid ? "unavailable"
+                            : exitcode                     ? "invalid"
+                                                           : "valid");
     printf(",\"message\":");
     lab_json_string(stdout, m.error);
     printf(",\"rows\":%zu,\"columns\":%zu,\"nonzeros\":%zu,\"objective_sense\":\"%s\",\"checked_"
-           "feasible\":%s,\"certifies_optimality\":false",
-           m.nr, m.nc, m.nnz, m.maximize ? "max" : "min", !inspect && !exitcode ? "true" : "false");
+           "feasible\":%s,\"relaxation\":%s,\"certifies_optimality\":%s",
+           m.nr, m.nc, m.nnz, m.maximize ? "max" : "min", primal_valid ? "true" : "false",
+           relax ? "true" : "false", optimal ? "true" : "false");
+    printf(",\"bound_status\":");
+    lab_json_string(stdout, m.error[0] || !dual ? "absent" : bound_valid ? "valid" : "unavailable");
+    printf(",\"bound_direction\":\"%s\",\"certified_bound\":", m.maximize ? "upper" : "lower");
+    if (!m.error[0] && bound_valid)
+        json_q(bound);
+    else
+        printf("null");
+    printf(",\"bound_message\":");
+    lab_json_string(stdout, bound_message);
     printf(",\"objective\":");
-    if (!inspect && !m.error[0] && !nosol)
+    if (sol && !m.error[0] && !nosol)
         json_q(m.obj);
     else
         printf("null");
@@ -806,6 +981,7 @@ int main(int argc, char **argv) {
     json_q(objtol);
     printf("}\n");
     cleanup(&m);
-    mpq_clears(lin, integ, objtol, claimed, lo, hi, t, u, maxrow, maxbound, maxint, objerr, NULL);
+    mpq_clears(lin, integ, objtol, claimed, lo, hi, t, u, maxrow, maxbound, maxint, objerr, bound,
+               NULL);
     return exitcode;
 }

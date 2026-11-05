@@ -22,6 +22,8 @@ def report(root,runs_file='runs.jsonl',prefix='summary'):
           'checked_feasible':sum(x['checker'].get('checked_feasible',False) and x['checker'].get('status')=='valid' for x in runs),
           'invalid_candidates':sum(x['checker'].get('status')=='invalid' for x in runs),
           'checker_errors':sum(x['checker'].get('status') in ('error','unsupported') for x in runs),
+          'certified_lp_bounds':sum(x['checker'].get('bound_status')=='valid' for x in runs),
+          'certified_optima':sum(x['checker'].get('certifies_optimality',False) for x in runs),
           'reached_reference':sum(x['reached_reference'] for x in runs),
           'reference_contradictions':sum(x['reference_contradiction'] for x in runs),
           'total_solver_wall_s':sum(x['wall_s'] for x in runs),'total_checker_wall_s':sum(x['checker_wall_s'] for x in runs),
@@ -29,23 +31,28 @@ def report(root,runs_file='runs.jsonl',prefix='summary'):
     data={'schema':1,'kind':'short-budget pipeline baseline; not a solver ranking','reference_match_policy':'absolute 1e-4 + relative 1e-9 against pinned =opt= reference; not an optimality proof',
           'summary':summary,'contradictions':contradictions,'attempts':len(rows),'instances':len({r['instance'] for r in rows}),'environment':json.loads((root/'environment.json').read_text())}
     data['run_records']=runs_file
+    data['relaxation']=bool(data['environment'].get('relaxation',False))
+    if data['relaxation']:data['kind']='LP relaxation correctness baseline; not a solver ranking'
     if (root/'host.json').exists():data['host']=json.loads((root/'host.json').read_text())
     if any('revalidation' in r for r in rows):data['revalidation']={'checker_sha256':sorted({r['checker_sha256'] for r in rows}),'driver_sha256':sorted({r['revalidation']['driver_sha256'] for r in rows if 'revalidation' in r}),'solver_times_unchanged':True}
     (root/(prefix+'.json')).write_text(json.dumps(data,indent=2)+'\n')
     E=lambda x:html.escape(str(x))
     parts=['<!doctype html><meta charset="utf-8"><title>MILP baseline report</title><style>body{font:16px system-ui;max-width:1200px;margin:40px auto;padding:0 24px;color:#102a43}table{border-collapse:collapse;width:100%;font-size:13px;margin:24px 0}th,td{text-align:left;padding:9px;border-bottom:1px solid #ccd}th{background:#102a43;color:white}tr:nth-child(even){background:#eff5f7}code{overflow-wrap:anywhere}.bad{color:#b22}a{color:#087f8c}</style><h1>MILP baseline report</h1>']
     env=data['environment'];parts.append(f'<p>{data["instances"]} instances, {len(rows)} runs. Requested one thread; seed {env["seed"]}; internal solve limit {env["time_limit_s"]} seconds. Process wall time includes startup, input parsing and output; checking is separate.</p>')
-    parts.append('<p><strong>This short-budget run validates the laboratory. It does not establish a performance ranking or certify optimality.</strong> A checked feasible solution satisfies the original model under the recorded tolerances. Reference agreement is a comparison with versioned metadata.</p>')
+    if data['relaxation']:parts.append('<p><strong>Continuous LP relaxations: integrality is explicitly ignored and suite reference objectives must be LP values.</strong></p>')
+    parts.append('<p><strong>This short-budget run validates the laboratory. It does not establish a performance ranking.</strong> A checked feasible solution satisfies the model under the recorded tolerances. Reference agreement is a comparison with versioned metadata, not a proof. Only an exact matching primal/dual certificate can independently certify optimality.</p>')
     parts.append('<p>The checker requires absolute row/bound tolerance 1e-4, integer tolerance 1e-5, and claimed-objective consistency 1e-4. A rejection can involve feasibility or objective consistency. With large coefficients, a point accepted under solver scaling/tolerances can fail this absolute policy. Such a failure alone does not establish a solver bug.</p>')
     if 'revalidation' in data:parts.append('<p>Independent validation was rerun from retained solution files. Original solver timings and raw run records are unchanged. Each row links to the newer validation record.</p>')
-    parts.append('<table><tr><th>Solver</th><th>Attempts</th><th>Passed checker</th><th>Reached reference</th><th>Invalid candidates</th><th>Checker errors</th><th>Claimed statuses</th><th>Solver wall seconds</th></tr>')
-    for name,s in summary.items():parts.append('<tr>'+''.join(f'<td>{E(x)}</td>' for x in [name,s['attempts'],s['checked_feasible'],s['reached_reference'],s['invalid_candidates'],s['checker_errors'],s['claimed_statuses'],round(s['total_solver_wall_s'],2)])+'</tr>')
+    parts.append('<table><tr><th>Solver</th><th>Attempts</th><th>Passed checker</th><th>Reached reference</th><th>Certified LP bounds</th><th>Certified optima</th><th>Invalid candidates</th><th>Checker errors</th><th>Claimed statuses</th><th>Solver wall seconds</th></tr>')
+    for name,s in summary.items():parts.append('<tr>'+''.join(f'<td>{E(x)}</td>' for x in [name,s['attempts'],s['checked_feasible'],s['reached_reference'],s['certified_lp_bounds'],s['certified_optima'],s['invalid_candidates'],s['checker_errors'],s['claimed_statuses'],round(s['total_solver_wall_s'],2)])+'</tr>')
     parts.append('</table><p>Reference matching: absolute 1e-4 + relative 1e-9, for pinned =opt= records only. No comparisons use a solver unvalidated dual bound as truth. All failures and missing candidates remain in the table.</p>')
-    parts.append('<h2>Individual runs</h2><table><tr><th>Instance</th><th>Solver</th><th>Claimed status</th><th>Checker</th><th>Checked objective</th><th>Reference reached</th><th>Wall seconds</th><th>Evidence</th></tr>')
+    parts.append('<h2>Individual runs</h2><p>Run status includes process failures; solver report preserves the parsed status before process overrides. Raw exits and signals remain in each record.</p><table><tr><th>Instance</th><th>Solver</th><th>Run status</th><th>Solver report</th><th>Checker</th><th>Checked objective</th><th>Certified LP bound</th><th>Reference reached</th><th>Wall seconds</th><th>Evidence</th></tr>')
     for r in details:
         relative_run=f'{r["instance"]}/{r["solver"]}/seed-{r["seed"]}'
-        values=[r['instance'],r['solver'],r['claimed_status'],r['checker']['status'],r['validated_objective_decimal'],r['reached_reference'],round(r['wall_s'],4)]
+        bound=r['checker'].get('certified_bound') if r['checker'].get('bound_status')=='valid' else None
+        values=[r['instance'],r['solver'],r['claimed_status'],r.get('reported_solver_status'),r['checker']['status'],r['validated_objective_decimal'],bound,r['reached_reference'],round(r['wall_s'],4)]
         validation=f' / <a href="{E(relative_run)}/{E(r["revalidation"].get("record","checker-revalidated.json"))}">validation</a>' if 'revalidation' in r else ''
+        if r.get('dual_file'):validation+=f' / <a href="{E(relative_run)}/dual.sol">dual</a>'
         parts.append('<tr>'+''.join(f'<td>{E(x)}</td>' for x in values)+f'<td><a href="{E(relative_run)}/run.json">record</a> / <a href="{E(relative_run)}/solver.log">log</a>{validation}</td></tr>')
     parts.append('</table><h2>Original timed evaluator</h2><pre><code>'+E(json.dumps(env,indent=2))+'</code></pre>')
     if 'revalidation' in data:parts.append('<h2>Final independent validation</h2><pre><code>'+E(json.dumps(data['revalidation'],indent=2))+'</code></pre>')

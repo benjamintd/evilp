@@ -24,4 +24,17 @@ class Report(unittest.TestCase):
             self.assertEqual(data['summary']['cbc']['reference_contradictions'],1)
             self.assertTrue((root/'contract.html').exists())
             self.assertFalse((root/'summary.html').exists())
+    def test_lp_reference_match_is_distinct_from_certificate(self):
+        with tempfile.TemporaryDirectory() as td:
+            root=pathlib.Path(td)
+            r=record('lp','lab','optimal','803/100',True)
+            r['checker'].update({'bound_status':'valid','certified_bound':'8','certifies_optimality':False})
+            (root/'runs.jsonl').write_text(json.dumps(r)+'\n')
+            (root/'environment.json').write_text(json.dumps({'seed':1,'time_limit_s':2,'relaxation':True}))
+            data=report(root)
+            self.assertTrue(data['relaxation'])
+            self.assertEqual(data['summary']['lab']['reached_reference'],1)
+            self.assertEqual(data['summary']['lab']['certified_lp_bounds'],1)
+            self.assertEqual(data['summary']['lab']['certified_optima'],0)
+            self.assertIn('Continuous LP relaxations',(root/'summary.html').read_text())
 unittest.main()
