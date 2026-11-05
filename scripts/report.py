@@ -45,7 +45,7 @@ def report(root,runs_file='runs.jsonl',prefix='summary'):
     for r in details:
         relative_run=f'{r["instance"]}/{r["solver"]}/seed-{r["seed"]}'
         values=[r['instance'],r['solver'],r['claimed_status'],r['checker']['status'],r['validated_objective_decimal'],r['reached_reference'],round(r['wall_s'],4)]
-        validation=f' / <a href="{E(relative_run)}/checker-revalidated.json">validation</a>' if 'revalidation' in r else ''
+        validation=f' / <a href="{E(relative_run)}/{E(r["revalidation"].get("record","checker-revalidated.json"))}">validation</a>' if 'revalidation' in r else ''
         parts.append('<tr>'+''.join(f'<td>{E(x)}</td>' for x in values)+f'<td><a href="{E(relative_run)}/run.json">record</a> / <a href="{E(relative_run)}/solver.log">log</a>{validation}</td></tr>')
     parts.append('</table><h2>Environment and provenance</h2><pre><code>'+E(json.dumps(env,indent=2))+'</code></pre>')
     if 'host' in data:parts.append('<h2>Host and measurement conditions</h2><pre><code>'+E(json.dumps(data['host'],indent=2))+'</code></pre>')

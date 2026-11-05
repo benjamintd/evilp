@@ -65,6 +65,9 @@ python3 scripts/revalidate.py results/my-miplib-pilot --checker build/milpcheck
 python3 scripts/report.py results/my-miplib-pilot --runs revalidated.jsonl --prefix validated
 ~~~
 
+For a subsequent validation version, use --name final-validation and report
+--runs final-validation.jsonl. Previous records remain intact.
+
 Each output directory must be new. Raw run artifacts and JSONL remain available
 even when a solver times out or supplies no solution. Reports link to every log
 and run record. Seed zero is rejected because some solvers interpret it as a
