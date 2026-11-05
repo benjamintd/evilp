@@ -17,6 +17,61 @@ REPLAY = pathlib.Path(__file__).resolve().parents[1] / 'scripts/check_trace_cert
 
 
 class FarkasPipeline(unittest.TestCase):
+    def test_simplified_candidate_end_to_end_with_analytic_contradiction(self):
+        # a+c=1 and b+c=1 imply a=b; the third row requires b-a>=1.
+        # The exact row combination (1/3,-1/10,1,0) has margin one.
+        # Extra fixed rows exercise the large-source candidate path. Which
+        # constructor succeeds may differ across compilers; every emitted
+        # certificate must independently prove the original contradiction.
+        lines = ['NAME SIMPLE_RETRY', 'ROWS', ' N O', ' E R1', ' E R2', ' G R3', ' E R4']
+        lines += [f' E F{i}' for i in range(127)]
+        lines += ['COLUMNS', ' a O 0 R1 3', ' a R3 -1',
+                  ' c O 0 R1 3', ' c R2 10 R4 1',
+                  ' b O 0 R2 10', ' b R3 1', ' w O 0 R4 1']
+        lines += [f' z{i} O 0 F{i} 1' for i in range(127)]
+        lines += ['RHS', ' rhs R1 3 R2 10', ' rhs R3 1', 'BOUNDS',
+                  ' UP box a 2', ' UP box b 2', ' UP box c 2']
+        lines += [f' FX box z{i} 0' for i in range(127)]
+        model = '\n'.join(lines + ['ENDATA', ''])
+        with tempfile.TemporaryDirectory() as td:
+            root = pathlib.Path(td)
+            path, analytic = root/'original.mps', root/'analytic.farkas'
+            path.write_text(model)
+            analytic.write_text('MILPLAB_FARKAS_1\nR1 1/3\nR2 -1/10\nR3 1\n')
+            check = subprocess.run([CHECKER, '--model', str(path), '--farkas', str(analytic)],
+                                   text=True, capture_output=True, timeout=30)
+            self.assertEqual(check.returncode, 0, (check.stdout, check.stderr))
+            self.assertEqual(F(json.loads(check.stdout)['contradiction_margin']), 1)
+            for i, control in enumerate([[], ['--bland-pricing']]):
+                certificate = root/f'candidate-{i}.farkas'
+                p = subprocess.run([SOLVER, str(path), '--relax', '--farkas', str(certificate),
+                                    *control], text=True, capture_output=True, timeout=30)
+                self.assertEqual(p.returncode, 0, (p.stdout, p.stderr))
+                result = json.loads(p.stdout)
+                self.assertEqual(result['status'], 'infeasible', result)
+                self.assertFalse(result['exact_model_available'], result)
+                self.assertEqual(result['source_infeasibilities'], 1, result)
+                self.assertFalse(result['certifies_infeasibility'])
+                if result['source_removed_terms']:
+                    self.assertGreaterEqual(result['source_infeasibility_attempts'], 3, result)
+                check = subprocess.run([CHECKER, '--model', str(path), '--farkas', str(certificate)],
+                                       text=True, capture_output=True, timeout=30)
+                self.assertEqual(check.returncode, 0, (check.stdout, check.stderr))
+                self.assertGreater(F(json.loads(check.stdout)['contradiction_margin']), 0)
+                feasible = root/f'feasible-{i}.mps'
+                feasible.write_text(model.replace('rhs R3 1', 'rhs R3 0'))
+                point = root/f'point-{i}.sol'
+                p = subprocess.run([SOLVER, str(feasible), '--relax', '--solution', str(point),
+                                    *control], text=True, capture_output=True, timeout=30)
+                self.assertEqual(p.returncode, 0, (p.stdout, p.stderr))
+                result = json.loads(p.stdout)
+                self.assertEqual(result['status'], 'optimal', result)
+                self.assertFalse(result['has_farkas_candidate'], result)
+                check = subprocess.run([CHECKER, '--model', str(feasible), '--solution', str(point),
+                                        '--relax', '--exact'], text=True, capture_output=True, timeout=30)
+                self.assertEqual(check.returncode, 0, (check.stdout, check.stderr))
+                self.assertTrue(json.loads(check.stdout)['checked_feasible'])
+
     def test_large_source_enclosure_export_and_typed_trace_margin(self):
         # Original-decimal .1*x>=.3 and .1*x<=.2 contradict each other.
         # Additional fixed rows exceed retained small-model provenance and
