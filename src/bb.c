@@ -5,6 +5,7 @@
 #include "search.h"
 #include "augment.h"
 #include "root_cut.h"
+#include "dive.h"
 #include <math.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -522,6 +523,55 @@ static int repair(Search *s, const LabLpResult *lp, const Node *node) {
     lab_lp_result_free(&fixed);
     return closes_node;
 }
+/* A failed heuristic establishes no node status or bound. Only a candidate
+ * checked against the original model can update the ordinary incumbent. */
+static void root_diving(Search *s, const LabLpResult *lp, const Node *node) {
+    s->result->root_dive_attempts++;
+    if (s->cuts.count && !cut_box_contains(s, &s->cuts, s->lower, s->upper)) {
+        s->result->root_dive_status = "box_mismatch";
+        return;
+    }
+    double seconds = fmin(1, .05 * remaining(s));
+    if (seconds <= 0) {
+        s->result->root_dive_status = "time_limit";
+        return;
+    }
+    LabDiveOptions options = lab_dive_options(seconds);
+    options.cold = s->options->cold;
+    LabDiveResult dive = {0};
+    lab_primal_dive(s->model, &s->lp_model, s->lower, s->upper, lp->primal,
+                    &s->options->lp, &options, &dive);
+    s->result->root_dive_status = lab_dive_status_name(dive.status);
+    s->result->root_dive_lp_solves += dive.lp_solves;
+    s->result->root_dive_iterations += dive.lp_iterations;
+    s->result->root_dive_steps += dive.steps;
+    s->result->root_dive_backtracks += dive.backtracks;
+    s->result->root_dive_elapsed += dive.elapsed;
+    if (dive.primal) {
+        s->result->root_dive_candidates++;
+        double objective;
+        if (!valid_candidate(s, dive.primal, 1, &objective))
+            s->result->root_dive_status = "candidate_rejected";
+        else {
+            long double normalized = score(s, dive.primal);
+            long double delta = s->result->has_primal
+                ? difference(s, dive.primal, s->result->primal) : 0;
+            if (!isfinite(normalized) || !isfinite(delta))
+                s->result->root_dive_status = "objective_comparison_unavailable";
+            else if (!s->result->has_primal || delta < 0) {
+                if (!s->result->primal)
+                    s->result->primal = lab_alloc(s->model->cols, sizeof(double));
+                memcpy(s->result->primal, dive.primal, s->model->cols * sizeof(double));
+                s->result->objective = objective;
+                s->result->has_primal = 1;
+                s->incumbent = normalized;
+                s->result->root_dive_incumbents++;
+                trace(s, node, "incumbent", SIZE_MAX, objective, 1);
+            }
+        }
+    }
+    lab_dive_result_free(&dive);
+}
 static LabSearchChoice branch_variable(Search *s, const double *primal, double tolerance,
                                        size_t *variable) {
     if (!s->options->first_fractional)
@@ -578,6 +628,7 @@ void lab_bb_solve(const LabModel *model, const LabBbOptions *options, LabBbResul
     s.incumbent = INFINITY;
     s.started = lab_now();
     result->root_cut_status = options->no_root_cuts ? "disabled" : "not_attempted";
+    result->root_dive_status = options->no_root_diving ? "disabled" : "not_attempted";
     outcome(&s, "numerical_failure", "MILP search did not complete");
     if (!isfinite(options->time_limit) || !options->node_limit) {
         outcome(&s, "input_error", "Positive finite time and node limits are required");
@@ -788,6 +839,14 @@ node_lp_ready:
                 }
                 goto node_lp_ready;
             }
+        }
+        if (!node->parent && !options->no_root_diving && !result->root_dive_attempts) {
+            int fractional = 0;
+            for (size_t j = 0; j < model->cols; ++j)
+                if (model->integer[j] && fabs(lp.primal[j] - round(lp.primal[j])) > 1e-7)
+                    fractional = 1;
+            if (fractional)
+                root_diving(&s, &lp, node);
         }
         long double normalized = score(&s, lp.primal);
         long double lower = normalized - 1e-7L * (1 + fabsl(normalized));

@@ -39,6 +39,9 @@ entering candidates are excluded.
 The later [source-enclosure record](results/point-source-contracts-v1/summary.json)
 adds an exact point-provenance path for larger models. It preserves rejection
 of uncertain source data and leaves all 240 MIPLIB problems required.
+The bounded [root primal dive](docs/PRIMAL-DIVING.md) uses a separate LP session
+to search for checked incumbents before branching. Its failures establish no
+bound or infeasibility claim; `--no-root-diving` retains the comparison control.
 The [primal recovery comparison](results/primal-recovery-v1/report.html),
 [40-case MILP crosscheck](results/mip-native-v5/summary.json), and
 [MIPLIB smoke report](results/miplib-smoke-2s-v4/runs/summary.html) preserve
