@@ -53,6 +53,8 @@ successful witnesses, numerical failures and capacity limits. The earlier
 
 The [autoresearch protocol](docs/AUTORESEARCH.md) starts only after every MILP
 problem in the existing benchmarks passes. That gate is not yet complete.
+The [current diagnosis and next experiment](docs/DIAGNOSIS.md) prioritize source
+correctness and measured LP bottlenecks before further search features.
 The latest [ten-second full inventory](results/miplib-candidate-10s-v2/inventory.json)
 evaluates `95b7450` and records 239 time limits, one numerical stop, 15
 independently checked incumbents and zero correctly completed instances.
