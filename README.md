@@ -53,12 +53,12 @@ successful witnesses, numerical failures and capacity limits. The earlier
 
 The [autoresearch protocol](docs/AUTORESEARCH.md) starts only after every MILP
 problem in the existing benchmarks passes. That gate is not yet complete.
-The latest [ten-second full inventory](results/miplib-candidate-10s-v1/inventory.json)
-records 232 time limits, four numerical stops, four watchdog stops, 13
+The latest [ten-second full inventory](results/miplib-candidate-10s-v2/inventory.json)
+evaluates `95b7450` and records 239 time limits, one numerical stop, 15
 independently checked incumbents and zero correctly completed instances.
 All 240 attempts and all failures are retained. Concurrent engineering makes
 this development coverage evidence unsuitable for a speed ranking.
-The [gate result](results/miplib-candidate-10s-v1/gate.json) remains closed. The
+The [gate result](results/miplib-candidate-10s-v2/gate.json) remains closed. The
 subsequent performance target is at least 120 strict paired wins against HiGHS
 over the fixed 240-instance denominator under matched conditions.
 

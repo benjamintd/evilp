@@ -48,14 +48,17 @@ distinct; individual LP certificates do not constitute a complete MILP tree proo
 Any budget change creates a fresh declared campaign, preserving earlier results.
 
 The gate is currently **not complete**. The latest frozen
-[ten-second full inventory](../results/miplib-candidate-10s-v1/inventory.json)
-contains one attempt for every locked instance: 232 `time_limit`, four
-`numerical_failure`, four `watchdog_timeout`, 13 independently checked
+[ten-second full inventory](../results/miplib-candidate-10s-v2/inventory.json)
+contains one attempt for every locked instance: 239 `time_limit`, one
+`numerical_failure`, zero `watchdog_timeout`, 15 independently checked
 incumbents and zero correctly completed problems. Its
-[gate record](../results/miplib-candidate-10s-v1/gate.json) has no missing
+[gate record](../results/miplib-candidate-10s-v2/gate.json) has no missing
 instances and leaves both completion and speed gates closed. It evaluates
-`332afbd`, before the later rational reconstruction and root cuts, while
-engineering ran concurrently. The earlier
+`95b7450`, including root cuts and primal diving, while engineering ran
+concurrently. The preceding
+[ten-second v1 inventory](../results/miplib-candidate-10s-v1/inventory.json)
+retains its 232 time limits, four numerical failures, four watchdog stops and
+13 checked incumbents at `332afbd`. The earlier
 [two-second v3 inventory](../results/miplib-candidate-v3/inventory.json) retains
 its 238 time limits, two numerical failures and nine checked incumbents.
 These are coverage and failure evidence, explicitly not comparable timing
