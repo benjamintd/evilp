@@ -104,3 +104,8 @@ add_test(NAME cut_trace_contract COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DI
 add_executable(test_scaled_ratio tests/test_scaled_ratio.c)
 target_link_libraries(test_scaled_ratio PRIVATE lab_lp)
 add_test(NAME source_unit_ratio_contract COMMAND test_scaled_ratio)
+add_executable(source_interval_driver tests/source_interval_driver.c)
+target_link_libraries(source_interval_driver PRIVATE lab_lp)
+add_executable(test_source_getters tests/test_source_getters.c)
+target_link_libraries(test_source_getters PRIVATE lab_lp)
+add_test(NAME source_enclosure_contract COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/test_source_enclosure.py --interval-driver $<TARGET_FILE:source_interval_driver> --getters $<TARGET_FILE:test_source_getters> --producer $<TARGET_FILE:test_root_cut> --checker $<TARGET_FILE:milpcheck>)

@@ -267,7 +267,15 @@ static int abstentions_and_row_cap(void){
     LabModel m;make_model(&m,1,1,a,rl,ru,lo,hi,obj,integer);LabLpOptions o=options();LabLpSession*s=lab_lp_session_create(&m,&o);CHECK(s);LabLpResult r;lab_lp_session_solve(s,&r);CHECK(!strcmp(r.status,"optimal"));
     LabNativeLimits l=limits();LabNativeBatch b={0};CHECK(lab_lp_session_export_native(s,&l,&b)==LAB_NATIVE_NO_ROWS);CHECK(!b.count&&!b.box);
     lab_lp_result_free(&r);lab_lp_session_free(s);lab_model_free(&m);
-    integer[0]=1;make_model(&m,1,1,a,rl,ru,lo,hi,obj,integer);m.parsed_decimal=1;s=lab_lp_session_create(&m,&o);CHECK(s);lab_lp_session_solve(s,&r);CHECK(!strcmp(r.status,"optimal"));CHECK(lab_lp_session_export_native(s,&l,&b)==LAB_NATIVE_SOURCE_UNAVAILABLE);
+    integer[0]=1;make_model(&m,1,1,a,rl,ru,lo,hi,obj,integer);m.parsed_decimal=1;s=lab_lp_session_create(&m,&o);CHECK(s);lab_lp_session_solve(s,&r);CHECK(!strcmp(r.status,"optimal"));CHECK(lab_lp_session_export_native(s,&l,&b)==LAB_NATIVE_OK);lab_native_batch_free(&b);
+    lab_lp_result_free(&r);lab_lp_session_free(s);lab_model_free(&m);
+    /* A proved point enclosure is provenance; a parsed model with neither
+     * exact rationals nor an enclosure must still abstain. */
+    make_model(&m,1,1,a,rl,ru,lo,hi,obj,integer);m.parsed_decimal=1;
+    lab_source_envelope_free(m.envelope);m.envelope=NULL;
+    s=lab_lp_session_create(&m,&o);CHECK(s);lab_lp_session_solve(s,&r);
+    CHECK(!strcmp(r.status,"optimal"));
+    CHECK(lab_lp_session_export_native(s,&l,&b)==LAB_NATIVE_SOURCE_UNAVAILABLE);
     lab_lp_result_free(&r);lab_lp_session_free(s);lab_model_free(&m);
     const double side[]={1},lf[]={-INFINITY},uf[]={INFINITY};make_model(&m,1,1,a,side,side,lf,uf,obj,integer);s=lab_lp_session_create(&m,&o);CHECK(s);lab_lp_session_solve(s,&r);CHECK(!strcmp(r.status,"optimal"));CHECK(lab_lp_session_export_native(s,&l,&b)==LAB_NATIVE_FREE_SPLIT);
     lab_lp_result_free(&r);lab_lp_session_free(s);lab_model_free(&m);

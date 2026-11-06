@@ -118,6 +118,56 @@ const char *lab_native_status_name(LabNativeStatus s) {
 }
 #define NATIVE_TRY(expression) do { status = (expression); if (status != LAB_NATIVE_OK) goto done; } while (0)
 
+static LabNativeStatus native_shift(const Work *w, size_t j, mpq_t q) {
+    if (w->transform[j] == 'F') { mpq_set_ui(q,0,1); return LAB_NATIVE_OK; }
+    return lab_source_exact_column_value(w->model,j,w->transform[j]=='U',w->shift[j],q)
+        ? LAB_NATIVE_SOURCE_UNAVAILABLE : LAB_NATIVE_OK;
+}
+static LabNativeStatus native_basis_value(const Work *w, size_t j, size_t entry, mpq_t q) {
+    const LabModel *m=w->model; const Column *c=&w->a[j]; size_t i=c->row[entry];
+    if (j>=w->structural || w->source_row[i]==SIZE_MAX) { mpq_set_d(q,c->value[entry]); return LAB_NATIVE_OK; }
+    size_t col=w->original[j],source=w->source_row[i],lo=m->col_start[col],hi=m->col_start[col+1];
+    while(lo<hi){size_t mid=lo+(hi-lo)/2;if(m->row_index[mid]<source)lo=mid+1;else hi=mid;}
+    if(lo==m->col_start[col+1]||m->row_index[lo]!=source) return LAB_NATIVE_EXACT_FAILURE;
+    if(lab_source_exact_coefficient(m,lo,q)) return LAB_NATIVE_SOURCE_UNAVAILABLE;
+    mpq_t scale;mpq_init(scale);mpq_set_d(scale,w->sign[j]);mpq_mul(q,q,scale);
+    mpq_set_d(scale,w->row_scale[i]);mpq_mul(q,q,scale);mpq_clear(scale);return LAB_NATIVE_OK;
+}
+static LabNativeStatus native_rhs(const Work *w, NativeGuard *g, mpq_t *rhs) {
+    const LabModel *m=w->model; LabNativeStatus status=LAB_NATIVE_OK;
+    mpq_t *activity=native_qvector(m->rows);if(!activity)return LAB_NATIVE_RESOURCE;
+    mpq_t shift,value,side,scale;mpq_inits(shift,value,side,scale,NULL);
+    for(size_t j=0;j<m->cols;j++) {
+        NATIVE_TRY(native_shift(w,j,shift));
+        for(size_t k=m->col_start[j];k<m->col_start[j+1];k++) {
+            if(lab_source_exact_coefficient(m,k,value)){status=LAB_NATIVE_SOURCE_UNAVAILABLE;goto done;}
+            mpq_mul(value,value,shift);NATIVE_TRY(native_check(g,value,0));
+            mpq_add(activity[m->row_index[k]],activity[m->row_index[k]],value);
+            NATIVE_TRY(native_check(g,activity[m->row_index[k]],0));
+        }
+    }
+    for(size_t i=0;i<w->m;i++) if(w->source_row[i]!=SIZE_MAX) {
+        size_t source=w->source_row[i];
+        if(lab_source_exact_row_bound(m,source,w->row_upper[i],side)){status=LAB_NATIVE_SOURCE_UNAVAILABLE;goto done;}
+        mpq_sub(rhs[i],side,activity[source]);mpq_set_d(scale,w->row_scale[i]);mpq_mul(rhs[i],rhs[i],scale);
+        NATIVE_TRY(native_check(g,rhs[i],0));
+    }
+    for(size_t j=0;j<m->cols;j++) {
+        NATIVE_TRY(native_shift(w,j,shift));
+        for(size_t i=0;i<w->m;i++) {
+            int upper=w->row_id[i]==w->upper_row[j];
+            if(!upper&&w->row_id[i]!=w->lower_row[j])continue;
+            if(lab_source_exact_column_bound(m,j,upper,side)){status=LAB_NATIVE_SOURCE_UNAVAILABLE;goto done;}
+            if(upper)mpq_sub(rhs[i],side,shift);else mpq_sub(rhs[i],shift,side);
+            mpq_set_d(scale,w->equation_scale[i]);mpq_mul(rhs[i],rhs[i],scale);
+            NATIVE_TRY(native_check(g,rhs[i],0));
+        }
+        NATIVE_TRY(native_tick(g));
+    }
+done:
+    mpq_clears(shift,value,side,scale,NULL);native_qfree(activity,m->rows);return status;
+}
+
 static LabNativeStatus native_capture(const Work *w, NativeGuard *g, LabNativeBatch *b) {
     const LabModel *m = w->model;
     LabNativeStatus status = LAB_NATIVE_OK;
@@ -136,8 +186,8 @@ static LabNativeStatus native_capture(const Work *w, NativeGuard *g, LabNativeBa
     for (size_t j = 0; j < m->cols; j++) {
         b->box[j].has_lower = isfinite(m->col_lower[j]);
         b->box[j].has_upper = isfinite(m->col_upper[j]);
-        if (b->box[j].has_lower) exact_column_bound(m, j, 0, b->box[j].lower);
-        if (b->box[j].has_upper) exact_column_bound(m, j, 1, b->box[j].upper);
+        if (b->box[j].has_lower && lab_source_exact_column_bound(m,j,0,b->box[j].lower)) return LAB_NATIVE_SOURCE_UNAVAILABLE;
+        if (b->box[j].has_upper && lab_source_exact_column_bound(m,j,1,b->box[j].upper)) return LAB_NATIVE_SOURCE_UNAVAILABLE;
         NATIVE_TRY(native_check(g, b->box[j].lower, 1));
         NATIVE_TRY(native_check(g, b->box[j].upper, 1));
         if (b->box[j].has_lower && b->box[j].has_upper && mpq_cmp(b->box[j].lower, b->box[j].upper) > 0) {
@@ -147,8 +197,8 @@ static LabNativeStatus native_capture(const Work *w, NativeGuard *g, LabNativeBa
     for (size_t i = 0; i < m->rows; i++) {
         b->source_row_box[i].has_lower = isfinite(m->row_lower[i]);
         b->source_row_box[i].has_upper = isfinite(m->row_upper[i]);
-        if (b->source_row_box[i].has_lower) exact_row_bound(m, i, 0, b->source_row_box[i].lower);
-        if (b->source_row_box[i].has_upper) exact_row_bound(m, i, 1, b->source_row_box[i].upper);
+        if (b->source_row_box[i].has_lower && lab_source_exact_row_bound(m,i,0,b->source_row_box[i].lower)) return LAB_NATIVE_SOURCE_UNAVAILABLE;
+        if (b->source_row_box[i].has_upper && lab_source_exact_row_bound(m,i,1,b->source_row_box[i].upper)) return LAB_NATIVE_SOURCE_UNAVAILABLE;
         NATIVE_TRY(native_check(g, b->source_row_box[i].lower, 1));
         NATIVE_TRY(native_check(g, b->source_row_box[i].upper, 1));
     }
@@ -156,7 +206,7 @@ static LabNativeStatus native_capture(const Work *w, NativeGuard *g, LabNativeBa
     memcpy(b->source_matrix.start, m->col_start, (m->cols + 1) * sizeof(size_t));
     if (m->nnz) memcpy(b->source_matrix.row, m->row_index, m->nnz * sizeof(size_t));
     for (size_t k = 0; k < m->nnz; k++) {
-        exact_coefficient(m, k, b->source_matrix.value[k]);
+        if(lab_source_exact_coefficient(m,k,b->source_matrix.value[k])) return LAB_NATIVE_SOURCE_UNAVAILABLE;
         NATIVE_TRY(native_check(g, b->source_matrix.value[k], 1));
     }
     size_t nnz = 0;
@@ -172,7 +222,7 @@ static LabNativeStatus native_capture(const Work *w, NativeGuard *g, LabNativeBa
         if (!w->artificial[j])
             for (size_t k = 0; k < w->a[j].count; k++) {
                 b->canonical_matrix.row[at] = w->a[j].row[k];
-                if (exact_basis_value(w, j, k, b->canonical_matrix.value[at])) { status = LAB_NATIVE_EXACT_FAILURE; goto done; }
+                NATIVE_TRY(native_basis_value(w,j,k,b->canonical_matrix.value[at]));
                 NATIVE_TRY(native_check(g, b->canonical_matrix.value[at++], 1));
             }
     }
@@ -195,7 +245,7 @@ static LabNativeStatus native_capture(const Work *w, NativeGuard *g, LabNativeBa
         }
     }
     b->basis_matrix.start[w->m] = at;
-    exact_rhs(w, b->rhs);
+    NATIVE_TRY(native_rhs(w,g,b->rhs));
     for (size_t i = 0; i < w->m; i++) NATIVE_TRY(native_check(g, b->rhs[i], 1));
     if (lab_rational_sparse_solve(w->m, b->basis_matrix.start, b->basis_matrix.row,
                                  b->basis_matrix.value, b->rhs, b->basic_values, g->deadline)) {
@@ -249,8 +299,8 @@ static LabNativeStatus native_term(const Work *w, NativeGuard *g, LabNativeTable
         if (w->transform[original] == 'F') { status = LAB_NATIVE_FREE_SPLIT; goto done; }
         term->kind = LAB_NATIVE_VAR; term->index = original;
         term->upper = w->transform[original] == 'U';
-        exact_column_bound(w->model, original, term->upper, term->anchor);
-        exact_shift(w, original, shift);
+        if(lab_source_exact_column_bound(w->model,original,term->upper,term->anchor)){status=LAB_NATIVE_SOURCE_UNAVAILABLE;goto done;}
+        NATIVE_TRY(native_shift(w,original,shift));
         mpq_set_d(scale, fabs(w->sign[j])); mpq_inv(term->canonical_scale, scale);
         if (term->upper) mpq_sub(delta, shift, term->anchor);
         else mpq_sub(delta, term->anchor, shift);
@@ -267,7 +317,7 @@ static LabNativeStatus native_term(const Work *w, NativeGuard *g, LabNativeTable
         mpq_set_d(term->canonical_scale, w->equation_scale[i]);
         if (w->source_row[i] != SIZE_MAX) {
             term->kind = LAB_NATIVE_ROW; term->index = w->source_row[i]; term->upper = w->row_upper[i];
-            exact_row_bound(w->model, term->index, term->upper, term->anchor);
+            if(lab_source_exact_row_bound(w->model,term->index,term->upper,term->anchor)){status=LAB_NATIVE_SOURCE_UNAVAILABLE;goto done;}
         } else {
             term->kind = LAB_NATIVE_BOUND; term->index = SIZE_MAX;
             for (size_t c = 0; c < w->model->cols; c++) {
@@ -276,7 +326,7 @@ static LabNativeStatus native_term(const Work *w, NativeGuard *g, LabNativeTable
                 }
             }
             if (term->index == SIZE_MAX) { status = LAB_NATIVE_EXACT_FAILURE; goto done; }
-            exact_column_bound(w->model, term->index, term->upper, term->anchor);
+            if(lab_source_exact_column_bound(w->model,term->index,term->upper,term->anchor)){status=LAB_NATIVE_SOURCE_UNAVAILABLE;goto done;}
         }
     }
     mpq_mul(term->coefficient, t->signed_basic_scale, alpha);
@@ -390,7 +440,7 @@ static LabNativeStatus native_row(const Work *w, NativeGuard *g, LabNativeBatch 
     if (mpq_cmp(beta, b->basic_values[position])) { status = LAB_NATIVE_IDENTITY_FAILURE; goto done; }
     t->basis_identity_verified = 1;
     mpq_set_d(t->signed_basic_scale, w->sign[t->canonical_basic]);
-    exact_shift(w, t->basic_column, shift);
+    NATIVE_TRY(native_shift(w,t->basic_column,shift));
     mpq_set(t->basic_shift, shift);
     mpq_mul(t->beta, t->signed_basic_scale, beta); mpq_add(t->beta, t->beta, shift);
     for (size_t j = 0; j < w->n; j++) {
@@ -418,8 +468,9 @@ LabNativeStatus lab_lp_session_export_native(LabLpSession *s, const LabNativeLim
         return LAB_NATIVE_STALE;
     const Work *w = &s->work;
     const LabModel *m = &s->model;
-    if (s->options.no_exact || !exact_source(m) || m->rows > 128 || m->cols > 256 || m->nnz > 20000)
-        return LAB_NATIVE_SOURCE_UNAVAILABLE;
+    if (s->options.no_exact || (m->parsed_decimal && !m->exact &&
+        (!m->envelope || !m->envelope->complete))) return LAB_NATIVE_SOURCE_UNAVAILABLE;
+    if (m->rows>16384 || m->cols>16384 || m->nnz>100000) return LAB_NATIVE_RESOURCE;
     if (w->m > limit->max_basis_dimension) return LAB_NATIVE_RESOURCE;
     if (!w->m) return LAB_NATIVE_NO_ROWS;
     for (size_t j = 0; j < m->cols; j++)
@@ -441,7 +492,7 @@ LabNativeStatus lab_lp_session_export_native(LabLpSession *s, const LabNativeLim
         for (size_t p = 0; p < w->m; p++) {
             size_t c = w->basis[p];
             if (c >= w->structural || w->original[c] != j) continue;
-            exact_shift(w, j, shift); mpq_set_d(scale, w->sign[c]);
+            NATIVE_TRY(native_shift(w,j,shift)); mpq_set_d(scale,w->sign[c]);
             mpq_mul(value, scale, result.basic_values[p]); mpq_add(value, value, shift);
             NATIVE_TRY(native_check(&guard, value, 0));
             if (mpz_cmp_ui(mpq_denref(value), 1) == 0) continue;

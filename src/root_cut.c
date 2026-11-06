@@ -140,12 +140,7 @@ static int cut_name(const char *s) {
     return 1;
 }
 
-static void source_row_side(const LabModel *m, size_t i, int upper, mpq_t q) {
-    if (m->exact)
-        mpq_set(q, upper ? m->exact->row_upper[i] : m->exact->row_lower[i]);
-    else
-        mpq_set_d(q, upper ? m->row_upper[i] : m->row_lower[i]);
-}
+static int source_row_side(const LabModel *m,size_t i,int upper,mpq_t q) { return lab_source_exact_row_bound(m,i,upper,q); }
 
 /* The source identity is established by the exporter. Bind its exact matrix
  * and integrality to the caller's original source, and check every original
@@ -153,7 +148,7 @@ static void source_row_side(const LabModel *m, size_t i, int upper, mpq_t q) {
 static LabRootCutStatus bind_source(CutGuard *g, const LabModel *m,
                                    const LabNativeBatch *b) {
     if (m->rows != b->source_rows || m->cols != b->columns ||
-        m->nnz != b->source_matrix.nnz || (m->parsed_decimal && !m->exact) ||
+        m->nnz != b->source_matrix.nnz ||
         !m->col_start || !m->integer || !m->col_name || !m->row_name ||
         !m->row_lower || !m->row_upper ||
         (m->nnz && (!m->row_index || !m->value)))
@@ -178,8 +173,7 @@ static LabRootCutStatus bind_source(CutGuard *g, const LabModel *m,
             status = LAB_ROOT_CUT_SOURCE_UNAVAILABLE;
             goto done;
         }
-        if (m->exact) mpq_set(q, m->exact->value[k]);
-        else mpq_set_d(q, m->value[k]);
+        if(lab_source_exact_coefficient(m,k,q)){status=LAB_ROOT_CUT_SOURCE_UNAVAILABLE;goto done;}
         CUT_TRY(cut_check(g, q));
         if (mpq_cmp(q, b->source_matrix.value[k])) {
             status = LAB_ROOT_CUT_SOURCE_UNAVAILABLE;
@@ -202,7 +196,7 @@ static LabRootCutStatus bind_source(CutGuard *g, const LabModel *m,
                 status = LAB_ROOT_CUT_SOURCE_UNAVAILABLE;
                 goto done;
             }
-            source_row_side(m, term->index, term->upper, q);
+            if(source_row_side(m,term->index,term->upper,q)){status=LAB_ROOT_CUT_SOURCE_UNAVAILABLE;goto done;}
             if (mpq_cmp(q, term->anchor)) {
                 status = LAB_ROOT_CUT_SOURCE_UNAVAILABLE;
                 goto done;
@@ -214,12 +208,12 @@ static LabRootCutStatus bind_source(CutGuard *g, const LabModel *m,
                 status = LAB_ROOT_CUT_SOURCE_UNAVAILABLE;
                 goto done;
             }
-            source_row_side(m, i, 0, q);
+            if(source_row_side(m,i,0,q)){status=LAB_ROOT_CUT_SOURCE_UNAVAILABLE;goto done;}
             if (mpq_cmp(q, b->source_row_box[i].lower)) {
                 status = LAB_ROOT_CUT_SOURCE_UNAVAILABLE;
                 goto done;
             }
-            source_row_side(m, i, 1, q);
+            if(source_row_side(m,i,1,q)){status=LAB_ROOT_CUT_SOURCE_UNAVAILABLE;goto done;}
             if (mpq_cmp(q, b->source_row_box[i].lower)) {
                 status = LAB_ROOT_CUT_SOURCE_UNAVAILABLE;
                 goto done;

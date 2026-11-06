@@ -50,4 +50,11 @@ int lab_exact_nearest(const mpq_t value, double *result);
  * No feasibility tolerance or acceptance policy is applied here. */
 int lab_exact_evaluate(const LabModel *model, const double *x, double *objective,
                        double *max_violation);
+/* Exact accessors preserve initialized out on unavailability. Parsed source
+ * without an MPQ snapshot requires a complete matching point enclosure.
+ * Column values distinct from original source doubles are binary overlays. */
+int lab_source_exact_coefficient(const LabModel *, size_t entry, mpq_t out);
+int lab_source_exact_row_bound(const LabModel *, size_t row, int upper, mpq_t out);
+int lab_source_exact_column_value(const LabModel *, size_t column, int upper, double value, mpq_t out);
+int lab_source_exact_column_bound(const LabModel *, size_t column, int upper, mpq_t out);
 #endif

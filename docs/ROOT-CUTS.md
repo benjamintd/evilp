@@ -61,12 +61,28 @@ full-tree or global optimality proof.
 
 ## Current limits and evidence
 
-The source snapshot is still limited to 128 original rows, 256 columns and
-20,000 coefficient records. Native reconstruction additionally limits basis
-dimension to 1,024 and basis/canonical nonzeros to 100,000, with a bounded exact
-coupled core and rational bit budgets. Only ten locked MIPLIB models meet the
-original source-shape limits. Large or unsupported exact reconstructions
-continue ordinary search without cuts; they do not count as benchmark passes.
+The retained small MPQ snapshot remains limited to 128 original rows, 256
+columns and 20,000 coefficient records. Native reconstruction can also use
+complete matching point source enclosures, bounded to 16,384 source rows and
+columns and 100,000 nonzeros. Every needed coefficient and bound must have
+exact provenance; an uncertain enclosure or stored uncertain zero causes
+abstention. Global primal/objective exact-source eligibility is unchanged.
+
+Decimal/scientific spellings such as `0.5`, `1.0` and `1D3` can have exact
+binary values. The interval reader recognizes those only after bounded rational
+comparison with the binary value; parsing or resource failure retains the old
+outward enclosure. Source getters preserve the output on unavailability and
+distinguish original source bound identities from explicit binary overlays.
+
+Native basis dimension is still limited to 1,024 and basis/canonical nonzeros
+to 100,000, with bounded exact core and bit budgets. Of the 240 locked models,
+69 meet the expanded source arithmetic/shape prerequisites versus ten under
+the original source-shape gate. Only 13 meet the conservative raw standard-row
+bound without free splits; actual presolved basis, exact reconstruction and
+time eligibility remain separate. Two newly admitted development cases,
+`mik-250-20-75-4` and `neos859080`, each emit four independently valid cuts.
+All selected cases still hit limits or numerical stops. Large or unsupported
+exact reconstructions continue search without cuts and remain benchmark failures.
 
 Focused Release and ASAN/UBSAN evidence is retained under
 `work/root-cut-contracts-v1` and `work/gmi-checker-integration-v1`. The engine
@@ -80,6 +96,9 @@ additionally validates search and source-unit pivot recovery together. Its two
 initial full runs each retain a Python 3.9 oracle portability failure; the other
 34 suites pass, and the repaired oracle passes both unchanged engine binaries
 in a targeted rerun. Every tested source file is bound to the final commit.
+The additive [source-enclosure contract record](../results/point-source-contracts-v1/summary.json)
+checks 5,015 intervals against Fraction, large parsed-model cuts, masks, bound
+overlays, absent/incomplete provenance and rejection of uncertain source data.
 
 Controlled packing and parity examples reduce node counts from five to three
 and three to one respectively. Those counts are not MIPLIB speed measurements.

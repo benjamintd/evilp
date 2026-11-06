@@ -65,9 +65,10 @@ const char *lab_native_status_name(LabNativeStatus status);
  * no pivots, caches, metrics, result statuses, input data or bounds change.
  * Initialized out is replaced only by a successful, complete owned batch.
  * Unsupported/limited exact reconstruction is abstention, never a proof.
- * Current bounds: 128 original rows, 256 columns, 20,000 original nonzeros,
+ * Current bounds: 16,384 original rows/columns, 100,000 original nonzeros,
  * 1,024 canonical basis rows, 100,000 basis/canonical nonzeros and four rows.
- * Parsed decimal source requires retained exact provenance; free splits abstain.
+ * Parsed decimal source requires retained rationals or matching complete point
+ * enclosures for every used value. Uncertain data and free splits abstain.
  */
 LabNativeStatus lab_lp_session_export_native(LabLpSession *session,
     const LabNativeLimits *limits, LabNativeBatch *out);

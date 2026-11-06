@@ -36,6 +36,9 @@ the repaired oracle passed both unchanged engine builds in a targeted rerun.
 Source hashes, initial failures and corrective runs are retained. New numerical
 controls require original-unit ratios and refuse false optimality after unsafe
 entering candidates are excluded.
+The later [source-enclosure record](results/point-source-contracts-v1/summary.json)
+adds an exact point-provenance path for larger models. It preserves rejection
+of uncertain source data and leaves all 240 MIPLIB problems required.
 The [primal recovery comparison](results/primal-recovery-v1/report.html),
 [40-case MILP crosscheck](results/mip-native-v5/summary.json), and
 [MIPLIB smoke report](results/miplib-smoke-2s-v4/runs/summary.html) preserve

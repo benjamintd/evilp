@@ -464,6 +464,18 @@ LabInterval lab_source_number_interval(const char *text, double rounded) {
             (unsigned long long)absolute == magnitude)
             return (LabInterval){rounded, rounded};
     }
+    /* Only a successful bounded exact comparison may collapse this interval.
+     * Allocation/parser limits retain the previous outward enclosure. */
+    mpq_t source, binary;
+    mpq_inits(source, binary, NULL);
+    int represented = !lab_exact_decimal(source, text);
+    if (represented) {
+        mpq_set_d(binary, rounded);
+        represented = !mpq_cmp(source, binary);
+    }
+    mpq_clears(source, binary, NULL);
+    if (represented)
+        return (LabInterval){rounded, rounded};
     return (LabInterval){nextafter(rounded, -INFINITY), nextafter(rounded, INFINITY)};
 }
 LabSourceEnvelope *lab_source_envelope_new(size_t rows, size_t cols, size_t nnz) {
@@ -492,4 +504,60 @@ void lab_source_envelope_free(LabSourceEnvelope *s) {
     free(s->col_lower_source);
     free(s->col_upper_source);
     free(s);
+}
+
+/* Exact source accessors never infer a rational from an uncertain enclosure.
+ * A distinct column value is an explicit binary bound/shift overlay. */
+static int source_envelope_valid(const LabModel *m) {
+    const LabSourceEnvelope *s = m->envelope;
+    return s && s->complete && s->rows == m->rows && s->cols == m->cols &&
+        s->nnz == m->nnz && s->value && s->row_lower && s->row_upper &&
+        s->col_lower && s->col_upper && s->col_lower_source && s->col_upper_source;
+}
+static int source_exact_valid(const LabModel *m) {
+    return m->exact && m->exact->rows == m->rows && m->exact->cols == m->cols &&
+        m->exact->nnz == m->nnz;
+}
+static int exact_point(LabInterval side, double value) {
+    return isfinite(value) && side.lower == value && side.upper == value;
+}
+int lab_source_exact_coefficient(const LabModel *m, size_t k, mpq_t out) {
+    if (!m || k >= m->nnz || !isfinite(m->value[k]) || (m->exact && !source_exact_valid(m))) return -1;
+    if (source_exact_valid(m)) mpq_set(out, m->exact->value[k]);
+    else if (!m->parsed_decimal || (source_envelope_valid(m) &&
+             exact_point(m->envelope->value[k], m->value[k]))) mpq_set_d(out, m->value[k]);
+    else return -1;
+    return 0;
+}
+int lab_source_exact_row_bound(const LabModel *m, size_t i, int upper, mpq_t out) {
+    if (!m || i >= m->rows || (upper != 0 && upper != 1) || (m->exact && !source_exact_valid(m))) return -1;
+    double value = upper ? m->row_upper[i] : m->row_lower[i];
+    if (!isfinite(value)) return -1;
+    if (source_exact_valid(m)) mpq_set(out, upper ? m->exact->row_upper[i] : m->exact->row_lower[i]);
+    else if (!m->parsed_decimal || (source_envelope_valid(m) && exact_point(
+        upper ? m->envelope->row_upper[i] : m->envelope->row_lower[i], value))) mpq_set_d(out,value);
+    else return -1;
+    return 0;
+}
+int lab_source_exact_column_value(const LabModel *m, size_t j, int upper,
+                                  double value, mpq_t out) {
+    if (!m || j >= m->cols || (upper != 0 && upper != 1) || !isfinite(value) ||
+        (m->exact && !source_exact_valid(m))) return -1;
+    if (source_exact_valid(m)) {
+        const LabExactModel *e = m->exact;
+        if (value == (upper ? e->col_upper_source[j] : e->col_lower_source[j]))
+            mpq_set(out, upper ? e->col_upper[j] : e->col_lower[j]);
+        else mpq_set_d(out,value);
+    } else if (!m->parsed_decimal) mpq_set_d(out,value);
+    else if (source_envelope_valid(m)) {
+        const LabSourceEnvelope *s = m->envelope;
+        if (value == (upper ? s->col_upper_source[j] : s->col_lower_source[j]) &&
+            !exact_point(upper ? s->col_upper[j] : s->col_lower[j],value)) return -1;
+        mpq_set_d(out,value);
+    } else return -1;
+    return 0;
+}
+int lab_source_exact_column_bound(const LabModel *m, size_t j, int upper, mpq_t out) {
+    if (!m || j >= m->cols) return -1;
+    return lab_source_exact_column_value(m,j,upper,upper ? m->col_upper[j] : m->col_lower[j],out);
 }
