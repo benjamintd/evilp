@@ -74,7 +74,9 @@ class SourceSignRepair(unittest.TestCase):
                 retained = root / 'retained.basis'
                 retained.write_text(f'MILPLAB_BASIS_1 {source_hash} {size} {total_columns} {size}\n' +
                                     ''.join(f'{i} {j}\n' for i, j in enumerate(basis)))
-                arguments = ['--read-basis', str(retained)]
+                # Column IDs in this retained adversarial basis refer to the
+                # explicit-bound representation, independent of the default.
+                arguments = ['--keep-bound-rows', '--read-basis', str(retained)]
             p = subprocess.run([SOLVER, str(path), '--mip' if mip_mode else '--relax',
                                 '--time-limit', '10', '--solution', str(solution),
                                 *arguments, *map(str, extra)], text=True, capture_output=True, timeout=30)

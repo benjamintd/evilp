@@ -99,16 +99,21 @@ class Scalability(unittest.TestCase):
         self.assertLessEqual(result['factor_nnz_peak'], 8 * result['standard_rows'])
         self.assertLessEqual(result['factor_core_peak'], 3)
         self.assertGreater(result['factor_core_peak'], 0)
-        self.assertGreaterEqual(result['singleton_eliminations_peak'], 2 * columns)
+        self.assertGreaterEqual(result['singleton_eliminations_peak'], result['standard_rows'] - 3)
 
     def test_thousands_of_bounds_and_small_coupled_root(self):
-        columns = 2500
+        # Preserve a basis larger than the dense ceiling after implicit lower
+        # rows disappear, and retain the original 2,500-column case separately.
+        columns = 5000
         with tempfile.TemporaryDirectory(prefix='sparse capacity ') as td:
             result = self.invoke(pathlib.Path(td) / 'default', instance(columns), columns)
             self.assert_sparse_core(result, columns)
+            old = self.invoke(pathlib.Path(td) / 'original-explicit', instance(2500), 2500,
+                              extra=['--keep-bound-rows'])
+            self.assert_sparse_core(old, 2500)
 
     def test_updates_reduce_refactors_without_changing_original_optimum(self):
-        columns, active = 2500, 64
+        columns, active = 5000, 64
         model = instance(columns, active)
         with tempfile.TemporaryDirectory(prefix='basis update work ') as td:
             root = pathlib.Path(td)

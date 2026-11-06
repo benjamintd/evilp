@@ -73,7 +73,9 @@ class PrimalRecovery(unittest.TestCase):
                 basis = root / 'retained.basis'
                 digest = hashlib.sha256(path.read_bytes()).hexdigest()
                 basis.write_text(f'MILPLAB_BASIS_1 {digest} 3 7 3\n0 1\n1 2\n2 3\n')
-                basis_arguments = ['--read-basis', str(basis)]
+                # This minimized historical fixture names columns in the
+                # explicit-bound representation. Retain that representation.
+                basis_arguments = ['--keep-bound-rows', '--read-basis', str(basis)]
             p = subprocess.run([SOLVER, str(path), '--relax', '--solution', str(solution),
                                 *basis_arguments, *extra],
                                text=True, capture_output=True, timeout=20)

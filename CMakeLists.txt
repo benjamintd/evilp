@@ -136,3 +136,6 @@ add_test(NAME source_support_contract COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOUR
 add_executable(test_sparse_eta tests/test_sparse_eta.c)
 target_link_libraries(test_sparse_eta PRIVATE lab_lp)
 add_test(NAME sparse_eta_contract COMMAND test_sparse_eta)
+add_executable(implicit_bound_session tests/implicit_bound_session.c)
+target_link_libraries(implicit_bound_session PRIVATE lab_lp)
+add_test(NAME implicit_bound_contract COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/test_implicit_bounds.py --solver $<TARGET_FILE:milpsolve> --checker $<TARGET_FILE:milpcheck> --driver $<TARGET_FILE:implicit_bound_session>)

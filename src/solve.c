@@ -80,7 +80,7 @@ int main(int argc, char **argv) {
              "          [--time-limit SECONDS] [--iteration-limit N] [--max-dimension N]\n"
              "          [--backend sparse|dense]\n"
              "          [--no-scaling] [--no-refinement] [--no-exact] [--bland-ratio]\n"
-             "          [--no-primal-repair] [--no-updates] [--bland-pricing]\n"
+             "          [--no-primal-repair] [--no-updates] [--bland-pricing] [--keep-bound-rows]\n"
              "          LP: [--dual NEW_FILE] [--farkas NEW_FILE] [--basis NEW_FILE] [--read-basis FILE]\n"
              "          MILP: [--node-limit N] [--cold] [--trace NEW_FILE]\n"
              "                [--no-presolve] [--first-fractional] [--no-root-cuts] [--no-root-diving]\n"
@@ -117,6 +117,8 @@ int main(int argc, char **argv) {
             options.no_primal_repair = 1;
         } else if (!strcmp(a, "--no-updates")) {
             options.no_updates = 1;
+        } else if (!strcmp(a, "--keep-bound-rows")) {
+            options.keep_bound_rows = 1;
         } else if (!strcmp(a, "--no-presolve")) {
             no_presolve = 1;
         } else if (!strcmp(a, "--first-fractional")) {
@@ -331,7 +333,7 @@ int main(int argc, char **argv) {
         printf("null");
     printf(
         ",\"rows\":%zu,\"columns\":%zu,\"nonzeros\":%zu,\"standard_rows\":%zu,"
-        "\"standard_columns\":%zu,\"redundant_rows\":%zu,\"iterations\":%zu,"
+        "\"standard_columns\":%zu,\"implicit_bound_rows\":%zu,\"redundant_rows\":%zu,\"iterations\":%zu,"
         "\"refactorizations\":%zu,\"primal_residual\":%.17g,\"dual_residual\":%.17g,"
         "\"solve_wall_s\":%.9g,\"total_wall_s\":%.9g,\"backend\":\"%s\","
         "\"warm_start\":%s,\"dual_iterations\":%zu,\"cold_fallbacks\":%zu,"
@@ -355,7 +357,7 @@ int main(int argc, char **argv) {
         "\"source_pricing_pivots\":%zu,\"source_pricing_completions\":%zu,"
         "\"source_dual_closures\":%zu,\"source_support_scans\":%zu,"
         "\"source_support_binary_paths\":%zu}\n",
-        model.rows, model.cols, model.nnz, r.standard_rows, r.standard_columns, r.redundant_rows,
+        model.rows, model.cols, model.nnz, r.standard_rows, r.standard_columns, r.implicit_bound_rows, r.redundant_rows,
         r.iterations, r.refactorizations, r.primal_residual, r.dual_residual, r.elapsed,
         lab_now() - started, options.dense ? "dense_lu_reference" : "sparse_lu",
         r.warm_start ? "true" : "false", r.dual_iterations, r.cold_fallbacks, r.factor_nnz_peak,

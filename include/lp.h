@@ -12,6 +12,7 @@ typedef struct {
     int no_primal_repair;
     int no_updates;
     int bland_pricing;
+    int keep_bound_rows; /* retain explicit rows for transformed implicit bounds */
 } LabLpOptions;
 typedef struct {
     const char *status;
@@ -19,6 +20,7 @@ typedef struct {
     double *primal, *dual;
     double objective, primal_residual, dual_residual, elapsed;
     size_t iterations, refactorizations, standard_rows, standard_columns, redundant_rows;
+    size_t implicit_bound_rows;
     int has_primal;
     int warm_start;
     size_t dual_iterations, cold_fallbacks, factor_nnz_peak, standard_nnz;

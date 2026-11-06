@@ -1,12 +1,12 @@
 #include "lp.h"
-#include "native_tableau.h"
 #include "common.h"
-#include "linear.h"
 #include "exact.h"
-#include "rational.h"
+#include "farkas_candidate.h"
+#include "linear.h"
+#include "native_tableau.h"
 #include "pivot.h"
 #include "pricing.h"
-#include "farkas_candidate.h"
+#include "rational.h"
 #include <float.h>
 #include <math.h>
 #include <stdint.h>
@@ -34,6 +34,8 @@ typedef struct {
     unsigned char *basic;
     size_t *lower_row, *upper_row;
     unsigned char *transform;
+    unsigned char *implicit_side; /* zero: explicit;1: shifted lower;2: reflected upper */
+    size_t implicit_bound_rows;
     LabLinear linear;
     double *xb, *pi, *cb, *direction, *column;
     size_t scaled_rows, scaled_columns;
@@ -274,23 +276,22 @@ static void exact_coefficient(const LabModel *m, size_t k, mpq_t q) {
 }
 static void exact_column_bound(const LabModel *m, size_t j, int upper, mpq_t q) {
     double current = upper ? m->col_upper[j] : m->col_lower[j];
-    if (m->exact && current == (upper ? m->exact->col_upper_source[j]
-                                      : m->exact->col_lower_source[j]))
+    if (m->exact &&
+        current == (upper ? m->exact->col_upper_source[j] : m->exact->col_lower_source[j]))
         mpq_set(q, upper ? m->exact->col_upper[j] : m->exact->col_lower[j]);
     else
         mpq_set_d(q, current);
 }
 static int exact_source(const LabModel *m) {
-    return m->exact || (!m->parsed_decimal && m->rows <= 128 && m->cols <= 256 &&
-                       m->nnz <= 20000);
+    return m->exact || (!m->parsed_decimal && m->rows <= 128 && m->cols <= 256 && m->nnz <= 20000);
 }
 static void exact_shift(const Work *w, size_t j, mpq_t q) {
     const LabModel *m = w->model;
     int upper = w->transform[j] == 'U';
     if (w->transform[j] == 'F')
         mpq_set_ui(q, 0, 1);
-    else if (m->exact && w->shift[j] == (upper ? m->exact->col_upper_source[j]
-                                              : m->exact->col_lower_source[j]))
+    else if (m->exact &&
+             w->shift[j] == (upper ? m->exact->col_upper_source[j] : m->exact->col_lower_source[j]))
         mpq_set(q, upper ? m->exact->col_upper[j] : m->exact->col_lower[j]);
     else
         mpq_set_d(q, w->shift[j]);
@@ -492,8 +493,7 @@ static int exact_primal(Work *w, double *point) {
     }
     double *candidate = lab_alloc(m->cols, sizeof(double));
     for (size_t j = 0; j < m->cols && valid; j++) {
-        if (lab_exact_nearest(x[j], &candidate[j]) ||
-            (mpq_sgn(x[j]) && candidate[j] == 0))
+        if (lab_exact_nearest(x[j], &candidate[j]) || (mpq_sgn(x[j]) && candidate[j] == 0))
             valid = 0;
     }
     if (valid) {
@@ -511,7 +511,13 @@ static int exact_primal(Work *w, double *point) {
         mpq_clear(x[j]);
     for (size_t i = 0; i < m->rows; i++)
         mpq_clear(activity[i]);
-    free(start); free(row); free(value); free(rhs); free(z); free(x); free(activity);
+    free(start);
+    free(row);
+    free(value);
+    free(rhs);
+    free(z);
+    free(x);
+    free(activity);
     mpq_clears(term, bound, NULL);
     return valid ? 1 : -1;
 }
@@ -522,8 +528,7 @@ static int exact_primal(Work *w, double *point) {
 static int phase_one_certificate(Work *w) {
     const LabModel *m = w->model;
     size_t n = w->m;
-    if (w->options->no_exact || n > LAB_RATIONAL_MAX_DIMENSION ||
-        (m->parsed_decimal && !m->exact))
+    if (w->options->no_exact || n > LAB_RATIONAL_MAX_DIMENSION || (m->parsed_decimal && !m->exact))
         return 0;
     w->result->exact_attempts++;
     double deadline = fmin(w->started + w->options->time_limit, lab_now() + 1);
@@ -646,25 +651,25 @@ static int source_phase_one_certificate(Work *w) {
     w->result->source_infeasibility_attempts++;
     double deadline = fmin(w->started + w->options->time_limit, lab_now() + 1);
     LabFarkasCandidate candidate;
-    int accepted = lab_farkas_candidate(w->model, w->m, w->source_row, w->row_scale,
-                                        w->pi, deadline, &candidate);
+    int accepted = lab_farkas_candidate(w->model, w->m, w->source_row, w->row_scale, w->pi,
+                                        deadline, &candidate);
     if (!accepted && lab_now() < deadline) {
         lab_farkas_candidate_free(&candidate);
         w->result->source_infeasibility_attempts++;
-        accepted = lab_farkas_projected_candidate(w->model, w->m, w->source_row,
-                                                  w->row_scale, w->pi, deadline, &candidate);
+        accepted = lab_farkas_projected_candidate(w->model, w->m, w->source_row, w->row_scale,
+                                                  w->pi, deadline, &candidate);
     }
     if (!accepted && lab_now() < deadline) {
         lab_farkas_candidate_free(&candidate);
         w->result->source_infeasibility_attempts++;
-        accepted = lab_farkas_simplified_candidate(w->model, w->m, w->source_row,
-                                                   w->row_scale, w->pi, deadline, &candidate);
+        accepted = lab_farkas_simplified_candidate(w->model, w->m, w->source_row, w->row_scale,
+                                                   w->pi, deadline, &candidate);
     }
     if (!accepted && lab_now() < deadline) {
         lab_farkas_candidate_free(&candidate);
         w->result->source_infeasibility_attempts++;
-        accepted = lab_farkas_reconstructed_candidate(w->model, w->m, w->source_row,
-                                                      w->row_scale, w->pi, deadline, &candidate);
+        accepted = lab_farkas_reconstructed_candidate(w->model, w->m, w->source_row, w->row_scale,
+                                                      w->pi, deadline, &candidate);
     }
     if (accepted == 1) {
         LabLpResult *r = w->result;
@@ -758,8 +763,7 @@ static int simplex(Work *w, int phase_one) {
             for (size_t k = 0; k < rejected_count; ++k)
                 if (rejected[k] == j)
                     skipped = 1;
-            if (!skipped &&
-                (reduced < -tolerance || (direct_cost < 0 && dot_magnitude == 0)) &&
+            if (!skipped && (reduced < -tolerance || (direct_cost < 0 && dot_magnitude == 0)) &&
                 lab_pricing_consider(&pricing, &choice, j, reduced, 1) < 0) {
                 message(w, "numerical_failure", "Invalid primal pricing candidate");
                 return -1;
@@ -805,11 +809,13 @@ static int simplex(Work *w, int phase_one) {
                         artificial_value += w->xb[i];
                 if (artificial_value > 1e-8) {
                     if (phase_one_certificate(w)) {
-                        message(w, "infeasible", "Exact original-model Farkas contradiction reconstructed");
+                        message(w, "infeasible",
+                                "Exact original-model Farkas contradiction reconstructed");
                         return -1;
                     }
                     if (source_phase_one_certificate(w)) {
-                        message(w, "infeasible", "Strict original-source Farkas contradiction lower bound");
+                        message(w, "infeasible",
+                                "Strict original-source Farkas contradiction lower bound");
                         return -1;
                     }
                     if (budget(w))
@@ -833,8 +839,8 @@ static int simplex(Work *w, int phase_one) {
          * primal error in its own original-variable or original-row units. */
         for (size_t i = 0; i < w->m; ++i)
             w->cb[i] = original_basic_tolerance(w, i);
-        int ratio_status = lab_primal_ratio_scaled(w->m, w->xb, w->direction, w->basis,
-                                                   w->cb, 1, &leaving);
+        int ratio_status =
+            lab_primal_ratio_scaled(w->m, w->xb, w->direction, w->basis, w->cb, 1, &leaving);
         if (ratio_status) {
             if (phase_one || ratio_status < 0) {
                 if (rejected_count < MAX_REJECTED_CANDIDATES) {
@@ -852,8 +858,7 @@ static int simplex(Work *w, int phase_one) {
         }
         size_t alternative = SIZE_MAX;
         if (!w->options->bland_ratio &&
-            lab_primal_ratio_scaled(w->m, w->xb, w->direction, w->basis,
-                                    w->cb, 0, &alternative))
+            lab_primal_ratio_scaled(w->m, w->xb, w->direction, w->basis, w->cb, 0, &alternative))
             alternative = SIZE_MAX;
         size_t old_column = w->basis[leaving];
         size_t accepted_position = leaving;
@@ -1160,6 +1165,19 @@ static int scale_form(Work *w, const LabModel *m) {
     }
     return 0;
 }
+/* Nonnegativity supplies this bound only when source and binary anchors are
+ * identical. Unknown or nonpoint source bounds retain their explicit row. */
+static int implicit_bound(const LabModel *m, size_t j, int upper) {
+    mpq_t source, binary;
+    mpq_inits(source, binary, NULL);
+    double value = upper ? m->col_upper[j] : m->col_lower[j];
+    int known = !lab_source_exact_column_bound(m, j, upper, source);
+    if (known)
+        mpq_set_d(binary, value);
+    int equal = known && !mpq_cmp(source, binary);
+    mpq_clears(source, binary, NULL);
+    return equal;
+}
 static int build(Work *w, const LabModel *m) {
     size_t dim = w->options->max_dimension, nz = 0, nr = 0;
     if (dim > LAB_LP_SPARSE_DIMENSION_LIMIT ||
@@ -1167,6 +1185,7 @@ static int build(Work *w, const LabModel *m) {
         message(w, "unsupported", "Backend dimension ceiling exceeded");
         return -1;
     }
+    w->implicit_side = lab_alloc(m->cols, 1);
     for (size_t j = 0; j < m->cols; j++) {
         if (m->col_lower[j] > m->col_upper[j]) {
             message(w, "infeasible", "Conflicting column bounds");
@@ -1174,8 +1193,13 @@ static int build(Work *w, const LabModel *m) {
         }
         if (m->col_lower[j] == m->col_upper[j])
             continue;
+        int lower = isfinite(m->col_lower[j]), upper = isfinite(m->col_upper[j]);
+        if (!w->options->keep_bound_rows && (lower || upper) && implicit_bound(m, j, !lower)) {
+            w->implicit_side[j] = (unsigned char)(lower ? 1 : 2);
+            w->implicit_bound_rows++;
+        }
         nz += (!isfinite(m->col_lower[j]) && !isfinite(m->col_upper[j])) ? 2U : 1U;
-        nr += (size_t)isfinite(m->col_lower[j]) + (size_t)isfinite(m->col_upper[j]);
+        nr += (size_t)lower + (size_t)upper - (size_t)(w->implicit_side[j] != 0);
     }
     for (size_t i = 0; i < m->rows; i++) {
         if (m->row_lower[i] > m->row_upper[i]) {
@@ -1304,9 +1328,9 @@ static int build(Work *w, const LabModel *m) {
         }
         if (first[j] == SIZE_MAX)
             continue;
-        /* Keep a slack equation for the initially implicit bound as well.
-         * Tightening it changes only RHS; the root transformation stays fixed. */
-        if (isfinite(m->col_lower[j])) {
+        /* An omitted implicit side is carried by z>=0. Warm updates reanchor
+         * that transform and refresh every affected RHS without changing A. */
+        if (isfinite(m->col_lower[j]) && w->implicit_side[j] != 1) {
             w->lower_row[j] = r;
             w->b[r] = 0;
             if (precise_shift) {
@@ -1325,7 +1349,7 @@ static int build(Work *w, const LabModel *m) {
             w->row_id[r] = r;
             r++;
         }
-        if (isfinite(m->col_upper[j])) {
+        if (isfinite(m->col_upper[j]) && w->implicit_side[j] != 2) {
             w->upper_row[j] = r;
             w->b[r] = w->transform[j] == 'U' ? 0 : m->col_upper[j] - w->shift[j];
             if (precise_shift) {
@@ -1484,7 +1508,8 @@ static int recover(Work *w, const LabModel *m, int require_support) {
         if (lab_exact_evaluate(m, r->primal, &r->objective, &r->primal_residual))
             r->primal_residual = DBL_MAX;
         if (!budget(w))
-            message(w, "numerical_failure", "Exact primal reconstruction unavailable or infeasible");
+            message(w, "numerical_failure",
+                    "Exact primal reconstruction unavailable or infeasible");
         return -1;
     }
     long double variation = 0;
@@ -1579,8 +1604,8 @@ static int recover(Work *w, const LabModel *m, int require_support) {
         gap_bad = source_numeric_gap(w, r->primal, r->dual, &source_available);
         if (source_available != 1) {
             double deadline = fmin(w->started + w->options->time_limit, lab_now() + 1);
-            gap_bad = source_support_interval_gap(w, r->primal, r->dual, deadline,
-                                                 &source_available);
+            gap_bad =
+                source_support_interval_gap(w, r->primal, r->dual, deadline, &source_available);
         }
         source_unavailable = source_available != 1;
     }
@@ -1631,6 +1656,7 @@ static void work_free(Work *w) {
     free(w->lower_row);
     free(w->upper_row);
     free(w->transform);
+    free(w->implicit_side);
     free(w->xb);
     free(w->pi);
     free(w->cb);
@@ -1651,7 +1677,8 @@ static int restore_primal(Work *w, const LabModel *m, int require_support) {
             break;
         size_t hinted = source_negative(w);
         if (attempt && hinted == SIZE_MAX) {
-            message(w, "numerical_failure", "Primal restoration has no proven source-negative basic");
+            message(w, "numerical_failure",
+                    "Primal restoration has no proven source-negative basic");
             break;
         }
         if (hinted != SIZE_MAX) {
@@ -1765,8 +1792,8 @@ static int dual_simplex(Work *w, int original_units) {
     int outcome = -1;
     int source_step = original_units && source_negative(w) != SIZE_MAX;
     int source_pivot_done = 0;
-    int factor_ready = !w->options->no_updates && w->linear.valid && w->linear.n == w->m &&
-                       !basis_values(w, 0);
+    int factor_ready =
+        !w->options->no_updates && w->linear.valid && w->linear.n == w->m && !basis_values(w, 0);
     for (;;) {
         if (budget(w) || (!factor_ready && refactor(w, 0)))
             break;
@@ -1930,6 +1957,54 @@ int lab_lp_session_set_bounds(LabLpSession *s, size_t j, double lower, double up
     s->model.col_upper[j] = upper;
     return 0;
 }
+static int anchored_value(double raw, double scale, double *value) {
+    int e = ilogb(fabs(scale));
+    if (scale < 0)
+        raw = -raw;
+    *value = scalbn(raw, e);
+    return !isfinite(raw) || !isfinite(*value) || scalbn(*value, -e) != raw ? -1 : 0;
+}
+static int anchored_rhs(Work *w, const LabModel *m, const size_t *position, double *rhs) {
+    if (exact_source(m)) {
+        mpq_t *source = lab_alloc(w->m, sizeof(mpq_t));
+        for (size_t i = 0; i < w->m; i++)
+            mpq_init(source[i]);
+        exact_rhs(w, source);
+        int bad = 0;
+        for (size_t i = 0; i < w->m; i++) {
+            rhs[i] = mpq_get_d(source[i]);
+            bad |= !isfinite(rhs[i]);
+            mpq_clear(source[i]);
+        }
+        free(source);
+        return bad ? -1 : 0;
+    }
+    long double *activity = lab_alloc(m->rows, sizeof(long double));
+    for (size_t j = 0; j < m->cols; j++)
+        for (size_t k = m->col_start[j]; k < m->col_start[j + 1]; k++)
+            activity[m->row_index[k]] += (long double)m->value[k] * w->shift[j];
+    int bad = 0;
+    for (size_t i = 0; i < w->m && !bad; i++) {
+        if (w->source_row[i] != SIZE_MAX) {
+            size_t row = w->source_row[i];
+            double bound = w->row_upper[i] ? m->row_upper[row] : m->row_lower[row];
+            double raw = (double)((long double)bound - activity[row]);
+            bad = anchored_value(raw, w->row_scale[i], &rhs[i]);
+        }
+    }
+    for (size_t j = 0; j < m->cols && !bad; j++) {
+        if (w->lower_row[j] != SIZE_MAX) {
+            size_t i = position[w->lower_row[j]];
+            bad = anchored_value(w->shift[j] - m->col_lower[j], w->equation_scale[i], &rhs[i]);
+        }
+        if (!bad && w->upper_row[j] != SIZE_MAX) {
+            size_t i = position[w->upper_row[j]];
+            bad = anchored_value(m->col_upper[j] - w->shift[j], w->equation_scale[i], &rhs[i]);
+        }
+    }
+    free(activity);
+    return bad ? -1 : 0;
+}
 static int update_rhs(LabLpSession *s) {
     Work *w = &s->work;
     clear_source_negative(w);
@@ -1939,9 +2014,11 @@ static int update_rhs(LabLpSession *s) {
         if (w->transform[j] == 'X' && (lo != w->shift[j] || hi != w->shift[j]))
             return -1;
         if (w->transform[j] == 'L' &&
-            (!isfinite(lo) || lo < w->shift[j] || (isfinite(hi) != (w->upper_row[j] != SIZE_MAX))))
+            (!isfinite(lo) || (w->implicit_side[j] != 1 && lo < w->shift[j]) ||
+             (isfinite(hi) != (w->upper_row[j] != SIZE_MAX))))
             return -1;
-        if (w->transform[j] == 'U' && (!isfinite(hi) || hi > w->shift[j] || isfinite(lo)))
+        if (w->transform[j] == 'U' &&
+            (!isfinite(hi) || (w->implicit_side[j] != 2 && hi > w->shift[j]) || isfinite(lo)))
             return -1;
         if (w->transform[j] == 'F' && (isfinite(lo) || isfinite(hi)))
             return -1;
@@ -1951,6 +2028,33 @@ static int update_rhs(LabLpSession *s) {
         position[i] = SIZE_MAX;
     for (size_t i = 0; i < w->m; i++)
         position[w->row_id[i]] = i;
+    int reanchor = 0;
+    for (size_t j = 0; j < m->cols; j++) {
+        if ((w->lower_row[j] != SIZE_MAX && position[w->lower_row[j]] == SIZE_MAX) ||
+            (w->upper_row[j] != SIZE_MAX && position[w->upper_row[j]] == SIZE_MAX)) {
+            free(position);
+            return -1;
+        }
+        reanchor |= (w->implicit_side[j] == 1 && w->shift[j] != m->col_lower[j]) ||
+                    (w->implicit_side[j] == 2 && w->shift[j] != m->col_upper[j]);
+    }
+    if (reanchor) {
+        double *previous = lab_alloc(m->cols, sizeof(double));
+        double *rhs = lab_alloc(w->m, sizeof(double));
+        memcpy(previous, w->shift, m->cols * sizeof(double));
+        for (size_t j = 0; j < m->cols; j++)
+            if (w->implicit_side[j])
+                w->shift[j] = w->implicit_side[j] == 1 ? m->col_lower[j] : m->col_upper[j];
+        int bad = anchored_rhs(w, m, position, rhs);
+        if (bad)
+            memcpy(w->shift, previous, m->cols * sizeof(double));
+        else
+            memcpy(w->b, rhs, w->m * sizeof(double));
+        free(previous);
+        free(rhs);
+        free(position);
+        return bad;
+    }
     int bad = 0;
     for (size_t j = 0; j < m->cols; j++) {
         if (w->lower_row[j] != SIZE_MAX) {
@@ -2061,6 +2165,7 @@ void lab_lp_session_solve(LabLpSession *s, LabLpResult *result) {
     (void)cold_solve(w, &s->model);
     s->ready = !strcmp(result->status, "optimal");
 done:
+    result->implicit_bound_rows = w->implicit_bound_rows;
     if (s->ready && result->has_primal && !strcmp(result->status, "optimal")) {
         s->solved_generation = s->bound_generation;
         s->export_ready = 1;
