@@ -45,4 +45,34 @@ their declared iteration/node limits and are not completed benchmark solves.
 All emitted witnesses pass independent original-model checking. The improvement
 is workload-dependent; external host activity was uncontrolled, and three short
 pairs do not establish a general performance ranking. The ten-second MILP
-campaign is recorded separately after all runs terminate.
+campaign is retained in the [final experiment report](../results/sparse-basis-updates-v1/REPORT.md).
+
+The six-model MILP campaign uses three alternating pairs per model. Median
+nodes in ten seconds are:
+
+| Model | Control | Sparse | Outcome |
+| --- | ---: | ---: | --- |
+| sp150x300d | 143 | 381 | time limit |
+| ran14x18-disj-8 | 1 | 1 | time limit in first LP |
+| gen-ip002 | 2,050 | 2,034 | time limit; no clear throughput change |
+| mas76 | 1,233 | 1,534 | time limit |
+| pk1 | 462 | 493 | time limit |
+| glass4 | 441 | 441 | same numerical failure |
+
+Sparse updates find a checked sp150x300d incumbent of 97 in every repetition,
+where the control finds none; the locked optimum is 69. The best mas76
+incumbent also improves. All 27 emitted MILP Lab witnesses pass original-source
+checking, with no watchdogs. Neither variant completes a panel problem.
+
+A posthoc 1,500-node gen-ip002 comparison leaves the implementation unchanged
+and confirms neutral CPU cost: 6.735 s versus 6.733 s, with all non-timing
+fields equal. The HiGHS reference completes sp150x300d at 69. Its other five
+runs hit limits. Its original glass4 file fails the objective-header check;
+the unchanged coordinate values pass a separate point-only check. Both
+records are preserved, and no tolerance is loosened.
+
+The decision is to keep this change. It improves the measured sparse workload
+and preserves the numerical contract, while providing little benefit on some
+models. The next LP investigation should address the remaining formulation
+and degeneracy costs; this experiment does not establish a competitive MILP
+solver or open the full-corpus gate.
