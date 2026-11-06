@@ -271,8 +271,8 @@ static void cancellation_and_source_boxes(const char *checker) {
         "NAME HIDDENCOEF\nROWS\n N O\n G R\nCOLUMNS\n"
         " x O 0 R 10000000000000001\n x R -10000000000000000\n"
         "RHS\n b R 1\nBOUNDS\n FX b x 1\nENDATA\n", path);
-    require(!m.exact && m.envelope && m.value[0] == 0,
-            "lost coefficient uses source envelope rather than false zero");
+    require(m.exact && m.envelope && m.value[0] == 1,
+            "exact coalescing restores the lost source coefficient");
     lab_presolve(&m, NULL, NULL, &opt, &r);
     require(strcmp(r.status, "infeasible") && r.lower[0] <= 1 && r.upper[0] >= 1,
             "zero-coalescing cannot create a false constant contradiction");

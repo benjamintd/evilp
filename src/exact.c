@@ -332,6 +332,7 @@ static int evaluate_binary(const LabModel *m, const double *x, double *objective
     *violation = worst;
     return 0;
 }
+static int evaluate_enclosed_source(const LabModel *,const double *,double *,double *);
 int lab_exact_evaluate(const LabModel *m, const double *x, double *objective,
                        double *max_violation) {
     if (!objective || !max_violation)
@@ -349,6 +350,7 @@ int lab_exact_evaluate(const LabModel *m, const double *x, double *objective,
             m->row_lower[i] == INFINITY || m->row_upper[i] == -INFINITY)
             return -1;
     int failed = m->exact ? evaluate_source(m, x, objective, max_violation)
+                          : m->parsed_decimal ? evaluate_enclosed_source(m,x,objective,max_violation)
                           : evaluate_binary(m, x, objective, max_violation);
     if (failed) {
         *objective = NAN;
@@ -491,12 +493,14 @@ LabSourceEnvelope *lab_source_envelope_new(size_t rows, size_t cols, size_t nnz)
     s->col_lower_source = lab_alloc(cols, sizeof(double));
     s->col_upper_source = lab_alloc(cols, sizeof(double));
     s->complete = 1;
+    s->objective=lab_alloc(cols,sizeof(LabInterval));
     return s;
 }
 void lab_source_envelope_free(LabSourceEnvelope *s) {
     if (!s)
         return;
     free(s->value);
+    free(s->objective);
     free(s->row_lower);
     free(s->row_upper);
     free(s->col_lower);
@@ -514,26 +518,29 @@ static int source_envelope_valid(const LabModel *m) {
         s->nnz == m->nnz && s->value && s->row_lower && s->row_upper &&
         s->col_lower && s->col_upper && s->col_lower_source && s->col_upper_source;
 }
+static const LabExactModel *native_source_snapshot(const LabModel *m) {
+    return m->exact ? m->exact : m->native_exact;
+}
 static int source_exact_valid(const LabModel *m) {
-    return m->exact && m->exact->rows == m->rows && m->exact->cols == m->cols &&
-        m->exact->nnz == m->nnz;
+    const LabExactModel *e=native_source_snapshot(m);
+    return e && e->rows==m->rows && e->cols==m->cols && e->nnz==m->nnz;
 }
 static int exact_point(LabInterval side, double value) {
     return isfinite(value) && side.lower == value && side.upper == value;
 }
 int lab_source_exact_coefficient(const LabModel *m, size_t k, mpq_t out) {
-    if (!m || k >= m->nnz || !isfinite(m->value[k]) || (m->exact && !source_exact_valid(m))) return -1;
-    if (source_exact_valid(m)) mpq_set(out, m->exact->value[k]);
+    if (!m || k >= m->nnz || !isfinite(m->value[k]) || ((m->exact || m->native_exact) && !source_exact_valid(m))) return -1;
+    if (source_exact_valid(m)) mpq_set(out,native_source_snapshot(m)->value[k]);
     else if (!m->parsed_decimal || (source_envelope_valid(m) &&
              exact_point(m->envelope->value[k], m->value[k]))) mpq_set_d(out, m->value[k]);
     else return -1;
     return 0;
 }
 int lab_source_exact_row_bound(const LabModel *m, size_t i, int upper, mpq_t out) {
-    if (!m || i >= m->rows || (upper != 0 && upper != 1) || (m->exact && !source_exact_valid(m))) return -1;
+    if (!m || i >= m->rows || (upper != 0 && upper != 1) || ((m->exact || m->native_exact) && !source_exact_valid(m))) return -1;
     double value = upper ? m->row_upper[i] : m->row_lower[i];
     if (!isfinite(value)) return -1;
-    if (source_exact_valid(m)) mpq_set(out, upper ? m->exact->row_upper[i] : m->exact->row_lower[i]);
+    if (source_exact_valid(m)) mpq_set(out,upper ? native_source_snapshot(m)->row_upper[i] : native_source_snapshot(m)->row_lower[i]);
     else if (!m->parsed_decimal || (source_envelope_valid(m) && exact_point(
         upper ? m->envelope->row_upper[i] : m->envelope->row_lower[i], value))) mpq_set_d(out,value);
     else return -1;
@@ -542,9 +549,9 @@ int lab_source_exact_row_bound(const LabModel *m, size_t i, int upper, mpq_t out
 int lab_source_exact_column_value(const LabModel *m, size_t j, int upper,
                                   double value, mpq_t out) {
     if (!m || j >= m->cols || (upper != 0 && upper != 1) || !isfinite(value) ||
-        (m->exact && !source_exact_valid(m))) return -1;
+        ((m->exact || m->native_exact) && !source_exact_valid(m))) return -1;
     if (source_exact_valid(m)) {
-        const LabExactModel *e = m->exact;
+        const LabExactModel *e = native_source_snapshot(m);
         if (value == (upper ? e->col_upper_source[j] : e->col_lower_source[j]))
             mpq_set(out, upper ? e->col_upper[j] : e->col_lower[j]);
         else mpq_set_d(out,value);
@@ -560,4 +567,186 @@ int lab_source_exact_column_value(const LabModel *m, size_t j, int upper,
 int lab_source_exact_column_bound(const LabModel *m, size_t j, int upper, mpq_t out) {
     if (!m || j >= m->cols) return -1;
     return lab_source_exact_column_value(m,j,upper,upper ? m->col_upper[j] : m->col_lower[j],out);
+}
+
+LabSourceObjective *lab_source_objective_new(size_t cols) {
+    LabSourceObjective *o=lab_alloc(1,sizeof *o);o->cols=cols;
+    o->value=rationals(cols);o->source=lab_alloc(cols,sizeof(double));mpq_init(o->offset);return o;
+}
+void lab_source_objective_free(LabSourceObjective *o) {
+    if(!o)return;free_rationals(o->value,o->cols);free(o->source);mpq_clear(o->offset);free(o);
+}
+int lab_source_exact_objective(const LabModel *m,size_t j,mpq_t out) {
+    if(!m||j>=m->cols||!isfinite(m->objective[j]))return -1;
+    if(m->exact) {
+        if(m->exact->cols!=m->cols)return -1;
+        mpq_set(out,m->exact->objective[j]);return 0;
+    }
+    const LabSourceObjective *o=m->objective_exact;
+    if(o) {
+        if(o->cols!=m->cols||o->source[j]!=m->objective[j])return -1;
+        mpq_set(out,o->value[j]);return 0;
+    }
+    if(!m->parsed_decimal) {mpq_set_d(out,m->objective[j]);return 0;}
+    const LabSourceEnvelope *e=m->envelope;
+    if(e&&e->complete&&e->objective_complete&&e->cols==m->cols&&e->objective&&
+       e->objective[j].lower==m->objective[j]&&e->objective[j].upper==m->objective[j]) {
+        mpq_set_d(out,m->objective[j]);return 0;
+    }
+    return -1;
+}
+int lab_source_exact_offset(const LabModel *m,mpq_t out) {
+    if(!m||!isfinite(m->offset))return -1;
+    if(m->exact){mpq_set(out,m->exact->offset);return 0;}
+    if(m->objective_exact) {
+        if(m->objective_exact->cols!=m->cols||m->objective_exact->offset_source!=m->offset)return -1;
+        mpq_set(out,m->objective_exact->offset);return 0;
+    }
+    if(!m->parsed_decimal){mpq_set_d(out,m->offset);return 0;}
+    const LabSourceEnvelope *e=m->envelope;
+    if(e&&e->complete&&e->objective_complete&&e->offset.lower==m->offset&&e->offset.upper==m->offset) {
+        mpq_set_d(out,m->offset);return 0;
+    }
+    return -1;
+}
+int lab_source_objective_needs_exact(const LabModel *m) {
+    if(!m)return 1;
+    if(!m->parsed_decimal&&!m->exact&&!m->objective_exact)return 0;
+    const LabSourceEnvelope *e=m->envelope;
+    if(e&&e->complete&&e->objective_complete&&e->cols==m->cols&&e->objective) {
+        for(size_t j=0;j<m->cols;j++)if(e->objective[j].lower!=m->objective[j]||e->objective[j].upper!=m->objective[j])return 1;
+        return 0;
+    }
+    if(!m->exact&&!m->objective_exact)return 1;
+    mpq_t q,d;mpq_inits(q,d,NULL);int needed=0;
+    for(size_t j=0;j<m->cols;j++) {
+        if(lab_source_exact_objective(m,j,q)){needed=1;break;}
+        mpq_set_d(d,m->objective[j]);if(mpq_cmp(q,d)){needed=1;break;}
+    }
+    mpq_clears(q,d,NULL);return needed;
+}
+static int source_scalar(const LabModel *m,const double *left,const double *right,double *out) {
+    if(!m||!out||(m->cols&&!left))return -1;
+    int fast=!lab_source_objective_needs_exact(m);
+    if(fast&&!right) {
+        mpq_t q,d;mpq_inits(q,d,NULL);
+        if(lab_source_exact_offset(m,q))fast=0;
+        else {mpq_set_d(d,m->offset);if(mpq_cmp(q,d))fast=0;}
+        mpq_clears(q,d,NULL);
+    }
+    if(fast) {
+        Accumulator total={0};
+        if(!right) {
+            mpq_t offset;mpq_init(offset);int bad=lab_source_exact_offset(m,offset);
+            double d=0;if(!bad)bad=rational_double(offset,&d,0);mpq_clear(offset);
+            if(bad)return -1;total.high=d;
+        }
+        int bad=0;
+        for(size_t j=0;j<m->cols&&!bad;j++) {
+            if(!isfinite(left[j])||(right&&!isfinite(right[j])))return -1;
+            if(right) {
+                double hi,lo;if(two_sum(left[j],-right[j],&hi,&lo))return -1;
+                bad=product(&total,m->objective[j],hi)||product(&total,m->objective[j],lo);
+            } else bad=product(&total,m->objective[j],left[j]);
+        }
+        if(bad)return -1;
+        if(total.error==0){double value=total.high+total.low;if(!isfinite(value))return -1;*out=value==0?0:value;return 0;}
+    }
+    if(m->cols>65536)return -1;
+    mpq_t total,c,x,y,term;mpq_inits(total,c,x,y,term,NULL);int bad=0;
+    if(!right)bad=lab_source_exact_offset(m,total);
+    for(size_t j=0;j<m->cols&&!bad;j++) {
+        if(!isfinite(left[j])||(right&&!isfinite(right[j]))){bad=1;break;}
+        bad=lab_source_exact_objective(m,j,c);if(bad)break;
+        mpq_set_d(x,left[j]);if(right){mpq_set_d(y,right[j]);mpq_sub(x,x,y);}
+        mpq_mul(term,c,x);mpq_add(total,total,term);
+        if(mpz_sizeinbase(mpq_numref(total),2)>16384||mpz_sizeinbase(mpq_denref(total),2)>16384)bad=1;
+    }
+    double value=0;if(!bad)bad=rational_double(total,&value,0);
+    mpq_clears(total,c,x,y,term,NULL);if(bad)return -1;*out=value==0?0:value;return 0;
+}
+int lab_source_objective_value(const LabModel *m,const double *x,double *out) {return source_scalar(m,x,NULL,out);}
+int lab_source_objective_difference(const LabModel *m,const double *x,const double *y,double *out) {
+    if(!y)return -1;return source_scalar(m,x,y,out);
+}
+
+/* Evaluate all source enclosures first. Only ambiguous row scalars are rebuilt
+ * exactly, within the independently bounded native source budget. This never
+ * changes the global exact-basis eligibility or acceptance tolerances. */
+static double row_enclosure_violation(const LabModel *m,size_t i,LabInterval activity) {
+    const LabSourceEnvelope *e=m->envelope;
+    double worst=0;
+    if(isfinite(m->row_lower[i]))worst=fmax(worst,lab_interval_subtract(e->row_lower[i],activity).upper);
+    if(isfinite(m->row_upper[i]))worst=fmax(worst,lab_interval_subtract(activity,e->row_upper[i]).upper);
+    return worst;
+}
+static int scalar_bits_fit(const mpq_t q) {
+    return mpz_sizeinbase(mpq_numref(q),2)<=16384 && mpz_sizeinbase(mpq_denref(q),2)<=16384;
+}
+static int evaluate_enclosed_source(const LabModel *m,const double *x,double *objective,double *violation) {
+    if(fegetround()!=FE_TONEAREST||!source_envelope_valid(m))return -1;
+    const LabSourceEnvelope *e=m->envelope;
+    Accumulator *binary=lab_alloc(m->rows,sizeof *binary);
+    LabInterval *uncertainty=lab_alloc(m->rows,sizeof *uncertainty);
+    double *row_worst=lab_alloc(m->rows,sizeof *row_worst);
+    size_t *selected=lab_alloc(m->rows,sizeof *selected);
+    double worst=0;int bad=0;size_t count=0;
+    mpq_t bound,point,term;mpq_inits(bound,point,term,NULL);
+    for(size_t j=0;j<m->cols&&!bad;j++) {
+        LabInterval value={x[j],x[j]};
+        for(int upper=0;upper<2;upper++) {
+            double side=upper?m->col_upper[j]:m->col_lower[j];if(!isfinite(side))continue;
+            LabInterval source=upper?e->col_upper[j]:e->col_lower[j];
+            if(side!=(upper?e->col_upper_source[j]:e->col_lower_source[j]))source=(LabInterval){side,side};
+            double error=(upper?lab_interval_subtract(value,source):lab_interval_subtract(source,value)).upper;
+            if(error>1e-12&&!lab_source_exact_column_bound(m,j,upper,bound)) {
+                mpq_set_d(point,x[j]);if(upper)mpq_sub(term,point,bound);else mpq_sub(term,bound,point);
+                if(mpq_sgn(term)<=0)error=0;else if(rational_double(term,&error,1))bad=1;
+            }
+            worst=fmax(worst,error);
+        }
+        for(size_t k=m->col_start[j];k<m->col_start[j+1]&&!bad;k++) {
+            size_t i=m->row_index[k];if(i>=m->rows){bad=1;break;}
+            if(!isfinite(m->row_lower[i])&&!isfinite(m->row_upper[i]))continue;
+            bad=product(&binary[i],m->value[k],x[j]);
+            LabInterval delta=lab_interval_subtract(e->value[k],(LabInterval){m->value[k],m->value[k]});
+            uncertainty[i]=lab_interval_add(uncertainty[i],lab_interval_multiply(delta,value));
+        }
+    }
+    for(size_t i=0;i<m->rows&&!bad;i++) {
+        selected[i]=SIZE_MAX;
+        if(!isfinite(m->row_lower[i])&&!isfinite(m->row_upper[i]))continue;
+        double lo,hi;bad=enclosure(&binary[i],&lo,&hi);if(bad)break;
+        LabInterval activity=lab_interval_add((LabInterval){lo,hi},uncertainty[i]);
+        row_worst[i]=row_enclosure_violation(m,i,activity);
+        if(row_worst[i]>1e-12&&count<2048)selected[i]=count++;
+    }
+    mpq_t *activity=rationals(count);unsigned char *known=lab_alloc(count,sizeof *known);
+    memset(known,1,count);size_t terms=0;
+    for(size_t j=0;j<m->cols&&!bad;j++) {
+        if(x[j]==0)continue;mpq_set_d(point,x[j]);
+        for(size_t k=m->col_start[j];k<m->col_start[j+1];k++) {
+            size_t r=selected[m->row_index[k]];if(r==SIZE_MAX||!known[r])continue;
+            if(terms++>=100000||lab_source_exact_coefficient(m,k,term)){known[r]=0;continue;}
+            mpq_mul(term,term,point);mpq_add(activity[r],activity[r],term);
+            if(!scalar_bits_fit(activity[r]))known[r]=0;
+        }
+    }
+    for(size_t i=0;i<m->rows&&!bad;i++) {
+        size_t r=selected[i];
+        if(r!=SIZE_MAX&&known[r]) {
+            mpq_set_ui(point,0,1);int available=1;
+            for(int upper=0;upper<2;upper++) {
+                double side=upper?m->row_upper[i]:m->row_lower[i];if(!isfinite(side))continue;
+                if(lab_source_exact_row_bound(m,i,upper,bound)){available=0;break;}
+                if(upper)mpq_sub(term,activity[r],bound);else mpq_sub(term,bound,activity[r]);
+                larger(point,term);
+            }
+            if(available&&rational_double(point,&row_worst[i],1))bad=1;
+        }
+        worst=fmax(worst,row_worst[i]);
+    }
+    if(!bad)bad=!isfinite(worst)||lab_source_objective_value(m,x,objective);
+    free_rationals(activity,count);free(known);free(binary);free(uncertainty);free(row_worst);free(selected);
+    mpq_clears(bound,point,term,NULL);if(bad)return -1;*violation=worst;return 0;
 }

@@ -88,13 +88,11 @@ static void bounds(Search *s, const Node *node) {
 static double remaining(const Search *s) {
     return s->options->time_limit - (lab_now() - s->started);
 }
-static void current_bound(const Search *s, size_t j, double value, int upper, mpq_t q) {
-    const LabExactModel *e = s->model->exact;
-    if (e && value == (upper ? e->col_upper_source[j] : e->col_lower_source[j]))
-        mpq_set(q, upper ? e->col_upper[j] : e->col_lower[j]);
-    else
-        mpq_set_d(q, value);
+static void current_bound(const Search *s,size_t j,double value,int upper,mpq_t q) {
+    if (lab_source_exact_column_value(s->model,j,upper,value,q))
+        mpq_set_d(q,value);
 }
+
 /* Every active cut is conditional on the exported root box. Verify this
  * premise in exact source units for node and fixed-integer repair LPs. */
 static int cut_box_contains(const Search *s, const LabRootCutBatch *cuts,
@@ -130,16 +128,16 @@ static int cut_box_contains(const Search *s, const LabRootCutBatch *cuts,
  * Constant objective offsets and large fixed-variable contributions must not
  * hide a smaller but material change in the integer assignment. */
 static long double score(const Search *s, const double *point) {
-    long double value = 0;
-    for (size_t j = 0; j < s->model->cols; j++)
-        value += (long double)s->model->objective[j] * ((long double)point[j] - s->reference[j]);
-    return s->sense * value;
+    double value;
+    if (lab_source_objective_difference(s->model, point, s->reference, &value))
+        return NAN;
+    return s->sense * (long double)value;
 }
 static long double difference(const Search *s, const double *left, const double *right) {
-    long double value = 0;
-    for (size_t j = 0; j < s->model->cols; j++)
-        value += (long double)s->model->objective[j] * ((long double)left[j] - right[j]);
-    return s->sense * value;
+    double value;
+    if (lab_source_objective_difference(s->model, left, right, &value))
+        return NAN;
+    return s->sense * (long double)value;
 }
 static void trace(Search *s, const Node *node, const char *event, size_t variable, double value,
                   int finite) {
@@ -243,6 +241,12 @@ static int call_lp(Search *s, const double *lower, const double *upper, LabLpRes
     s->result->primal_short_steps += lp->primal_short_steps;
     s->result->pricing_bland_fallbacks += lp->pricing_bland_fallbacks;
     s->result->primal_candidate_rejections += lp->primal_candidate_rejections;
+    s->result->source_pricing_attempts += lp->source_pricing_attempts;
+    s->result->source_pricing_pivots += lp->source_pricing_pivots;
+    s->result->source_pricing_completions += lp->source_pricing_completions;
+    s->result->source_dual_closures += lp->source_dual_closures;
+    s->result->source_support_scans += lp->source_support_scans;
+    s->result->source_support_binary_paths += lp->source_support_binary_paths;
     s->result->primal_repairs += lp->primal_repairs;
     s->result->primal_repair_iterations += lp->primal_repair_iterations;
     s->result->exact_primal_attempts += lp->exact_primal_attempts;
@@ -298,11 +302,7 @@ static int call_lp(Search *s, const double *lower, const double *upper, LabLpRes
                 if (!isfinite(v))
                     fputs("null", s->trace);
                 else {
-                    const LabExactModel *e = s->model->exact;
-                    if (e && v == (side ? e->col_upper_source[j] : e->col_lower_source[j]))
-                        mpq_set(q, side ? e->col_upper[j] : e->col_lower[j]);
-                    else
-                        mpq_set_d(q, v);
+                    current_bound(s,j,v,side,q);
                     char *text = mpq_get_str(NULL, 10, q);
                     lab_json_string(s->trace, text);
                     free(text);
@@ -718,7 +718,6 @@ void lab_bb_solve(const LabModel *model, const LabBbOptions *options, LabBbResul
     }
     s.lp_model.col_lower = s.base_lower;
     s.lp_model.col_upper = s.base_upper;
-    s.constant = model->offset;
     for (size_t j = 0; j < n; j++) {
         double lo = s.base_lower[j], hi = s.base_upper[j];
         if (model->integer[j] &&
@@ -728,8 +727,13 @@ void lab_bb_solve(const LabModel *model, const LabBbOptions *options, LabBbResul
             goto cleanup;
         }
         s.reference[j] = isfinite(lo) ? lo : isfinite(hi) ? hi : 0;
-        s.constant += (long double)model->objective[j] * s.reference[j];
     }
+    double source_constant;
+    if (lab_source_objective_value(model, s.reference, &source_constant)) {
+        outcome(&s, "numerical_failure", "Source objective reference unavailable");
+        goto cleanup;
+    }
+    s.constant = source_constant;
     if (!options->first_fractional)
         (void)lab_search_init(&s.branching, n); /* allocation failure keeps deterministic fallback */
 #ifdef LAB_LP_SESSION_API

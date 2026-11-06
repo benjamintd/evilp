@@ -9,6 +9,9 @@
 #define CHECK(c) do{if(!(c)){fprintf(stderr,"getter control %d: %s\n",__LINE__,#c);return 1;}}while(0)
 int main(int argc,char **argv){
  CHECK(argc==3);LabModel m={0};CHECK(!lab_model_read(&m,argv[1]));CHECK(!m.exact&&m.parsed_decimal&&m.rows==200&&m.cols==300);
+ /* These controls intentionally exercise point-only provenance. Native-only
+  * rational coverage is validated separately against the original source. */
+ lab_exact_model_free(m.native_exact);m.native_exact=NULL;
  mpq_t q;mpq_init(q);CHECK(!lab_source_exact_coefficient(&m,0,q)&&mpq_cmp_ui(q,2,1)==0);
  mpq_set_ui(q,42,1);m.envelope->complete=0;CHECK(lab_source_exact_coefficient(&m,0,q)&&mpq_cmp_ui(q,42,1)==0);m.envelope->complete=1;
  LabInterval saved=m.envelope->value[0];m.envelope->value[0].upper=nextafter(2,INFINITY);CHECK(lab_source_exact_coefficient(&m,0,q)&&mpq_cmp_ui(q,42,1)==0);m.envelope->value[0]=saved;

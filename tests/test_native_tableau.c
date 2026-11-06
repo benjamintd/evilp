@@ -44,10 +44,11 @@ static void make_model(LabModel *m,size_t rows,size_t cols,const double *a,
         m->envelope->row_lower[i]=(LabInterval){rl[i],rl[i]};m->envelope->row_upper[i]=(LabInterval){ru[i],ru[i]};
     }
     for(size_t j=0;j<cols;j++){
+        m->envelope->objective[j]=(LabInterval){obj[j],obj[j]};
         m->envelope->col_lower[j]=(LabInterval){lo[j],lo[j]};m->envelope->col_upper[j]=(LabInterval){hi[j],hi[j]};
         m->envelope->col_lower_source[j]=lo[j];m->envelope->col_upper_source[j]=hi[j];
     }
-    m->envelope->complete=1;
+    m->envelope->complete=1;m->envelope->objective_complete=1;
 }
 static void promote_exact(LabModel *m) {
     m->exact=lab_exact_model_new(m->rows,m->cols,m->nnz);m->parsed_decimal=1;
@@ -272,9 +273,10 @@ static int abstentions_and_row_cap(void){
     /* A proved point enclosure is provenance; a parsed model with neither
      * exact rationals nor an enclosure must still abstain. */
     make_model(&m,1,1,a,rl,ru,lo,hi,obj,integer);m.parsed_decimal=1;
-    lab_source_envelope_free(m.envelope);m.envelope=NULL;
-    s=lab_lp_session_create(&m,&o);CHECK(s);lab_lp_session_solve(s,&r);
-    CHECK(!strcmp(r.status,"optimal"));
+    s=lab_lp_session_create(&m,&o);CHECK(s);lab_lp_session_solve(s,&r);CHECK(!strcmp(r.status,"optimal"));
+    /* Retain borrowed storage but invalidate its provenance after the solved
+     * fixture: export must not infer source data from the numerical matrix. */
+    m.envelope->complete=0;
     CHECK(lab_lp_session_export_native(s,&l,&b)==LAB_NATIVE_SOURCE_UNAVAILABLE);
     lab_lp_result_free(&r);lab_lp_session_free(s);lab_model_free(&m);
     const double side[]={1},lf[]={-INFINITY},uf[]={INFINITY};make_model(&m,1,1,a,side,side,lf,uf,obj,integer);s=lab_lp_session_create(&m,&o);CHECK(s);lab_lp_session_solve(s,&r);CHECK(!strcmp(r.status,"optimal"));CHECK(lab_lp_session_export_native(s,&l,&b)==LAB_NATIVE_FREE_SPLIT);

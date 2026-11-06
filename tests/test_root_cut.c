@@ -1,4 +1,5 @@
 #include "root_cut.h"
+#include "exact.h"
 #include "common.h"
 #include <math.h>
 #include <stdio.h>
@@ -13,6 +14,12 @@ int main(int argc, char **argv) {
     if (argc < 3 || argc > 8) return 64;
     LabModel model = {0};
     CHECK(!lab_model_read(&model, argv[1]));
+    /* Component controls may deliberately remove native-only provenance to
+     * keep exercising the independent point-envelope fallback contracts. */
+    if (getenv("LAB_TEST_POINT_SOURCE_ONLY")) {
+        lab_exact_model_free(model.native_exact);
+        model.native_exact=NULL;
+    }
     LabLpOptions options = {.time_limit=30,.iteration_limit=10000,.max_dimension=4096};
     if (argc >= 4) options.dense = atoi(argv[3]);
     if (argc >= 5) options.no_scaling = atoi(argv[4]);
@@ -52,7 +59,7 @@ int main(int argc, char **argv) {
             double *values=malloc(model.nnz*sizeof *values);CHECK(values);
             memcpy(values,model.value,model.nnz*sizeof *values);
             values[0]=nextafter(values[0],INFINITY);other=model;
-            other.value=values;other.exact=NULL;other.parsed_decimal=0;
+            other.value=values;other.exact=NULL;other.native_exact=NULL;other.parsed_decimal=0;
             CHECK(lab_root_cut_derive(session,&other,&limits,&batch)==LAB_ROOT_CUT_SOURCE_UNAVAILABLE);
             CHECK(!memcmp(&saved,&batch,sizeof batch));free(values);controls++;
         }

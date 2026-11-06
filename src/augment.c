@@ -30,6 +30,11 @@ static int valid_base(const LabModel *m) {
     const LabExactModel *e = m->exact;
     if (e && (e->rows != m->rows || e->cols != m->cols || e->nnz != m->nnz))
         return 0;
+    const LabExactModel *native=m->native_exact;
+    if(native && (native->rows!=m->rows || native->cols!=m->cols || native->nnz!=m->nnz))
+        return 0;
+    const LabSourceObjective *o=m->objective_exact;
+    if(o && (o->cols!=m->cols || (m->cols&&(!o->value||!o->source))))return 0;
     const LabSourceEnvelope *s = m->envelope;
     if (s && (s->rows != m->rows || s->cols != m->cols || s->nnz != m->nnz))
         return 0;
@@ -56,7 +61,19 @@ static void copy_column_metadata(const LabModel *base, LabModel *m) {
             m->exact->col_lower_source[j] = base->exact->col_lower_source[j];
             m->exact->col_upper_source[j] = base->exact->col_upper_source[j];
         }
+        if(m->native_exact) {
+            mpq_set(m->native_exact->col_lower[j],base->native_exact->col_lower[j]);
+            mpq_set(m->native_exact->col_upper[j],base->native_exact->col_upper[j]);
+            mpq_set(m->native_exact->objective[j],base->native_exact->objective[j]);
+            m->native_exact->col_lower_source[j]=base->native_exact->col_lower_source[j];
+            m->native_exact->col_upper_source[j]=base->native_exact->col_upper_source[j];
+        }
+        if(m->objective_exact){
+            mpq_set(m->objective_exact->value[j],base->objective_exact->value[j]);
+            m->objective_exact->source[j]=base->objective_exact->source[j];
+        }
         if (m->envelope) {
+            m->envelope->objective[j]=base->envelope->objective[j];
             m->envelope->col_lower[j] = base->envelope->col_lower[j];
             m->envelope->col_upper[j] = base->envelope->col_upper[j];
             m->envelope->col_lower_source[j] = base->envelope->col_lower_source[j];
@@ -114,9 +131,20 @@ LabAugmentStatus lab_model_append_rows(const LabModel *base, size_t count,
         m.exact = lab_exact_model_new(m.rows, m.cols, m.nnz);
         mpq_set(m.exact->offset, base->exact->offset);
     }
+    if(base->native_exact) {
+        m.native_exact=lab_exact_model_new(m.rows,m.cols,m.nnz);
+        mpq_set(m.native_exact->offset,base->native_exact->offset);
+    }
+    if(base->objective_exact){
+        m.objective_exact=lab_source_objective_new(m.cols);
+        mpq_set(m.objective_exact->offset,base->objective_exact->offset);
+        m.objective_exact->offset_source=base->objective_exact->offset_source;
+    }
     if (base->envelope) {
         m.envelope = lab_source_envelope_new(m.rows, m.cols, m.nnz);
         m.envelope->complete = base->envelope->complete;
+        m.envelope->objective_complete=base->envelope->objective_complete;
+        m.envelope->offset=base->envelope->offset;
     }
     copy_column_metadata(base, &m);
     for (size_t i = 0; i < m.rows; i++) {
@@ -136,6 +164,15 @@ LabAugmentStatus lab_model_append_rows(const LabModel *base, size_t count,
                     mpq_set_d(m.exact->row_upper[i], m.row_upper[i]);
             }
         }
+        if(m.native_exact) {
+            if(original) {
+                mpq_set(m.native_exact->row_lower[i],base->native_exact->row_lower[i]);
+                mpq_set(m.native_exact->row_upper[i],base->native_exact->row_upper[i]);
+            } else {
+                if(isfinite(m.row_lower[i]))mpq_set_d(m.native_exact->row_lower[i],m.row_lower[i]);
+                if(isfinite(m.row_upper[i]))mpq_set_d(m.native_exact->row_upper[i],m.row_upper[i]);
+            }
+        }
         if (m.envelope) {
             m.envelope->row_lower[i] = original ? base->envelope->row_lower[i]
                 : (LabInterval){m.row_lower[i], m.row_lower[i]};
@@ -151,6 +188,8 @@ LabAugmentStatus lab_model_append_rows(const LabModel *base, size_t count,
             m.value[next] = base->value[k];
             if (m.exact)
                 mpq_set(m.exact->value[next], base->exact->value[k]);
+            if(m.native_exact)
+                mpq_set(m.native_exact->value[next],base->native_exact->value[k]);
             if (m.envelope)
                 m.envelope->value[next] = base->envelope->value[k];
         }
@@ -162,6 +201,8 @@ LabAugmentStatus lab_model_append_rows(const LabModel *base, size_t count,
             m.value[next] = value;
             if (m.exact)
                 mpq_set_d(m.exact->value[next], value);
+            if(m.native_exact)
+                mpq_set_d(m.native_exact->value[next],value);
             if (m.envelope)
                 m.envelope->value[next] = (LabInterval){value, value};
             next++;

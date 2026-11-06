@@ -702,6 +702,8 @@ static int record_pricing_result(Work *w, LabPricing *pricing, LabPricingPending
 /* 0 optimum, 1 unbounded, -1 explicit failure/limit. Unit-aware leaving
  * choices must validate before acceptance. Unsafe entering candidates can be
  * excluded for this basis only; exhausting them never establishes optimality. */
+#include "source_pricing.inc"
+#include "source_support.inc"
 static int simplex(Work *w, int phase_one) {
     enum { MAX_REJECTED_CANDIDATES = 32 };
     size_t rejected[MAX_REJECTED_CANDIDATES], rejected_count = 0;
@@ -709,6 +711,9 @@ static int simplex(Work *w, int phase_one) {
     LabPricingPending pending = {0};
     lab_pricing_begin(&pricing, w->options->bland_pricing);
     int factor_ready = 0;
+    int source_risk = -1;
+    size_t source_pivots = 0;
+    double source_deadline = 0;
     for (;;) {
         /* Count only a validated prior pivot before a possible budget exit. */
         if (factor_ready && record_pricing_result(w, &pricing, &pending))
@@ -725,6 +730,7 @@ static int simplex(Work *w, int phase_one) {
             return -1;
         }
         LabPricingChoice choice;
+        int source_entering = 0;
         lab_pricing_scan_begin(&choice);
         double worst = 0;
         long double pi_norm = 0;
@@ -762,6 +768,29 @@ static int simplex(Work *w, int phase_one) {
         size_t entering = choice.column;
         if (!phase_one)
             w->result->dual_residual = worst;
+        if (entering == SIZE_MAX && !phase_one && !rejected_count) {
+            if (source_deadline == 0)
+                source_deadline = fmin(w->started + w->options->time_limit, lab_now() + 1);
+            if (source_risk < 0)
+                source_risk = source_objective_risk(w, source_deadline);
+            if (source_risk) {
+                if (source_pivots >= 32) {
+                    message(w, "numerical_failure", "Source objective pivot cap exhausted");
+                    return -1;
+                }
+                int priced = source_objective_price(w, source_deadline, &entering);
+                if (priced < 0) {
+                    if (!budget(w))
+                        message(w, "numerical_failure",
+                                "Bounded source objective pricing unavailable");
+                    return -1;
+                }
+                if (priced > 0) {
+                    source_pivots++;
+                    source_entering = 1;
+                }
+            }
+        }
         if (entering == SIZE_MAX) {
             /* Excluding an unsafe numerical candidate is not evidence that
              * its reduced cost is nonnegative. Never call this an optimum. */
@@ -915,6 +944,8 @@ static int simplex(Work *w, int phase_one) {
             message(w, "numerical_failure", "Invalid pending primal pricing event");
             return -1;
         }
+        if (source_entering)
+            w->result->source_pricing_pivots++;
         rejected_count = 0; /* every exclusion belongs to the prior basis */
     }
 }
@@ -1435,90 +1466,7 @@ static int save_basis(Work *w) {
     }
     return 0;
 }
-/* Evaluate the existing support-gap safeguard in source arithmetic. This is
- * an optimizer rejection test, separate from the independent bound checker. */
-static int exact_support_gap_bad(const Work *w, const double *primal, const double *dual,
-                                 int *available) {
-    const LabModel *m = w->model;
-    mpq_t *activity = lab_alloc(m->rows, sizeof(mpq_t));
-    for (size_t i = 0; i < m->rows; i++)
-        mpq_init(activity[i]);
-    mpq_t x, y, value, reduced, side, gap, variation, shift, threshold;
-    mpq_inits(x, y, value, reduced, side, gap, variation, shift, threshold, NULL);
-    for (size_t j = 0; j < m->cols; j++) {
-        mpq_set_d(x, primal[j]);
-        for (size_t k = m->col_start[j]; k < m->col_start[j + 1]; k++) {
-            exact_coefficient(m, k, value);
-            mpq_mul(value, value, x);
-            mpq_add(activity[m->row_index[k]], activity[m->row_index[k]], value);
-        }
-        if (w->transform[j] != 'X') {
-            exact_shift(w, j, shift);
-            mpq_sub(value, x, shift);
-            if (m->exact)
-                mpq_set(reduced, m->exact->objective[j]);
-            else
-                mpq_set_d(reduced, m->objective[j]);
-            mpq_mul(value, value, reduced);
-            mpq_abs(value, value);
-            mpq_add(variation, variation, value);
-        }
-    }
-    *available = 1;
-    for (size_t i = 0; i < m->rows && *available; i++) {
-        int sign = (dual[i] > 0) - (dual[i] < 0);
-        if (!sign)
-            continue;
-        if (!isfinite(sign > 0 ? m->row_lower[i] : m->row_upper[i])) {
-            *available = 0;
-            break;
-        }
-        exact_row_bound(m, i, sign < 0, side);
-        mpq_sub(value, activity[i], side);
-        mpq_set_d(y, dual[i]);
-        mpq_mul(value, value, y);
-        mpq_abs(value, value);
-        mpq_add(gap, gap, value);
-    }
-    for (size_t j = 0; j < m->cols && *available; j++) {
-        if (m->exact)
-            mpq_set(reduced, m->exact->objective[j]);
-        else
-            mpq_set_d(reduced, m->objective[j]);
-        if (m->maximize)
-            mpq_neg(reduced, reduced);
-        for (size_t k = m->col_start[j]; k < m->col_start[j + 1]; k++) {
-            exact_coefficient(m, k, value);
-            mpq_set_d(y, dual[m->row_index[k]]);
-            mpq_mul(value, value, y);
-            mpq_sub(reduced, reduced, value);
-        }
-        int sign = mpq_sgn(reduced);
-        if (!sign)
-            continue;
-        if (!isfinite(sign > 0 ? m->col_lower[j] : m->col_upper[j])) {
-            *available = 0;
-            break;
-        }
-        exact_column_bound(m, j, sign < 0, side);
-        mpq_set_d(x, primal[j]);
-        mpq_sub(value, x, side);
-        mpq_mul(value, value, reduced);
-        mpq_abs(value, value);
-        mpq_add(gap, gap, value);
-    }
-    mpq_set_ui(threshold, 1, 1);
-    mpq_add(threshold, threshold, variation);
-    mpq_set_ui(value, 1, 10000000);
-    mpq_mul(threshold, threshold, value);
-    int bad = *available && mpq_cmp(gap, threshold) > 0;
-    for (size_t i = 0; i < m->rows; i++)
-        mpq_clear(activity[i]);
-    free(activity);
-    mpq_clears(x, y, value, reduced, side, gap, variation, shift, threshold, NULL);
-    return bad;
-}
-static int recover(Work *w, const LabModel *m) {
+static int recover(Work *w, const LabModel *m, int require_support) {
     LabLpResult *r = w->result;
     r->primal_repair_required = 0;
     r->primal = lab_alloc(m->cols, sizeof(double));
@@ -1579,6 +1527,14 @@ static int recover(Work *w, const LabModel *m) {
         message(w, "numerical_failure", "Original-model primal residual exceeds 1e-7");
         return -1;
     }
+    /* A feasible point accompanying an improving-ray claim is not an
+     * optimality claim. Keep all source primal checks above, but do not ask
+     * an unbounded LP for a finite optimal support bound. */
+    if (!require_support) {
+        free(activity);
+        r->has_primal = 1;
+        return 0;
+    }
     /* A tolerance-small reduced cost can imply a large objective error over
      * wide bounds. This floating support calculation is a rejection safeguard,
      * not a certificate; milpcheck recomputes a rigorous bound independently. */
@@ -1612,11 +1568,29 @@ static int recover(Work *w, const LabModel *m) {
     free(activity);
     /* Complementarity differences avoid subtracting large nearly equal totals.
      * Fixed-variable contributions and objective offsets cannot hide a gap. */
-    int gap_bad = exact_source(m) ? exact_support_gap_bad(w, r->primal, r->dual, &available)
-                                 : available && (!isfinite(gap) || !isfinite(variation) ||
-                                                 gap > 1e-7L * (1 + variation));
-    if (gap_bad) {
-        message(w, "numerical_failure", "Primal/support-bound gap exceeds stopping tolerance");
+    int source_available = 0;
+    int source_unavailable = 0;
+    int gap_bad = 0;
+    if (source_price_binary_equivalent(w)) {
+        w->result->source_support_binary_paths++;
+        gap_bad =
+            available && (!isfinite(gap) || !isfinite(variation) || gap > 1e-7L * (1 + variation));
+    } else {
+        gap_bad = source_numeric_gap(w, r->primal, r->dual, &source_available);
+        if (source_available != 1) {
+            double deadline = fmin(w->started + w->options->time_limit, lab_now() + 1);
+            gap_bad = source_support_interval_gap(w, r->primal, r->dual, deadline,
+                                                 &source_available);
+        }
+        source_unavailable = source_available != 1;
+    }
+    /* A rounded dual can request an infinite side even when the exact source
+     * dual has zero reduced cost. Unknown numeric support is not a proof;
+     * only the same bounded, available exact closure may rescue it. */
+    if ((source_unavailable || gap_bad) && !source_gap_closure(w, r->primal)) {
+        message(w, "numerical_failure",
+                source_unavailable ? "Bounded original-source support unavailable"
+                                   : "Primal/support-bound gap exceeds stopping tolerance");
         return -1;
     }
     r->has_primal = 1;
@@ -1665,8 +1639,8 @@ static void work_free(Work *w) {
     memset(w, 0, sizeof *w);
 }
 static int dual_simplex(Work *w, int original_units);
-static int restore_primal(Work *w, const LabModel *m) {
-    if (recover(w, m) == 0)
+static int restore_primal(Work *w, const LabModel *m, int require_support) {
+    if (recover(w, m, require_support) == 0)
         return 0;
     enum { MAX_SOURCE_REPAIRS = 32 };
     size_t *seen = NULL, seen_count = 0;
@@ -1711,7 +1685,7 @@ static int restore_primal(Work *w, const LabModel *m) {
         w->result->primal_repair_iterations += pivots;
         if (status)
             break;
-        if (!recover(w, m)) {
+        if (!recover(w, m, require_support)) {
             outcome = 0;
             break;
         }
@@ -1773,7 +1747,7 @@ static int cold_solve(Work *w, const LabModel *m) {
         }
     }
     int status = simplex(w, 0);
-    if (status < 0 || restore_primal(w, m))
+    if (status < 0 || restore_primal(w, m, !status))
         return -1;
     if (status)
         message(w, "unbounded", "Improving LP ray found (numerical claim)");
@@ -2049,7 +2023,12 @@ void lab_lp_session_solve(LabLpSession *s, LabLpResult *result) {
             s->ready = 0;
             goto done;
         }
-        if (status == 0 && !recover(w, &s->model)) {
+        if (status == 0) {
+            double deadline = fmin(w->started + w->options->time_limit, lab_now() + 1);
+            if (source_objective_risk(w, deadline))
+                status = simplex(w, 0);
+        }
+        if (status == 0 && !recover(w, &s->model, 1)) {
             message(w, "optimal", "Dual revised simplex repaired the saved basis");
             if (save_basis(w))
                 s->ready = 0;

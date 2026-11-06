@@ -1,5 +1,6 @@
 #include "bb.h"
 #include "common.h"
+#include "solution.h"
 #include "lp.h"
 #include <errno.h>
 #include <limits.h>
@@ -27,20 +28,6 @@ static int positive_size(const char *s, size_t *n, size_t cap) {
     *n = (size_t)v;
     return 0;
 }
-/* Choose the shortest significant-digit decimal that roundtrips to the same
- * double. This avoids exporting .29999999999999999 for input .3. Independent
- * rational checking still decides whether that decimal is a valid witness. */
-static void decimal(FILE *f, double x) {
-    char text[64];
-    for (int digits = 1; digits <= 17; digits++) {
-        snprintf(text, sizeof text, "%.*g", digits, x == 0 ? 0 : x);
-        char *end;
-        double parsed = strtod(text, &end);
-        if (!*end && parsed == x)
-            break;
-    }
-    fputs(text, f);
-}
 static int write_vector(const char *path, const LabModel *m, const LabLpResult *r, int dual) {
     if (!path)
         return 0;
@@ -50,17 +37,13 @@ static int write_vector(const char *path, const LabModel *m, const LabLpResult *
     if (dual) {
         for (size_t i = 0; i < m->rows; i++) {
             fprintf(f, "%s ", m->row_name[i]);
-            decimal(f, r->dual[i]);
+            lab_solution_decimal(f, r->dual[i]);
             fputc('\n', f);
         }
     } else {
-        fprintf(f, "=obj= ");
-        decimal(f, r->objective);
-        fputc('\n', f);
-        for (size_t j = 0; j < m->cols; j++) {
-            fprintf(f, "%s ", m->col_name[j]);
-            decimal(f, r->primal[j]);
-            fputc('\n', f);
+        if (lab_solution_write_point(f, m, r->primal)) {
+            fclose(f);
+            return -1;
         }
     }
     int bad = ferror(f);
@@ -280,7 +263,7 @@ int main(int argc, char **argv) {
                "\"primal_accepted_pivots\":%zu,"
                "\"primal_zero_steps\":%zu,\"primal_short_steps\":%zu,"
                "\"pricing_bland_fallbacks\":%zu,\"primal_candidate_rejections\":%zu,"
-               "\"pricing_requested\":\"%s\","
+               "\"pricing_requested\":\"%s\",\"source_pricing_attempts\":%zu,\"source_pricing_pivots\":%zu,\"source_pricing_completions\":%zu,\"source_dual_closures\":%zu,\"source_support_scans\":%zu,\"source_support_binary_paths\":%zu,"
                "\"root_cuts_enabled\":%s,\"root_cut_attempts\":%zu,\"root_cuts\":%zu,"
                "\"root_cut_lp_solves\":%zu,\"root_cut_status\":\"%s\","
                "\"root_diving_enabled\":%s,\"root_dive_attempts\":%zu,"
@@ -308,7 +291,9 @@ int main(int argc, char **argv) {
                r.source_reconstructed_terms,
                r.primal_accepted_pivots, r.primal_zero_steps, r.primal_short_steps,
                r.pricing_bland_fallbacks, r.primal_candidate_rejections,
-               options.bland_pricing ? "bland" : "most_negative",
+               options.bland_pricing ? "bland" : "most_negative", r.source_pricing_attempts,
+               r.source_pricing_pivots, r.source_pricing_completions, r.source_dual_closures,
+               r.source_support_scans, r.source_support_binary_paths,
                no_root_cuts ? "false" : "true", r.root_cut_attempts, r.root_cuts,
                r.root_cut_lp_solves, r.root_cut_status,
                no_root_diving ? "false" : "true", r.root_dive_attempts, r.root_dive_status,
@@ -366,7 +351,10 @@ int main(int argc, char **argv) {
         "\"farkas_margin_kind\":\"%s\",\"primal_accepted_pivots\":%zu,"
         "\"primal_zero_steps\":%zu,\"primal_short_steps\":%zu,"
         "\"pricing_bland_fallbacks\":%zu,\"primal_candidate_rejections\":%zu,"
-        "\"pricing_requested\":\"%s\"}\n",
+        "\"pricing_requested\":\"%s\",\"source_pricing_attempts\":%zu,"
+        "\"source_pricing_pivots\":%zu,\"source_pricing_completions\":%zu,"
+        "\"source_dual_closures\":%zu,\"source_support_scans\":%zu,"
+        "\"source_support_binary_paths\":%zu}\n",
         model.rows, model.cols, model.nnz, r.standard_rows, r.standard_columns, r.redundant_rows,
         r.iterations, r.refactorizations, r.primal_residual, r.dual_residual, r.elapsed,
         lab_now() - started, options.dense ? "dense_lu_reference" : "sparse_lu",
@@ -386,7 +374,9 @@ int main(int argc, char **argv) {
         !r.farkas ? "absent" : r.farkas_margin_is_lower_bound ? "source_enclosure" : "exact",
         r.primal_accepted_pivots, r.primal_zero_steps, r.primal_short_steps,
         r.pricing_bland_fallbacks, r.primal_candidate_rejections,
-        options.bland_pricing ? "bland" : "most_negative");
+        options.bland_pricing ? "bland" : "most_negative", r.source_pricing_attempts,
+               r.source_pricing_pivots, r.source_pricing_completions, r.source_dual_closures,
+               r.source_support_scans, r.source_support_binary_paths);
     int code = status_code(r.status);
     lab_lp_result_free(&r);
     lab_model_free(&model);

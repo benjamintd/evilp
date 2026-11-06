@@ -54,7 +54,7 @@ static void source_arithmetic(void) {
             "exact dimensions match CSC");
     require(mpq_cmp_ui(m.exact->value[0], 3, 10) == 0,
             "duplicate decimal .1+.2 is exactly .3");
-    require(m.value[0] != .3, "test exposes binary duplicate rounding");
+    require(m.value[0] == .3, "exact duplicate sum is rounded once into the numerical matrix");
     require(mpq_cmp_ui(m.exact->row_lower[0], 1, 10) == 0 &&
                 mpq_cmp_ui(m.exact->row_upper[0], 3, 10) == 0,
             "ranged bounds retain exact subtraction");
@@ -83,7 +83,9 @@ static void topology_disagreement(void) {
     for (size_t i = 0; i < sizeof models / sizeof *models; i++) {
         LabModel m = {0};
         read_text(&m, models[i], 1);
-        require(m.exact == NULL, "float/exact topology mismatch disables certificates");
+        require((m.exact != NULL) == (i < 2), "coalesced support is repaired; unresolved bound topology still disables certificates");
+        if(i==0)require(m.nnz==1&&m.value[0]==1,"lost nonzero is restored");
+        if(i==1)require(m.nnz==0,"exact cancellation removes the spurious binary nonzero");
         lab_model_free(&m);
     }
 }
@@ -343,8 +345,8 @@ static void source_envelopes(void) {
         "NAME HIDDENA\nROWS\n N O\n G R\nCOLUMNS\n"
         " x O 0 R 10000000000000001\n x R -10000000000000000\n"
         "RHS\n b R 1\nBOUNDS\n UP b x 1\nENDATA\n", 1);
-    require(!m.exact && m.nnz == 1 && m.value[0] == 0 && m.envelope->complete,
-            "uncertain coalesced zero remains in the source CSC envelope");
+    require(m.exact && m.nnz == 1 && m.value[0] == 1 && m.envelope->complete,
+            "exact coalescing restores nonzero source support and its enclosure");
     encloses(m.envelope->value[0], "1", "lost nonzero source coefficient retained");
     lab_model_free(&m);
 }

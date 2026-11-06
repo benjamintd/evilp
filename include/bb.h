@@ -36,6 +36,9 @@ typedef struct {
     size_t branch_observations;
     size_t primal_accepted_pivots, primal_zero_steps, primal_short_steps, pricing_bland_fallbacks;
     size_t primal_candidate_rejections;
+    size_t source_pricing_attempts, source_pricing_pivots, source_pricing_completions;
+    size_t source_dual_closures;
+    size_t source_support_scans, source_support_binary_paths;
     size_t root_cut_attempts, root_cuts, root_cut_lp_solves;
     const char *root_cut_status;
     size_t root_dive_attempts, root_dive_lp_solves, root_dive_iterations;

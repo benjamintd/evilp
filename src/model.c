@@ -13,7 +13,11 @@
 
 /* This reader belongs to the optimizer. It deliberately does not call or link
  * the independent checker's model reader or arithmetic implementation. */
-enum { MODEL_ITEMS = 5000000, MODEL_ENTRIES = 50000000, LINE_SIZE = 16384 };
+enum { MODEL_ITEMS = 5000000, MODEL_ENTRIES = 50000000, LINE_SIZE = 16384,
+       NATIVE_ROWS = 2048, NATIVE_COLUMNS = 4096, NATIVE_RECORDS = 100000,
+       NATIVE_TEXT_BYTES = 16 * 1024 * 1024, NATIVE_VALUE_BITS = 8192,
+       NATIVE_TOTAL_BITS = 16000000, OBJECTIVE_COLUMNS=65536,
+       OBJECTIVE_RECORDS=100000, OBJECTIVE_TEXT_BYTES=8*1024*1024 };
 typedef struct {
     const char *name;
     size_t index;
@@ -25,7 +29,7 @@ typedef struct {
 typedef struct {
     char *name;
     double rhs, range;
-    char *rhs_text, *range_text;
+    char *rhs_text, *range_text, *objective_rhs_text;
     LabInterval rhs_envelope, range_envelope;
     char kind;
     unsigned rhs_seen : 1, range_seen : 1;
@@ -43,6 +47,7 @@ typedef struct {
     double value;
     char *text;
     LabInterval envelope;
+    char *objective_text;
 } Entry;
 typedef struct {
     LabModel *output;
@@ -53,38 +58,56 @@ typedef struct {
     Names row_names, col_names;
     char *objective_name, *rhs_name, *range_name, *bound_name;
     size_t line;
-    int exact_enabled;
+    int exact_enabled, native_enabled;
+    size_t native_text_bytes, native_bits;
+    int objective_enabled;
+    size_t objective_row, objective_text_bytes, objective_records, objective_bits;
 } Reader;
 
 /* Decimal provenance is optional and permanently disabled once its bounded
  * storage budget is exceeded. It does not limit ordinary floating input. */
-static void disable_exact(Reader *p) {
-    if (!p->exact_enabled)
-        return;
-    p->exact_enabled = 0;
-    for (size_t i = 0; i < p->nr; i++) {
-        free(p->rows[i].rhs_text);
-        free(p->rows[i].range_text);
-        p->rows[i].rhs_text = p->rows[i].range_text = NULL;
+static void release_exact_texts(Reader *p) {
+    for (size_t i=0;i<p->nr;i++) {
+        free(p->rows[i].rhs_text); free(p->rows[i].range_text);
+        p->rows[i].rhs_text=p->rows[i].range_text=NULL;
     }
-    for (size_t j = 0; j < p->nc; j++) {
-        free(p->cols[j].lower_text);
-        free(p->cols[j].upper_text);
-        p->cols[j].lower_text = p->cols[j].upper_text = NULL;
+    for (size_t j=0;j<p->nc;j++) {
+        free(p->cols[j].lower_text); free(p->cols[j].upper_text);
+        p->cols[j].lower_text=p->cols[j].upper_text=NULL;
     }
-    for (size_t k = 0; k < p->ne; k++) {
-        free(p->entries[k].text);
-        p->entries[k].text = NULL;
-    }
+    for (size_t k=0;k<p->ne;k++) { free(p->entries[k].text);p->entries[k].text=NULL; }
 }
-static char *capture(Reader *p, const char *text) {
-    if (!p->exact_enabled)
-        return NULL;
-    if (strlen(text) > 1024) {
-        disable_exact(p);
-        return NULL;
+static void disable_exact(Reader *p) {
+    if (!p->exact_enabled) return;
+    p->exact_enabled=0;
+    if (!p->native_enabled) release_exact_texts(p);
+}
+static void disable_native(Reader *p) {
+    if (!p->native_enabled) return;
+    p->native_enabled=0;
+    if (!p->exact_enabled) release_exact_texts(p);
+}
+static void disable_objective(Reader *p) {
+    if(!p->objective_enabled)return;p->objective_enabled=0;
+    for(size_t i=0;i<p->nr;i++){free(p->rows[i].objective_rhs_text);p->rows[i].objective_rhs_text=NULL;}
+    for(size_t k=0;k<p->ne;k++){free(p->entries[k].objective_text);p->entries[k].objective_text=NULL;}
+}
+static char *capture_objective(Reader *p,const char *text) {
+    if(!p->objective_enabled)return NULL;size_t bytes=strlen(text)+1;
+    if(bytes>1025||p->objective_records>=OBJECTIVE_RECORDS||bytes>OBJECTIVE_TEXT_BYTES-p->objective_text_bytes) {
+        disable_objective(p);return NULL;
     }
-    return lab_strdup(text);
+    p->objective_records++;p->objective_text_bytes+=bytes;return lab_strdup(text);
+}
+static char *capture(Reader *p,const char *text) {
+    if (!p->exact_enabled&&!p->native_enabled) return NULL;
+    size_t bytes=strlen(text)+1;
+    if (bytes>1025) { disable_exact(p);disable_native(p);return NULL; }
+    if (p->native_enabled) {
+        if (bytes>NATIVE_TEXT_BYTES-p->native_text_bytes) disable_native(p);
+        else p->native_text_bytes+=bytes;
+    }
+    return p->exact_enabled||p->native_enabled ? lab_strdup(text) : NULL;
 }
 static void bound_text(Reader *p, char **destination, const char *text) {
     free(*destination);
@@ -250,6 +273,9 @@ static size_t get_column(Reader *p, const char *name, int marker) {
     col->marker_seen = marker >= 0;
     if (p->nc > 256)
         disable_exact(p);
+    if (p->nc > NATIVE_COLUMNS)
+        disable_native(p);
+    if(p->nc>OBJECTIVE_COLUMNS)disable_objective(p);
     col->lower_text = capture(p, "0");
     col->upper_text = marker > 0 ? capture(p, "1") : NULL;
     save_name(&p->col_names, col->name, j);
@@ -276,6 +302,8 @@ static int add_row(Reader *p, size_t n, char **field) {
     save_name(&p->row_names, r->name, p->nr++);
     if (p->nr > 129)
         disable_exact(p);
+    if (p->nr > NATIVE_ROWS + 1)
+        disable_native(p);
     return 0;
 }
 static int add_values(Reader *p, size_t column, size_t start, size_t n, char **field) {
@@ -291,9 +319,12 @@ static int add_values(Reader *p, size_t column, size_t start, size_t n, char **f
             return -1;
         if (p->ne >= 20000)
             disable_exact(p);
+        if (p->ne >= NATIVE_RECORDS)
+            disable_native(p);
         char *text = capture(p, field[i + 1]);
+        char *objective_text=row==p->objective_row?capture_objective(p,field[i+1]):NULL;
         p->entries[p->ne++] = (Entry){column, row, number, text,
-                                      lab_source_number_interval(field[i + 1], number)};
+                                      lab_source_number_interval(field[i + 1], number),objective_text};
     }
     return 0;
 }
@@ -321,6 +352,7 @@ static int row_side(Reader *p, size_t n, char **field, int ranges) {
             r->rhs = value;
             r->rhs_seen = 1;
             r->rhs_text = capture(p, field[k + 1]);
+            if(i==p->objective_row)r->objective_rhs_text=capture_objective(p,field[k+1]);
             r->rhs_envelope = lab_source_number_interval(field[k + 1], value);
         }
     }
@@ -472,6 +504,66 @@ static LabExactModel *prepare_exact(Reader *p, const size_t *index, size_t objec
     }
     return x;
 }
+static int native_value_fits(const mpq_t q) {
+    return mpz_sizeinbase(mpq_numref(q),2)<=NATIVE_VALUE_BITS &&
+           mpz_sizeinbase(mpq_denref(q),2)<=NATIVE_VALUE_BITS;
+}
+static int native_store(Reader *p,const mpq_t q) {
+    size_t bits=mpz_sizeinbase(mpq_numref(q),2)+mpz_sizeinbase(mpq_denref(q),2);
+    if (!native_value_fits(q)||bits>NATIVE_TOTAL_BITS-p->native_bits) return -1;
+    p->native_bits+=bits;return 0;
+}
+static LabExactModel *prepare_native(Reader *p,const size_t *index) {
+    LabModel *m=p->output;
+    if (!p->native_enabled || m->rows>NATIVE_ROWS || m->cols>NATIVE_COLUMNS || p->ne>NATIVE_RECORDS)
+        return NULL;
+    LabExactModel *x=lab_exact_model_new(m->rows,m->cols,p->ne);
+    mpq_t rhs,range;mpq_inits(rhs,range,NULL);int bad=0;p->native_bits=0;
+    for (size_t i=0;i<p->nr&&!bad;i++) {
+        if(index[i]==SIZE_MAX) continue;
+        const InputRow *r=&p->rows[i];size_t k=index[i];
+        bad=lab_exact_decimal(rhs,r->rhs_text?r->rhs_text:"0")||!native_value_fits(rhs);
+        if(isfinite(m->row_lower[k]))mpq_set(x->row_lower[k],rhs);
+        if(isfinite(m->row_upper[k]))mpq_set(x->row_upper[k],rhs);
+        if(r->range_seen&&!bad) {
+            bad=lab_exact_decimal(range,r->range_text?r->range_text:"0")||!native_value_fits(range);
+            int sign=mpq_sgn(range);mpq_abs(range,range);
+            if(r->kind=='L'||(r->kind=='E'&&sign<0))mpq_sub(x->row_lower[k],rhs,range);
+            else mpq_add(x->row_upper[k],rhs,range);
+        }
+        if(!bad)bad=native_store(p,x->row_lower[k])||native_store(p,x->row_upper[k]);
+    }
+    for(size_t j=0;j<m->cols&&!bad;j++) {
+        const InputCol *c=&p->cols[j];
+        if(isfinite(m->col_lower[j]))bad=lab_exact_decimal(x->col_lower[j],c->lower_text?c->lower_text:"0");
+        if(isfinite(m->col_upper[j])&&!bad)bad=lab_exact_decimal(x->col_upper[j],c->upper_text?c->upper_text:"0");
+        if(!bad)bad=native_store(p,x->col_lower[j])||native_store(p,x->col_upper[j])||native_store(p,x->objective[j]);
+        x->col_lower_source[j]=m->col_lower[j];x->col_upper_source[j]=m->col_upper[j];
+    }
+    if(!bad)bad=native_store(p,x->offset);
+    mpq_clears(rhs,range,NULL);
+    if(bad){lab_exact_model_free(x);return NULL;}return x;
+}
+static int objective_store(Reader *p,const mpq_t q) {
+    size_t bits=mpz_sizeinbase(mpq_numref(q),2)+mpz_sizeinbase(mpq_denref(q),2);
+    if(!native_value_fits(q)||bits>NATIVE_TOTAL_BITS-p->objective_bits)return -1;
+    p->objective_bits+=bits;return 0;
+}
+static LabSourceObjective *prepare_objective(Reader *p,size_t objective) {
+    if(!p->objective_enabled||p->nc>OBJECTIVE_COLUMNS)return NULL;
+    LabSourceObjective *o=lab_source_objective_new(p->nc);p->objective_bits=0;
+    const char *rhs=p->rows[objective].objective_rhs_text;
+    int bad=lab_exact_decimal(o->offset,rhs?rhs:"0");mpq_neg(o->offset,o->offset);
+    if(!bad)bad=objective_store(p,o->offset);o->offset_source=p->output->offset;
+    if(bad){lab_source_objective_free(o);return NULL;}return o;
+}
+static void discard_objective(LabModel *m){lab_source_objective_free(m->objective_exact);m->objective_exact=NULL;}
+static int round_source_sum(Reader *p,const mpq_t q,double *value,LabInterval *interval,int objective) {
+    if(lab_exact_nearest(q,value)||(*value==0&&mpq_sgn(q)))return problem(p,objective?"exact objective sum is outside nonzero finite double range":"exact coalesced coefficient is outside nonzero finite double range");
+    mpq_t binary;mpq_init(binary);mpq_set_d(binary,*value);int cmp=mpq_cmp(binary,q);mpq_clear(binary);
+    *interval=(LabInterval){cmp>0?nextafter(*value,-INFINITY):*value,cmp<0?nextafter(*value,INFINITY):*value};return 0;
+}
+static void discard_native(LabModel *m) {lab_exact_model_free(m->native_exact);m->native_exact=NULL;}
 static void discard_exact(LabModel *m) {
     lab_exact_model_free(m->exact);
     m->exact = NULL;
@@ -483,9 +575,11 @@ static LabInterval absolute_interval(LabInterval x) {
         return (LabInterval){-x.upper, -x.lower};
     return (LabInterval){0, fmax(-x.lower, x.upper)};
 }
-static LabSourceEnvelope *prepare_envelope(Reader *p, const size_t *index) {
+static LabSourceEnvelope *prepare_envelope(Reader *p, const size_t *index,size_t objective) {
     LabModel *m = p->output;
     LabSourceEnvelope *s = lab_source_envelope_new(m->rows, m->cols, p->ne);
+    s->objective_complete=1;
+    s->offset=(LabInterval){-p->rows[objective].rhs_envelope.upper,-p->rows[objective].rhs_envelope.lower};
     for (size_t i = 0; i < p->nr; i++) {
         if (index[i] == SIZE_MAX)
             continue;
@@ -568,21 +662,30 @@ static int finish(Reader *p) {
         m->integer[j] = (unsigned char)p->cols[j].integer;
     }
     m->exact = prepare_exact(p, index, objective);
-    m->envelope = prepare_envelope(p, index);
+    m->native_exact = prepare_native(p,index);
+    m->objective_exact=prepare_objective(p,objective);
+    m->envelope = prepare_envelope(p,index,objective);
     /* Sorting gives deterministic coalescing even if a writer interleaves
      * column records. Rows within every final CSC column are sorted. */
     if (p->ne)
         qsort(p->entries, p->ne, sizeof *p->entries, entry_order);
     size_t unique = 0;
-    mpq_t sum, term;
-    mpq_inits(sum, term, NULL);
+    mpq_t sum,term,native_sum,native_term,objective_sum,objective_term;
+    mpq_inits(sum,term,native_sum,native_term,objective_sum,objective_term,NULL);
     for (size_t e = 0; e < p->ne;) {
         Entry a = p->entries[e++];
         mpq_set_ui(sum, 0, 1);
+        mpq_set_ui(native_sum,0,1);
+        mpq_set_ui(objective_sum,0,1);
         if (m->exact && (index[a.row] != SIZE_MAX || a.row == objective)) {
             if (!a.text || lab_exact_decimal(sum, a.text))
                 discard_exact(m);
         }
+        if(m->native_exact && index[a.row]!=SIZE_MAX &&
+           (!a.text || lab_exact_decimal(native_sum,a.text) || !native_value_fits(native_sum)))
+            discard_native(m);
+        if(m->objective_exact && a.row==objective && (!a.objective_text||lab_exact_decimal(objective_sum,a.objective_text)||!native_value_fits(objective_sum)))discard_objective(m);
+        free(a.objective_text);p->entries[e-1].objective_text=a.objective_text=NULL;
         free(a.text);
         p->entries[e - 1].text = a.text = NULL;
         while (e < p->ne && a.column == p->entries[e].column && a.row == p->entries[e].row) {
@@ -595,24 +698,42 @@ static int finish(Reader *p) {
                 else
                     mpq_add(sum, sum, term);
             }
+            if(m->native_exact && index[a.row]!=SIZE_MAX) {
+                if(!next->text || lab_exact_decimal(native_term,next->text) || !native_value_fits(native_term))
+                    discard_native(m);
+                else {mpq_add(native_sum,native_sum,native_term);if(!native_value_fits(native_sum))discard_native(m);}
+            }
+            if(m->objective_exact&&a.row==objective) {
+                if(!next->objective_text||lab_exact_decimal(objective_term,next->objective_text)||!native_value_fits(objective_term))discard_objective(m);
+                else {mpq_add(objective_sum,objective_sum,objective_term);if(!native_value_fits(objective_sum))discard_objective(m);}
+            }
+            free(next->objective_text);next->objective_text=NULL;
             free(next->text);
             next->text = NULL;
             if (!isfinite(a.value)) {
-                mpq_clears(sum, term, NULL);
+                mpq_clears(sum,term,native_sum,native_term,objective_sum,objective_term,NULL);
                 free(index);
                 return problem(p, "duplicate coefficients overflow finite double range");
             }
+        }
+        const mpq_t *source_sum=NULL;
+        if(a.row==objective) {if(m->exact)source_sum=&sum;else if(m->objective_exact)source_sum=&objective_sum;}
+        else if(index[a.row]!=SIZE_MAX) {if(m->exact)source_sum=&sum;else if(m->native_exact)source_sum=&native_sum;}
+        if(source_sum && round_source_sum(p,*source_sum,&a.value,&a.envelope,a.row==objective)) {
+            mpq_clears(sum,term,native_sum,native_term,objective_sum,objective_term,NULL);free(index);return -1;
         }
         if (m->exact && index[a.row] != SIZE_MAX &&
             ((a.value == 0) != (mpq_sgn(sum) == 0)))
             discard_exact(m);
         if (a.row == objective) {
             m->objective[a.column] = a.value;
+            m->envelope->objective[a.column]=a.envelope;
+            if(m->objective_exact){if(objective_store(p,objective_sum))discard_objective(m);else mpq_set(m->objective_exact->value[a.column],objective_sum);}
             if (m->exact) {
                 mpq_set(m->exact->objective[a.column], sum);
                 if (lab_exact_nearest(sum, &m->objective[a.column]) ||
                     (m->objective[a.column] == 0 && mpq_sgn(sum))) {
-                    mpq_clears(sum, term, NULL);
+                    mpq_clears(sum,term,native_sum,native_term,objective_sum,objective_term,NULL);
                     free(index);
                     return problem(p, "exact objective sum is outside nonzero finite double range");
                 }
@@ -622,13 +743,17 @@ static int finish(Reader *p) {
                  (a.value != 0 || a.envelope.lower != 0 || a.envelope.upper != 0)) {
             if (m->exact)
                 mpq_set(m->exact->value[unique], sum);
+            if (m->native_exact) {
+                if(native_store(p,native_sum))discard_native(m);
+                else mpq_set(m->native_exact->value[unique],native_sum);
+            }
             m->envelope->value[unique] = a.envelope;
             a.row = index[a.row];
             p->entries[unique++] = a;
             ++m->col_start[a.column + 1];
         }
     }
-    mpq_clears(sum, term, NULL);
+    mpq_clears(sum,term,native_sum,native_term,objective_sum,objective_term,NULL);
     m->nnz = unique;
     m->envelope->nnz = unique;
     if (m->exact) {
@@ -636,6 +761,14 @@ static int finish(Reader *p) {
             mpq_clear(m->exact->value[k]);
         m->exact->nnz = unique;
     }
+    if(m->native_exact) {
+        for(size_t k=unique;k<m->native_exact->nnz;k++)mpq_clear(m->native_exact->value[k]);
+        m->native_exact->nnz=unique;
+        /* The existing small snapshot already provides all native feasibility
+         * fields. Keep its independent ownership and avoid a persistent copy. */
+        if(m->exact)discard_native(m);
+    }
+    if(m->objective_exact){for(size_t j=0;j<m->cols;j++)m->objective_exact->source[j]=m->objective[j];if(m->exact)discard_objective(m);}
     m->row_index = lab_alloc(unique, sizeof *m->row_index);
     m->value = lab_alloc(unique, sizeof *m->value);
     for (size_t e = 0; e < unique; ++e) {
@@ -652,14 +785,14 @@ static void cleanup(Reader *p) {
         free(p->rows[i].name);
         free(p->rows[i].rhs_text);
         free(p->rows[i].range_text);
+        free(p->rows[i].objective_rhs_text);
     }
     for (size_t j = 0; j < p->nc; ++j) {
         free(p->cols[j].name);
         free(p->cols[j].lower_text);
         free(p->cols[j].upper_text);
     }
-    for (size_t k = 0; k < p->ne; k++)
-        free(p->entries[k].text);
+    for (size_t k = 0; k < p->ne; k++){free(p->entries[k].text);free(p->entries[k].objective_text);}
     free(p->rows);
     free(p->cols);
     free(p->entries);
@@ -671,7 +804,7 @@ static void cleanup(Reader *p) {
     free(p->bound_name);
 }
 int lab_model_read(LabModel *model, const char *path) {
-    Reader p = {.output = model, .exact_enabled = 1};
+    Reader p = {.output=model,.exact_enabled=1,.native_enabled=1,.objective_enabled=1,.objective_row=SIZE_MAX};
     model->parsed_decimal = 1;
     enum { NONE, ROWS, COLUMNS, RHS, RANGES, BOUNDS, SENSE, OBJECTIVE } section = NONE;
     int seen_rows = 0, seen_columns = 0, ended = 0, marker = 0;
@@ -740,6 +873,8 @@ int lab_model_read(LabModel *model, const char *path) {
                 if (n != 1 || !seen_rows || seen_columns)
                     problem(&p, "repeated or misplaced COLUMNS section");
                 section = COLUMNS;
+                if(p.objective_name)p.objective_row=find_name(&p.row_names,p.objective_name);
+                else for(size_t k=0;k<p.nr;k++)if(p.rows[k].kind=='N'){p.objective_row=k;break;}
                 seen_columns = 1;
                 continue;
             } else if (!strcmp(word, "RHS") || !strcmp(word, "RANGES") || !strcmp(word, "BOUNDS")) {
@@ -842,6 +977,8 @@ void lab_model_free(LabModel *model) {
     free(model->row_index);
     free(model->value);
     lab_exact_model_free(model->exact);
+    lab_exact_model_free(model->native_exact);
+    lab_source_objective_free(model->objective_exact);
     lab_source_envelope_free(model->envelope);
     memset(model, 0, sizeof *model);
 }

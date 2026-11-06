@@ -203,7 +203,7 @@ static void free_columns_and_source_box(const char *checker) {
     read_model(&m,
         "NAME LOST\nROWS\n N O\n G R\nCOLUMNS\n x O 0 R 10000000000000001\n"
         " x R -10000000000000000\nRHS\n b R 1\nBOUNDS\n FX b x 1\nENDATA\n", path);
-    require(!m.exact && m.value[0] == 0, "uncertain-zero source fixture");
+    require(m.exact && m.value[0] == 1, "exact coalescing restores source fixture coefficient");
     require(lab_farkas_candidate(&m, 1, source, scale, pi, lab_now() + 5, &r) == 0,
             "uncertain source coefficient is not treated as a literal zero");
     lab_farkas_candidate_free(&r);

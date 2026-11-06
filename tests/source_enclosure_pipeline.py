@@ -14,7 +14,8 @@ for name,coef,rhs,lo,rng,zero,overlay,count in cases:
  model=out/(name+'.mps');model.write_text('\n'.join(text))
  for dense,scale in [(0,0),(1,0),(0,1)]:
   prefix=out/f'{name}-{dense}-{scale}';cmd=[str(producer),str(model),str(prefix),str(dense),str(scale)]+(list(overlay)+['0'] if overlay else [])
-  run=subprocess.run(cmd,text=True,capture_output=True,timeout=60);prefix.with_suffix('.process.json').write_text(json.dumps({'argv':cmd,'code':run.returncode,'stdout':run.stdout,'stderr':run.stderr},indent=2));assert run.returncode==0,(name,run.stdout,run.stderr)
+  env=os.environ.copy();env['LAB_TEST_POINT_SOURCE_ONLY']='1'
+  run=subprocess.run(cmd,text=True,capture_output=True,timeout=60,env=env);prefix.with_suffix('.process.json').write_text(json.dumps({'argv':cmd,'code':run.returncode,'stdout':run.stdout,'stderr':run.stderr},indent=2));assert run.returncode==0,(name,run.stdout,run.stderr)
   j=json.loads(run.stdout);assert j['cuts']==count,(name,j);assert not run.stderr,run.stderr
   for cut in j['published']:
    checked=subprocess.run([str(checker),'--model',str(model),'--gmi',cut['certificate']],text=True,capture_output=True,timeout=30);assert checked.returncode==0,(name,checked.stdout,checked.stderr);q=json.loads(checked.stdout);assert q['certifies_cut_validity'] and not q['certifies_original_lp_infeasibility']

@@ -4,6 +4,7 @@
 #include <stddef.h>
 typedef struct LabExactModel LabExactModel;
 typedef struct LabSourceEnvelope LabSourceEnvelope;
+typedef struct LabSourceObjective LabSourceObjective;
 
 /* Original (unscaled) bounded-row model. The matrix is compressed by column.
  * Bounds use +/-INFINITY; every stored coefficient and objective is finite.
@@ -22,6 +23,12 @@ typedef struct {
     /* Optional bounded decimal provenance, owned by this model. In-memory
      * sessions borrow it; manually constructed models leave both fields zero. */
     LabExactModel *exact;
+    /* Optional larger, bounded feasibility-only decimal provenance for native
+     * cut derivations. Never enables global primal/objective exact paths.
+     * Owned independently; sessions/views borrow it. */
+    LabExactModel *native_exact;
+    /* Bounded objective-only decimal provenance, independent of basis data. */
+    LabSourceObjective *objective_exact;
     int parsed_decimal;
     /* Outward source-decimal enclosures, independent of the exact-size cap.
      * Session views borrow them; this model owns the allocation. */

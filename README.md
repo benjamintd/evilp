@@ -20,6 +20,10 @@ The current foundation adds one bounded round of exact root GMI cuts, with
 conservative binary publication, immutable augmented LP models and an
 independent original-source cut checker. See [root cuts](docs/ROOT-CUTS.md)
 and [the certificate format](docs/GMI-CERTIFICATES.md) for scope and limits.
+The [source-accuracy safeguards](docs/SOURCE-ACCURACY.md) preserve decimal
+cancellation through optimization, objective comparisons and solution files.
+Their frozen combined checkpoint passes all 43 Release and sanitizer suites;
+the full MIPLIB completion gate remains closed.
 The independent checker validates original-model witnesses, rational LP bounds
 and exact infeasibility certificates.
 

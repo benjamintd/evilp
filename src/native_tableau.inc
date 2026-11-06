@@ -168,6 +168,39 @@ done:
     mpq_clears(shift,value,side,scale,NULL);native_qfree(activity,m->rows);return status;
 }
 
+/* A coalesced source coefficient may be nonzero even when its binary
+ * sum is zero. Preserve these entries in the exact canonical matrix rather
+ * than inheriting the floating matrix's omitted support. */
+static LabNativeStatus native_missing_zero_count(const Work *w,NativeGuard *g,
+    const LabNativeBatch *b,size_t j,size_t *count) {
+    *count=0;if(j>=w->structural)return LAB_NATIVE_OK;
+    size_t source=w->original[j];
+    for(size_t k=w->model->col_start[source];k<w->model->col_start[source+1];k++) {
+        if(w->model->value[k]!=0 || !mpq_sgn(b->source_matrix.value[k]))continue;
+        for(size_t i=0;i<w->m;i++)if(w->source_row[i]==w->model->row_index[k])(*count)++;
+        if(native_tick(g)!=LAB_NATIVE_OK)return LAB_NATIVE_DEADLINE;
+    }
+    return LAB_NATIVE_OK;
+}
+static LabNativeStatus native_missing_zeros(const Work *w,NativeGuard *g,
+    LabNativeBatch *b,size_t j,size_t *at) {
+    if(j>=w->structural)return LAB_NATIVE_OK;
+    size_t source=w->original[j];LabNativeStatus status=LAB_NATIVE_OK;
+    mpq_t scale;mpq_init(scale);
+    for(size_t k=w->model->col_start[source];k<w->model->col_start[source+1];k++) {
+        if(w->model->value[k]!=0 || !mpq_sgn(b->source_matrix.value[k]))continue;
+        for(size_t i=0;i<w->m;i++)if(w->source_row[i]==w->model->row_index[k]) {
+            b->canonical_matrix.row[*at]=i;
+            mpq_set(b->canonical_matrix.value[*at],b->source_matrix.value[k]);
+            mpq_set_d(scale,w->sign[j]);mpq_mul(b->canonical_matrix.value[*at],b->canonical_matrix.value[*at],scale);
+            mpq_set_d(scale,w->row_scale[i]);mpq_mul(b->canonical_matrix.value[*at],b->canonical_matrix.value[*at],scale);
+            NATIVE_TRY(native_check(g,b->canonical_matrix.value[(*at)++],1));
+        }
+        NATIVE_TRY(native_tick(g));
+    }
+done:mpq_clear(scale);return status;
+}
+
 static LabNativeStatus native_capture(const Work *w, NativeGuard *g, LabNativeBatch *b) {
     const LabModel *m = w->model;
     LabNativeStatus status = LAB_NATIVE_OK;
@@ -212,8 +245,11 @@ static LabNativeStatus native_capture(const Work *w, NativeGuard *g, LabNativeBa
     size_t nnz = 0;
     for (size_t j = 0; j < w->n; j++)
         if (!w->artificial[j]) {
+            size_t extra=0;NATIVE_TRY(native_missing_zero_count(w,g,b,j,&extra));
             if (w->a[j].count > g->limit->max_canonical_nnz - nnz) { status = LAB_NATIVE_RESOURCE; goto done; }
             nnz += w->a[j].count;
+            if(extra>g->limit->max_canonical_nnz-nnz){status=LAB_NATIVE_RESOURCE;goto done;}
+            nnz+=extra;
         }
     if (native_matrix_alloc(&b->canonical_matrix, w->m, w->n, nnz)) { status = LAB_NATIVE_RESOURCE; goto done; }
     size_t at = 0;
@@ -225,12 +261,13 @@ static LabNativeStatus native_capture(const Work *w, NativeGuard *g, LabNativeBa
                 NATIVE_TRY(native_basis_value(w,j,k,b->canonical_matrix.value[at]));
                 NATIVE_TRY(native_check(g, b->canonical_matrix.value[at++], 1));
             }
+        if(!w->artificial[j])NATIVE_TRY(native_missing_zeros(w,g,b,j,&at));
     }
     b->canonical_matrix.start[w->n] = at;
     nnz = 0;
     for (size_t p = 0; p < w->m; p++) {
         if (w->basis[p] >= w->n || w->artificial[w->basis[p]]) { status = LAB_NATIVE_EXACT_FAILURE; goto done; }
-        size_t count = w->a[w->basis[p]].count;
+        size_t count=b->canonical_matrix.start[w->basis[p]+1]-b->canonical_matrix.start[w->basis[p]];
         if (count > g->limit->max_basis_nnz - nnz) { status = LAB_NATIVE_RESOURCE; goto done; }
         nnz += count;
     }
@@ -468,7 +505,7 @@ LabNativeStatus lab_lp_session_export_native(LabLpSession *s, const LabNativeLim
         return LAB_NATIVE_STALE;
     const Work *w = &s->work;
     const LabModel *m = &s->model;
-    if (s->options.no_exact || (m->parsed_decimal && !m->exact &&
+    if (s->options.no_exact || (m->parsed_decimal && !m->exact && !m->native_exact &&
         (!m->envelope || !m->envelope->complete))) return LAB_NATIVE_SOURCE_UNAVAILABLE;
     if (m->rows>16384 || m->cols>16384 || m->nnz>100000) return LAB_NATIVE_RESOURCE;
     if (w->m > limit->max_basis_dimension) return LAB_NATIVE_RESOURCE;
