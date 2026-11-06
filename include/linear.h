@@ -17,6 +17,13 @@ typedef struct {
     size_t *row_index;
     double *value;
 } LabLinearColumn;
+typedef struct {
+    size_t column, count;
+    size_t *row_index;
+    double *value;
+    double pivot;
+    int sparse;
+} LabLinearEta;
 
 /* Equilibrated basis solve. Caller CSC inputs remain immutable. Current
  * original-unit coefficients are retained for compensated residuals; sparse
@@ -40,8 +47,10 @@ typedef struct {
     /* B_current = B_base E_0 ... E_(update_count-1). Each eta replaces one
      * column of the identity and is stored in original basis coordinates. */
     size_t update_count, accepted_updates, rejected_updates;
-    size_t *eta_column;
-    double **eta_value;
+    /* Sparse etas retain every nonzero off-diagonal coefficient, in row
+     * order. Dense etas retain the original full vector. The pivot is never
+     * dropped. Packed payloads use at most half a dense vector's bytes. */
+    LabLinearEta *eta;
     /* Work counters since factorization. Updates copy only replacement-column
      * entries; current CSC materialization is explicit and never part of a
      * solve/update. Entry counters saturate if accumulated usage overflows. */
@@ -75,8 +84,8 @@ int lab_linear_update_dense(LabLinear *s, size_t column, const double *new_colum
  * the source input. Views are borrowed, immutable and valid until the next
  * accepted update, refactorization or free. Invalid requests return -1 and
  * clear provided outputs. No allocation or materialization occurs. */
-int lab_linear_get_column(const LabLinear *s, size_t column, size_t *nnz,
-                          const size_t **row_index, const double **value);
+int lab_linear_get_column(const LabLinear *s, size_t column, size_t *nnz, const size_t **row_index,
+                          const double **value);
 /* Allocate an independent current CSC copy. The destination must be zeroed
  * or freed first; an invalid request leaves it unchanged. No internal pointer
  * is transferred to the caller. This explicit O(n+nnz) operation is optional. */

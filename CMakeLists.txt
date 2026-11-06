@@ -133,3 +133,6 @@ add_test(NAME source_pricing_contract COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOUR
 add_executable(source_support_driver tests/source_support_driver.c)
 target_link_libraries(source_support_driver PRIVATE lab_lp)
 add_test(NAME source_support_contract COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/test_source_support.py $<TARGET_FILE:source_support_driver>)
+add_executable(test_sparse_eta tests/test_sparse_eta.c)
+target_link_libraries(test_sparse_eta PRIVATE lab_lp)
+add_test(NAME sparse_eta_contract COMMAND test_sparse_eta)

@@ -58,14 +58,15 @@ void lab_linear_free(LabLinear *s) {
     free(s->overlay_slot);
     free(s->row_exponent);
     free(s->col_exponent);
-    for (size_t i = 0; i < s->update_count; i++)
-        free(s->eta_value[i]);
-    free(s->eta_column);
-    free(s->eta_value);
+    for (size_t i = 0; i < s->update_count; i++) {
+        free(s->eta[i].row_index);
+        free(s->eta[i].value);
+    }
+    free(s->eta);
     memset(s, 0, sizeof *s);
 }
-static void current_column(const LabLinear *s, size_t column, size_t *count,
-                            const size_t **row, const double **value) {
+static void current_column(const LabLinear *s, size_t column, size_t *count, const size_t **row,
+                           const double **value) {
     size_t slot = s->overlay_slot ? s->overlay_slot[column] : 0;
     if (slot) {
         const LabLinearColumn *c = &s->overlay[slot - 1];
@@ -79,8 +80,8 @@ static void current_column(const LabLinear *s, size_t column, size_t *count,
         *value = s->base_value + start;
     }
 }
-int lab_linear_get_column(const LabLinear *s, size_t column, size_t *count,
-                          const size_t **row, const double **value) {
+int lab_linear_get_column(const LabLinear *s, size_t column, size_t *count, const size_t **row,
+                          const double **value) {
     if (count)
         *count = 0;
     if (row)
@@ -96,8 +97,8 @@ static size_t counter_add(size_t value, size_t increment) {
     return value > SIZE_MAX - increment ? SIZE_MAX : value + increment;
 }
 int lab_linear_copy_csc(LabLinear *s, LabLinearCSC *copy) {
-    if (!s || !s->valid || !copy || copy->n || copy->nnz || copy->col_start ||
-        copy->row_index || copy->value)
+    if (!s || !s->valid || !copy || copy->n || copy->nnz || copy->col_start || copy->row_index ||
+        copy->value)
         return -1;
     LabLinearCSC result = {.n = s->n, .nnz = s->nnz};
     result.col_start = lab_alloc(s->n + 1, sizeof(size_t));
@@ -363,33 +364,77 @@ static int base_solve(LabLinear *s, const double *rhs, double *x, int transpose)
  * component p: x_p=(v_p-sum_(i!=p) d_i*v_i)/d_p. The normal chain is
  * chronological after the base solve; the transpose chain is reversed before
  * the base transpose solve. All eta vectors use original basis coordinates. */
+/* A zero product/error pair can renormalize the compensated accumulator.
+ * Replay it until the numeric state is unchanged, then the same deterministic
+ * operation cannot change that state in the remainder of this zero run.
+ * Signs of zero are not part of the numerical equality contract. All incoming
+ * vector entries are finite: the public solve checks rhs, base_solve checks
+ * every result, and each preceding eta checks its modified entries. */
+static int eta_zero_run(double *numerator, double *tail, size_t count) {
+    if (*tail == 0)
+        return 0;
+    while (count--) {
+        double previous = *numerator, previous_tail = *tail;
+        if (add(numerator, tail, 0) || add(numerator, tail, 0))
+            return -1;
+        if (*numerator == previous && *tail == previous_tail)
+            break;
+    }
+    return 0;
+}
 static int eta_solve(const LabLinear *s, size_t update, double *x, int transpose) {
-    size_t p = s->eta_column[update];
-    const double *d = s->eta_value[update];
+    const LabLinearEta *eta = &s->eta[update];
+    size_t p = eta->column;
+    const double *d = eta->value;
     double numerator = x[p], tail = 0;
-    if (transpose) {
+    if (transpose && eta->sparse) {
+        size_t cursor = 0;
+        for (size_t k = 0; k < eta->count; k++) {
+            size_t i = eta->row_index[k];
+            size_t zeros = i - cursor - (size_t)(p >= cursor && p < i);
+            if (eta_zero_run(&numerator, &tail, zeros))
+                return -1;
+            double product = d[k] * x[i];
+            double error = fma(d[k], x[i], -product);
+            if (!isfinite(product) || !isfinite(error) || (x[i] != 0 && product == 0) ||
+                add(&numerator, &tail, -product) || add(&numerator, &tail, -error))
+                return -1;
+            cursor = i + 1;
+        }
+        size_t zeros = s->n - cursor - (size_t)(p >= cursor);
+        if (eta_zero_run(&numerator, &tail, zeros))
+            return -1;
+        numerator += tail;
+    } else if (transpose) {
         for (size_t i = 0; i < s->n; i++) {
             if (i == p)
                 continue;
             double product = d[i] * x[i];
             double error = fma(d[i], x[i], -product);
             if (!isfinite(product) || !isfinite(error) ||
-                (d[i] != 0 && x[i] != 0 && product == 0) ||
-                add(&numerator, &tail, -product) || add(&numerator, &tail, -error))
+                (d[i] != 0 && x[i] != 0 && product == 0) || add(&numerator, &tail, -product) ||
+                add(&numerator, &tail, -error))
                 return -1;
         }
         numerator += tail;
     }
-    double pivot_value = numerator / d[p];
+    double pivot_value = numerator / eta->pivot;
     if (!isfinite(pivot_value) || (numerator != 0 && pivot_value == 0))
         return -1;
-    if (!transpose)
+    if (!transpose && eta->sparse) {
+        for (size_t k = 0; k < eta->count; k++) {
+            size_t i = eta->row_index[k];
+            double value = fma(-d[k], pivot_value, x[i]);
+            if (!isfinite(value) || (x[i] == 0 && pivot_value != 0 && value == 0))
+                return -1;
+            x[i] = value;
+        }
+    } else if (!transpose)
         for (size_t i = 0; i < s->n; i++) {
             if (i == p)
                 continue;
             double value = fma(-d[i], pivot_value, x[i]);
-            if (!isfinite(value) ||
-                (x[i] == 0 && d[i] != 0 && pivot_value != 0 && value == 0))
+            if (!isfinite(value) || (x[i] == 0 && d[i] != 0 && pivot_value != 0 && value == 0))
                 return -1;
             x[i] = value;
         }
@@ -567,12 +612,26 @@ int lab_linear_update(LabLinear *s, size_t column, size_t count, const size_t *r
         s->overlay_slot = lab_alloc(n, sizeof(unsigned char));
         s->overlay = lab_alloc(LAB_LINEAR_UPDATE_LIMIT, sizeof(LabLinearColumn));
     }
-    if (!s->eta_column) {
-        s->eta_column = lab_alloc(LAB_LINEAR_UPDATE_LIMIT, sizeof(size_t));
-        s->eta_value = lab_alloc(LAB_LINEAR_UPDATE_LIMIT, sizeof(double *));
+    if (!s->eta)
+        s->eta = lab_alloc(LAB_LINEAR_UPDATE_LIMIT, sizeof(LabLinearEta));
+    size_t off_diagonal = 0;
+    for (size_t i = 0; i < n; i++)
+        off_diagonal += i != column && d[i] != 0;
+    LabLinearEta eta = {.column = column, .count = n, .value = d, .pivot = d[column]};
+    if (off_diagonal <= n / 4) {
+        eta.sparse = 1;
+        eta.count = off_diagonal;
+        eta.row_index = off_diagonal ? lab_alloc(off_diagonal, sizeof(size_t)) : NULL;
+        eta.value = off_diagonal ? lab_alloc(off_diagonal, sizeof(double)) : NULL;
+        size_t at = 0;
+        for (size_t i = 0; i < n; i++)
+            if (i != column && d[i] != 0) {
+                eta.row_index[at] = i;
+                eta.value[at++] = d[i];
+            }
+        free(d);
     }
-    s->eta_column[s->update_count] = column;
-    s->eta_value[s->update_count] = d;
+    s->eta[s->update_count] = eta;
     s->update_count++;
     s->accepted_updates++;
     d = NULL;
