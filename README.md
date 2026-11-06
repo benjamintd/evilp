@@ -55,6 +55,9 @@ The [autoresearch protocol](docs/AUTORESEARCH.md) starts only after every MILP
 problem in the existing benchmarks passes. That gate is not yet complete.
 The [current diagnosis and next experiment](docs/DIAGNOSIS.md) prioritize source
 correctness and measured LP bottlenecks before further search features.
+The [version-matched HiGHS source audit](docs/HIGHS-LP-AUDIT.md) maps those
+bottlenecks to bound handling, sparse basis solves, reoptimization and
+degeneracy controls. Its simplex/interior-point comparison is diagnostic only.
 The latest [ten-second full inventory](results/miplib-candidate-10s-v2/inventory.json)
 evaluates `95b7450` and records 239 time limits, one numerical stop, 15
 independently checked incumbents and zero correctly completed instances.
