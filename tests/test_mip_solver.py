@@ -311,7 +311,10 @@ class MilpSolver(unittest.TestCase):
                                                  ('replay', [], 'x1'),
                                                  ('first', ['--first-fractional'], 'x0')]:
                     trace = root / f'{offset}-{policy}.jsonl'
-                    result = self.compare(model, ['--no-presolve', '--trace', trace, *flags])
+                    # Preserve the branching-policy experiment: root cuts can
+                    # close these independent rounding gaps before branching.
+                    result = self.compare(model, ['--no-presolve', '--no-root-cuts',
+                                                   '--trace', trace, *flags])
                     events = [json.loads(line) for line in trace.read_text().splitlines()]
                     branches = [(event['variable'], event['value']) for event in events
                                 if event['event'] == 'branch']

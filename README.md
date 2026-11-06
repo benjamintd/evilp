@@ -16,6 +16,10 @@ remaining coupled core. Guarded basis updates reuse that factorization across
 pivots, and a membership bitmap avoids repeatedly scanning the basis during
 pricing. Integer search adds conservative source-aware root propagation and
 deterministic reliability-based pseudocost selection.
+The current foundation adds one bounded round of exact root GMI cuts, with
+conservative binary publication, immutable augmented LP models and an
+independent original-source cut checker. See [root cuts](docs/ROOT-CUTS.md)
+and [the certificate format](docs/GMI-CERTIFICATES.md) for scope and limits.
 The independent checker validates original-model witnesses, rational LP bounds
 and exact infeasibility certificates.
 
@@ -25,6 +29,13 @@ See [source-sign repair and checked infeasibility candidates](docs/SOURCE-SAFETY
 [pivot safeguards and infeasibility witnesses](docs/MILESTONE-2E.md),
 [numerical scaling and refinement](docs/MILESTONE-2D.md), and
 [the integer-search contract](docs/MILESTONE-2BC.md).
+The [combined root-cut and source-unit validation](results/root-cut-combined-contracts-v1/summary.json)
+covers all 35 registered suites in Release and ASAN/UBSAN. The initial full
+runs each passed 34 suites and exposed a Python 3.9 oracle compatibility issue;
+the repaired oracle passed both unchanged engine builds in a targeted rerun.
+Source hashes, initial failures and corrective runs are retained. New numerical
+controls require original-unit ratios and refuse false optimality after unsafe
+entering candidates are excluded.
 The [primal recovery comparison](results/primal-recovery-v1/report.html),
 [40-case MILP crosscheck](results/mip-native-v5/summary.json), and
 [MIPLIB smoke report](results/miplib-smoke-2s-v4/runs/summary.html) preserve
@@ -36,12 +47,12 @@ successful witnesses, numerical failures and capacity limits. The earlier
 
 The [autoresearch protocol](docs/AUTORESEARCH.md) starts only after every MILP
 problem in the existing benchmarks passes. That gate is not yet complete.
-The [full 240-instance v3 inventory](results/miplib-candidate-v3/inventory.json)
-records zero unsupported cases, 238 time limits, two numerical stops, nine
+The latest [ten-second full inventory](results/miplib-candidate-10s-v1/inventory.json)
+records 232 time limits, four numerical stops, four watchdog stops, 13
 independently checked incumbents and zero correctly completed instances.
 All 240 attempts and all failures are retained. Concurrent engineering makes
 this development coverage evidence unsuitable for a speed ranking.
-The [gate result](results/miplib-candidate-v3/gate.json) remains closed. The
+The [gate result](results/miplib-candidate-10s-v1/gate.json) remains closed. The
 subsequent performance target is at least 120 strict paired wins against HiGHS
 over the fixed 240-instance denominator under matched conditions.
 
@@ -74,8 +85,8 @@ eligible reduced cost with phase-local stall fallback; `--bland-pricing` retains
 the original entering rule. The [combined checkpoint](results/simplified-source-contracts-v1/summary.json)
 at `332afbd` also passes all 26 suites in both builds. It adds a simplified
 multiplier candidate and identity-scaling fast paths. Those changes are outside
-the frozen v3 inventory. A fresh ten-second campaign retains all 240 models and
-will have separate completion counts after it finishes.
+the frozen v3 inventory. Its completed ten-second campaign retains all 240
+models. Later rational candidates and root cuts are outside that frozen build.
 
 Milestone 2A is preserved in [the original LP engine contract](docs/LP-ENGINE.md),
 [the lab's LP report](results/lp-native-v2/lab/summary.html), and

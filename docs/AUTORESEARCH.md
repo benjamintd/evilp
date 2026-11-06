@@ -47,15 +47,19 @@ feasible witnesses, numerical statuses and independently checked proofs remain
 distinct; individual LP certificates do not constitute a complete MILP tree proof.
 Any budget change creates a fresh declared campaign, preserving earlier results.
 
-The gate is currently **not complete**. The frozen
-[full 240-instance v3 inventory](../results/miplib-candidate-v3/inventory.json)
-contains one attempt for every locked instance: zero `unsupported`, 238
-`time_limit`, two `numerical_failure`, nine independently checked incumbents
-and zero correctly completed problems. Its [gate record](../results/miplib-candidate-v3/gate.json)
-has no missing instances and leaves both completion and speed gates closed.
-The inventory used a two-second budget at source revision `e02a45e`, while
-engineering ran concurrently. It is coverage and failure evidence, explicitly
-not a comparable timing campaign. The `=best=` reference for `supportcase22`
+The gate is currently **not complete**. The latest frozen
+[ten-second full inventory](../results/miplib-candidate-10s-v1/inventory.json)
+contains one attempt for every locked instance: 232 `time_limit`, four
+`numerical_failure`, four `watchdog_timeout`, 13 independently checked
+incumbents and zero correctly completed problems. Its
+[gate record](../results/miplib-candidate-10s-v1/gate.json) has no missing
+instances and leaves both completion and speed gates closed. It evaluates
+`332afbd`, before the later rational reconstruction and root cuts, while
+engineering ran concurrently. The earlier
+[two-second v3 inventory](../results/miplib-candidate-v3/inventory.json) retains
+its 238 time limits, two numerical failures and nine checked incumbents.
+These are coverage and failure evidence, explicitly not comparable timing
+campaigns. The `=best=` reference for `supportcase22`
 also remains an unresolved expected-outcome policy; it cannot be promoted to a
 known optimum. Passing unit tests or finding incumbents does not open the gate.
 
@@ -89,9 +93,12 @@ speed gate. No speed claim is made by either inventory or the 0.7 contract tests
 Pricing and pricing-integration tests are also additive prerequisites. All 26
 suites pass in both builds at `af61788` and the combined `332afbd` checkpoint;
 [recorded evidence](../results/simplified-source-contracts-v1/summary.json) binds
-tested source files to the commit. A new ten-second campaign preserves every
+tested source files to the commit. The ten-second campaign preserves every
 member and earlier result. A longer declared budget cannot turn a limit into a
-pass.
+pass. Native tableau, GMI arithmetic/oracle, independent cut checker,
+augmentation, root-cut pipeline/search and cut-aware trace contracts are
+additional required prerequisites once registered. Root cuts retain their
+explicit local MIP-box proof scope; they do not open this gate by themselves.
 
 ## One-paper, one-idea cycle after the gate
 

@@ -431,8 +431,10 @@ class FarkasPipeline(unittest.TestCase):
             self.assertEqual(default.returncode, 0, (default.stdout, default.stderr))
             self.assertEqual(json.loads(default.stdout)['status'], 'infeasible')
             # Root propagation now closes this integer model. Keep this same
-            # model, explicitly disable it to exercise local branch proofs.
-            p = subprocess.run([SOLVER, str(path), '--mip', '--no-presolve', '--trace', str(trace)],
+            # model, disable propagation and root cuts to exercise local LP
+            # branch proofs. Cut-dependent MIP proofs have a separate contract.
+            p = subprocess.run([SOLVER, str(path), '--mip', '--no-presolve', '--no-root-cuts',
+                                '--trace', str(trace)],
                                text=True, capture_output=True, timeout=20)
             self.assertEqual(p.returncode, 0, (p.stdout, p.stderr))
             self.assertEqual(json.loads(p.stdout)['status'], 'infeasible')

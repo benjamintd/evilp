@@ -8,4 +8,11 @@
  * Bland mode preserves the earlier ratio rule for controlled comparisons. */
 int lab_primal_ratio(size_t n, const double *xb, const double *direction,
                      const size_t *basis, int bland, size_t *leaving);
+/* Per-basic feasibility allowances in the same units as xb. All positive
+ * directions constrain the step, including directions too weak to pivot on.
+ * Bland ties are relative to the step size and remain inside every row's
+ * allowance. The legacy entry point above remains a comparison control. */
+int lab_primal_ratio_scaled(size_t n, const double *xb, const double *direction,
+                           const size_t *basis, const double *tolerance,
+                           int bland, size_t *leaving);
 #endif

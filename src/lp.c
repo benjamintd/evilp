@@ -1,4 +1,5 @@
 #include "lp.h"
+#include "native_tableau.h"
 #include "common.h"
 #include "linear.h"
 #include "exact.h"
@@ -227,7 +228,7 @@ static int basis_values(Work *w, int primal_required) {
         return -1;
     }
     for (size_t i = 0; i < w->m; i++) {
-        if (primal_required && w->xb[i] < -LAB_PRIMAL_TOLERANCE) {
+        if (primal_required && w->xb[i] < -original_basic_tolerance(w, i)) {
             message(w, "numerical_failure", "Basis lost primal feasibility");
             return -1;
         }
@@ -698,16 +699,18 @@ static int record_pricing_result(Work *w, LabPricing *pricing, LabPricingPending
     }
     return 0;
 }
-/* 0 optimum, 1 unbounded, -1 explicit failure/limit. Bland's normal leaving
- * order is preserved. A rejected basis can retry a validated Harris pivot. */
+/* 0 optimum, 1 unbounded, -1 explicit failure/limit. Unit-aware leaving
+ * choices must validate before acceptance. Unsafe entering candidates can be
+ * excluded for this basis only; exhausting them never establishes optimality. */
 static int simplex(Work *w, int phase_one) {
+    enum { MAX_REJECTED_CANDIDATES = 32 };
+    size_t rejected[MAX_REJECTED_CANDIDATES], rejected_count = 0;
     LabPricing pricing;
     LabPricingPending pending = {0};
     lab_pricing_begin(&pricing, w->options->bland_pricing);
     int factor_ready = 0;
     for (;;) {
-        /* Count a validated prior pivot before a possible budget exit. The
-         * deferred no-update/Bland-ratio path records only after refactoring. */
+        /* Count only a validated prior pivot before a possible budget exit. */
         if (factor_ready && record_pricing_result(w, &pricing, &pending))
             return -1;
         if (budget(w) || (!factor_ready && refactor(w, 1)))
@@ -745,7 +748,12 @@ static int simplex(Work *w, int phase_one) {
             worst = fmax(worst, (double)-reduced);
             /* An explicit cost with no dual contribution has no cancellation
              * to discount. Ignoring it can hide an improving unbounded ray. */
-            if ((reduced < -tolerance || (direct_cost < 0 && dot_magnitude == 0)) &&
+            int skipped = 0;
+            for (size_t k = 0; k < rejected_count; ++k)
+                if (rejected[k] == j)
+                    skipped = 1;
+            if (!skipped &&
+                (reduced < -tolerance || (direct_cost < 0 && dot_magnitude == 0)) &&
                 lab_pricing_consider(&pricing, &choice, j, reduced, 1) < 0) {
                 message(w, "numerical_failure", "Invalid primal pricing candidate");
                 return -1;
@@ -755,6 +763,12 @@ static int simplex(Work *w, int phase_one) {
         if (!phase_one)
             w->result->dual_residual = worst;
         if (entering == SIZE_MAX) {
+            /* Excluding an unsafe numerical candidate is not evidence that
+             * its reduced cost is nonnegative. Never call this an optimum. */
+            if (rejected_count) {
+                message(w, "numerical_failure", "Eligible columns have no validated primal pivot");
+                return -1;
+            }
             if (phase_one) {
                 double artificial_value = 0;
                 for (size_t i = 0; i < w->m; i++)
@@ -786,9 +800,21 @@ static int simplex(Work *w, int phase_one) {
             return -1;
         }
         size_t leaving = SIZE_MAX;
-        int ratio_status = lab_primal_ratio(w->m, w->xb, w->direction, w->basis,
-                                            1, &leaving);
+        /* cb is scratch after the transpose solve. Express each allowed
+         * primal error in its own original-variable or original-row units. */
+        for (size_t i = 0; i < w->m; ++i)
+            w->cb[i] = original_basic_tolerance(w, i);
+        int ratio_status = lab_primal_ratio_scaled(w->m, w->xb, w->direction, w->basis,
+                                                   w->cb, 1, &leaving);
         if (ratio_status) {
+            if (phase_one || ratio_status < 0) {
+                if (rejected_count < MAX_REJECTED_CANDIDATES) {
+                    rejected[rejected_count++] = entering;
+                    w->result->primal_candidate_rejections++;
+                    factor_ready = 1; /* unchanged, validated old basis */
+                    continue;
+                }
+            }
             if (phase_one || ratio_status < 0) {
                 message(w, "numerical_failure", "No stable leaving pivot");
                 return -1;
@@ -797,7 +823,8 @@ static int simplex(Work *w, int phase_one) {
         }
         size_t alternative = SIZE_MAX;
         if (!w->options->bland_ratio &&
-            lab_primal_ratio(w->m, w->xb, w->direction, w->basis, 0, &alternative))
+            lab_primal_ratio_scaled(w->m, w->xb, w->direction, w->basis,
+                                    w->cb, 0, &alternative))
             alternative = SIZE_MAX;
         size_t old_column = w->basis[leaving];
         size_t accepted_position = leaving;
@@ -813,13 +840,48 @@ static int simplex(Work *w, int phase_one) {
             if (update_basis(w, leaving, w->direction, 1)) {
                 w->result->rejected_pivots++;
                 change_basis(w, leaving, old_column);
-                if (alternative == SIZE_MAX || alternative == leaving || budget(w))
+                /* The rejected trial changed the factor as well as the
+                 * combinatorial basis. Restore and validate both before
+                 * retrying or returning the trial's failure. */
+                const char *failed_status = w->result->status;
+                char failed_message[sizeof w->result->message];
+                memcpy(failed_message, w->result->message, sizeof failed_message);
+                if (refactor(w, 1))
                     return -1;
+                w->result->status = failed_status;
+                memcpy(w->result->message, failed_message, sizeof failed_message);
+                if (budget(w))
+                    return -1;
+                if (alternative == SIZE_MAX || alternative == leaving) {
+                    if (rejected_count == MAX_REJECTED_CANDIDATES)
+                        return -1;
+                    rejected[rejected_count++] = entering;
+                    w->result->primal_candidate_rejections++;
+                    w->result->status = prior_status;
+                    memcpy(w->result->message, prior_message, sizeof prior_message);
+                    factor_ready = 1;
+                    continue;
+                }
+                size_t alternative_old = w->basis[alternative];
                 change_basis(w, alternative, entering);
                 w->result->iterations++;
                 if (refactor(w, 1)) {
                     w->result->rejected_pivots++;
-                    return -1;
+                    failed_status = w->result->status;
+                    memcpy(failed_message, w->result->message, sizeof failed_message);
+                    change_basis(w, alternative, alternative_old);
+                    if (refactor(w, 1))
+                        return -1;
+                    w->result->status = failed_status;
+                    memcpy(w->result->message, failed_message, sizeof failed_message);
+                    if (budget(w) || rejected_count == MAX_REJECTED_CANDIDATES)
+                        return -1;
+                    rejected[rejected_count++] = entering;
+                    w->result->primal_candidate_rejections++;
+                    w->result->status = prior_status;
+                    memcpy(w->result->message, prior_message, sizeof prior_message);
+                    factor_ready = 1;
+                    continue;
                 }
                 accepted_position = alternative;
                 w->result->harris_rescues++;
@@ -827,15 +889,33 @@ static int simplex(Work *w, int phase_one) {
                 memcpy(w->result->message, prior_message, sizeof prior_message);
             }
             factor_ready = 1;
-        } else if (!w->options->no_updates) {
-            if (update_basis(w, leaving, w->direction, 1))
-                return -1;
+        } else {
+            if (update_basis(w, leaving, w->direction, 1)) {
+                w->result->rejected_pivots++;
+                const char *failed_status = w->result->status;
+                char failed_message[sizeof w->result->message];
+                memcpy(failed_message, w->result->message, sizeof failed_message);
+                change_basis(w, leaving, old_column);
+                if (refactor(w, 1))
+                    return -1;
+                w->result->status = failed_status;
+                memcpy(w->result->message, failed_message, sizeof failed_message);
+                if (budget(w) || rejected_count == MAX_REJECTED_CANDIDATES)
+                    return -1;
+                rejected[rejected_count++] = entering;
+                w->result->primal_candidate_rejections++;
+                w->result->status = prior_status;
+                memcpy(w->result->message, prior_message, sizeof prior_message);
+                factor_ready = 1;
+                continue;
+            }
             factor_ready = 1;
         }
         if (lab_pricing_queue(&pending, accepted_position, entering)) {
             message(w, "numerical_failure", "Invalid pending primal pricing event");
             return -1;
         }
+        rejected_count = 0; /* every exclusion belongs to the prior basis */
     }
 }
 static void remove_row(Work *w, size_t row, size_t basis_position) {
@@ -1663,8 +1743,35 @@ static int cold_solve(Work *w, const LabModel *m) {
         message(w, "infeasible", "Positive Phase I artificial objective (numerical claim)");
         return -1;
     }
-    if (remove_artificials(w) || load_basis(w) < 0)
+    if (remove_artificials(w))
         return -1;
+    int loaded = load_basis(w);
+    if (loaded < 0)
+        return -1;
+    if (loaded) {
+        /* A retained basis can be dual feasible but primal infeasible. Keep
+         * its signed values intact and use the existing guarded dual repair
+         * before entering primal simplex, rather than clamping a source-unit
+         * violation to zero. dual_simplex independently checks dual signs. */
+        if (refactor(w, 0))
+            return -1;
+        int needs_repair = 0;
+        for (size_t i = 0; i < w->m; ++i)
+            if (w->xb[i] < -original_basic_tolerance(w, i))
+                needs_repair = 1;
+        if (needs_repair) {
+            if (w->options->no_primal_repair) {
+                message(w, "numerical_failure", "Retained basis needs original-unit primal repair");
+                return -1;
+            }
+            w->result->primal_repairs++;
+            size_t before = w->result->dual_iterations;
+            int repaired = dual_simplex(w, 1);
+            w->result->primal_repair_iterations += w->result->dual_iterations - before;
+            if (repaired)
+                return -1;
+        }
+    }
     int status = simplex(w, 0);
     if (status < 0 || restore_primal(w, m))
         return -1;
@@ -1816,6 +1923,8 @@ struct LabLpSession {
     Work work;
     double deadline;
     int ready;
+    size_t bound_generation, solved_generation;
+    int export_ready;
 };
 LabLpSession *lab_lp_session_create(const LabModel *m, const LabLpOptions *options) {
     if (!m || !options || !isfinite(options->time_limit) || !options->max_dimension ||
@@ -1839,6 +1948,10 @@ int lab_lp_session_set_bounds(LabLpSession *s, size_t j, double lower, double up
         upper == -INFINITY || lower < s->original->col_lower[j] ||
         upper > s->original->col_upper[j])
         return -1;
+    if (s->model.col_lower[j] != lower || s->model.col_upper[j] != upper) {
+        s->bound_generation++;
+        s->export_ready = 0;
+    }
     s->model.col_lower[j] = lower;
     s->model.col_upper[j] = upper;
     return 0;
@@ -1908,6 +2021,7 @@ void lab_lp_session_solve(LabLpSession *s, LabLpResult *result) {
         snprintf(result->message, sizeof result->message, "Invalid LP session");
         return;
     }
+    s->export_ready = 0;
     Work *w = &s->work;
     for (size_t j = 0; j < s->model.cols; j++)
         if (s->model.col_lower[j] > s->model.col_upper[j]) {
@@ -1968,6 +2082,10 @@ void lab_lp_session_solve(LabLpSession *s, LabLpResult *result) {
     (void)cold_solve(w, &s->model);
     s->ready = !strcmp(result->status, "optimal");
 done:
+    if (s->ready && result->has_primal && !strcmp(result->status, "optimal")) {
+        s->solved_generation = s->bound_generation;
+        s->export_ready = 1;
+    }
     result->scaled_rows = w->scaled_rows;
     result->scaled_columns = w->scaled_columns;
     if (w->a)
@@ -2000,3 +2118,5 @@ void lab_lp_solve(const LabModel *m, const LabLpOptions *options, LabLpResult *r
     lab_lp_session_solve(s, result);
     lab_lp_session_free(s);
 }
+
+#include "native_tableau.inc"

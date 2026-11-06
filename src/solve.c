@@ -100,7 +100,7 @@ int main(int argc, char **argv) {
              "          [--no-primal-repair] [--no-updates] [--bland-pricing]\n"
              "          LP: [--dual NEW_FILE] [--farkas NEW_FILE] [--basis NEW_FILE] [--read-basis FILE]\n"
              "          MILP: [--node-limit N] [--cold] [--trace NEW_FILE]\n"
-             "                [--no-presolve] [--first-fractional]\n"
+             "                [--no-presolve] [--first-fractional] [--no-root-cuts]\n"
              "C17 LP and numerical branch-and-bound prototype. Select problem mode explicitly.\n"
              "JSON statuses are numerical solver claims; use milpcheck for validation.\n"
              "Sparse standard-form limit16000000; dense hard cap4096. Sparse basis limit8000000.");
@@ -108,7 +108,7 @@ int main(int argc, char **argv) {
     }
     const char *path = NULL, *solution = NULL, *dual = NULL, *trace_path = NULL, *farkas = NULL;
     int relax = 0, mip = 0, cold = 0, node_limit_set = 0, dimension_limit_set = 0;
-    int no_presolve = 0, first_fractional = 0;
+    int no_presolve = 0, first_fractional = 0, no_root_cuts = 0;
     size_t node_limit = 100000;
     LabLpOptions options = {.time_limit = 60, .iteration_limit = 100000,
                             .max_dimension = LAB_LP_SPARSE_DIMENSION_LIMIT};
@@ -138,6 +138,8 @@ int main(int argc, char **argv) {
             no_presolve = 1;
         } else if (!strcmp(a, "--first-fractional")) {
             first_fractional = 1;
+        } else if (!strcmp(a, "--no-root-cuts")) {
+            no_root_cuts = 1;
         } else if (!strcmp(a, "--solution") || !strcmp(a, "--dual") || !strcmp(a, "--basis") ||
                    !strcmp(a, "--read-basis") || !strcmp(a, "--trace") || !strcmp(a, "--farkas")) {
             if (++i == argc)
@@ -196,7 +198,8 @@ int main(int argc, char **argv) {
     if (mip && (dual || farkas || options.basis_in || options.basis_out))
         return error("input_error",
                      "Dual/basis files are LP-only; MILP tree proofs are not implemented", 2);
-    if (!mip && (cold || node_limit_set || trace_path || no_presolve || first_fractional))
+    if (!mip && (cold || node_limit_set || trace_path || no_presolve || first_fractional ||
+                 no_root_cuts))
         return error("input_error", "Cold search, node limits and traces require --mip", 2);
     if (options.dense && !dimension_limit_set)
         options.max_dimension = LAB_LP_DENSE_DIMENSION_LIMIT;
@@ -223,6 +226,7 @@ int main(int argc, char **argv) {
                                    .cold = cold,
                                    .no_presolve = no_presolve,
                                    .first_fractional = first_fractional,
+                                   .no_root_cuts = no_root_cuts,
                                    .trace_path = trace_path};
         LabBbResult r;
         lab_bb_solve(&model, &bb_options, &r);
@@ -272,7 +276,10 @@ int main(int argc, char **argv) {
                "\"source_projected_rows\":%zu,\"source_removed_terms\":%zu,\"source_reconstructed_terms\":%zu,"
                "\"primal_accepted_pivots\":%zu,"
                "\"primal_zero_steps\":%zu,\"primal_short_steps\":%zu,"
-               "\"pricing_bland_fallbacks\":%zu,\"pricing_requested\":\"%s\"}\n",
+               "\"pricing_bland_fallbacks\":%zu,\"primal_candidate_rejections\":%zu,"
+               "\"pricing_requested\":\"%s\","
+               "\"root_cuts_enabled\":%s,\"root_cut_attempts\":%zu,\"root_cuts\":%zu,"
+               "\"root_cut_lp_solves\":%zu,\"root_cut_status\":\"%s\"}\n",
                model.rows, model.cols, model.nnz, r.nodes, r.lp_solves, r.lp_iterations,
                r.refactorizations, r.warm_starts, r.cold_starts, r.pruned_nodes, r.dual_iterations,
                r.cold_fallbacks, r.factor_nnz_peak, r.standard_nnz_peak, r.elapsed,
@@ -292,7 +299,10 @@ int main(int argc, char **argv) {
                r.source_removed_terms,
                r.source_reconstructed_terms,
                r.primal_accepted_pivots, r.primal_zero_steps, r.primal_short_steps,
-               r.pricing_bland_fallbacks, options.bland_pricing ? "bland" : "most_negative");
+               r.pricing_bland_fallbacks, r.primal_candidate_rejections,
+               options.bland_pricing ? "bland" : "most_negative",
+               no_root_cuts ? "false" : "true", r.root_cut_attempts, r.root_cuts,
+               r.root_cut_lp_solves, r.root_cut_status);
         int code = status_code(r.status);
         lab_bb_result_free(&r);
         lab_model_free(&model);
@@ -343,7 +353,8 @@ int main(int argc, char **argv) {
         "\"source_projected_rows\":%zu,\"source_removed_terms\":%zu,\"source_reconstructed_terms\":%zu,"
         "\"farkas_margin_kind\":\"%s\",\"primal_accepted_pivots\":%zu,"
         "\"primal_zero_steps\":%zu,\"primal_short_steps\":%zu,"
-        "\"pricing_bland_fallbacks\":%zu,\"pricing_requested\":\"%s\"}\n",
+        "\"pricing_bland_fallbacks\":%zu,\"primal_candidate_rejections\":%zu,"
+        "\"pricing_requested\":\"%s\"}\n",
         model.rows, model.cols, model.nnz, r.standard_rows, r.standard_columns, r.redundant_rows,
         r.iterations, r.refactorizations, r.primal_residual, r.dual_residual, r.elapsed,
         lab_now() - started, options.dense ? "dense_lu_reference" : "sparse_lu",
@@ -362,7 +373,8 @@ int main(int argc, char **argv) {
         r.source_reconstructed_terms,
         !r.farkas ? "absent" : r.farkas_margin_is_lower_bound ? "source_enclosure" : "exact",
         r.primal_accepted_pivots, r.primal_zero_steps, r.primal_short_steps,
-        r.pricing_bland_fallbacks, options.bland_pricing ? "bland" : "most_negative");
+        r.pricing_bland_fallbacks, r.primal_candidate_rejections,
+        options.bland_pricing ? "bland" : "most_negative");
     int code = status_code(r.status);
     lab_lp_result_free(&r);
     lab_model_free(&model);

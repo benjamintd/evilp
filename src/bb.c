@@ -3,6 +3,8 @@
 #include "exact.h"
 #include "presolve.h"
 #include "search.h"
+#include "augment.h"
+#include "root_cut.h"
 #include <math.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -23,6 +25,8 @@ typedef struct Node {
 typedef struct {
     const LabModel *model;
     LabModel lp_model;
+    LabModel augmented;
+    LabRootCutBatch cuts;
     double *lp_row_lower, *lp_row_upper;
     LabSearch branching;
     const LabBbOptions *options;
@@ -82,6 +86,44 @@ static void bounds(Search *s, const Node *node) {
 }
 static double remaining(const Search *s) {
     return s->options->time_limit - (lab_now() - s->started);
+}
+static void current_bound(const Search *s, size_t j, double value, int upper, mpq_t q) {
+    const LabExactModel *e = s->model->exact;
+    if (e && value == (upper ? e->col_upper_source[j] : e->col_lower_source[j]))
+        mpq_set(q, upper ? e->col_upper[j] : e->col_lower[j]);
+    else
+        mpq_set_d(q, value);
+}
+/* Every active cut is conditional on the exported root box. Verify this
+ * premise in exact source units for node and fixed-integer repair LPs. */
+static int cut_box_contains(const Search *s, const LabRootCutBatch *cuts,
+                            const double *lower, const double *upper) {
+    if (cuts->columns != s->model->cols || (cuts->columns && !cuts->box))
+        return 0;
+    mpq_t q;
+    mpq_init(q);
+    int valid = 1;
+    for (size_t j = 0; valid && j < cuts->columns; j++) {
+        const LabNativeBox *b = &cuts->box[j];
+        if (b->has_lower) {
+            if (!isfinite(lower[j]))
+                valid = 0;
+            else {
+                current_bound(s, j, lower[j], 0, q);
+                valid = mpq_cmp(q, b->lower) >= 0;
+            }
+        }
+        if (valid && b->has_upper) {
+            if (!isfinite(upper[j]))
+                valid = 0;
+            else {
+                current_bound(s, j, upper[j], 1, q);
+                valid = mpq_cmp(q, b->upper) <= 0;
+            }
+        }
+    }
+    mpq_clear(q);
+    return valid;
 }
 /* Compare contributions relative to a fixed reference before summation.
  * Constant objective offsets and large fixed-variable contributions must not
@@ -150,6 +192,10 @@ static int call_lp(Search *s, const double *lower, const double *upper, LabLpRes
         outcome(s, "time_limit", "MILP time budget exhausted");
         return -1;
     }
+    if (s->cuts.count && !cut_box_contains(s, &s->cuts, lower, upper)) {
+        outcome(s, "numerical_failure", "LP bounds leave the certified root-cut box");
+        return -1;
+    }
     LabLpOptions opt = s->options->lp;
     opt.time_limit = fmin(opt.time_limit, remaining(s));
     opt.basis_in = opt.basis_out = NULL;
@@ -195,6 +241,7 @@ static int call_lp(Search *s, const double *lower, const double *upper, LabLpRes
     s->result->primal_zero_steps += lp->primal_zero_steps;
     s->result->primal_short_steps += lp->primal_short_steps;
     s->result->pricing_bland_fallbacks += lp->pricing_bland_fallbacks;
+    s->result->primal_candidate_rejections += lp->primal_candidate_rejections;
     s->result->primal_repairs += lp->primal_repairs;
     s->result->primal_repair_iterations += lp->primal_repair_iterations;
     s->result->exact_primal_attempts += lp->exact_primal_attempts;
@@ -221,9 +268,22 @@ static int call_lp(Search *s, const double *lower, const double *upper, LabLpRes
     s->result->lp_iterations += lp->iterations;
     s->result->refactorizations += lp->refactorizations;
     if (s->trace && lp->farkas) {
-        fprintf(s->trace, "{\"event\":\"lp_infeasibility_certificate\",\"lp_solve\":%zu,"
-                         "\"scope\":\"LP with recorded column bounds; not a tree proof\","
-                         "\"bounds\":[", s->result->lp_solves);
+        fprintf(s->trace, "{\"event\":\"%s\",\"lp_solve\":%zu,\"scope\":",
+                s->cuts.count ? "mip_in_box_infeasibility_certificate"
+                              : "lp_infeasibility_certificate", s->result->lp_solves);
+        lab_json_string(s->trace, s->cuts.count
+            ? "Original MIP with recorded bounds and GMI cuts; not original LP or a tree proof"
+            : "LP with recorded column bounds; not a tree proof");
+        if (s->cuts.count) {
+            fputs(",\"cut_ids\":[", s->trace);
+            for (size_t r = 0; r < s->cuts.count; r++) {
+                if (r)
+                    fputc(',', s->trace);
+                lab_json_string(s->trace, s->lp_model.row_name[s->model->rows + r]);
+            }
+            fputc(']', s->trace);
+        }
+        fputs(",\"bounds\":[", s->trace);
         mpq_t q;
         mpq_init(q);
         for (size_t j = 0; j < s->model->cols; j++) {
@@ -254,7 +314,7 @@ static int call_lp(Search *s, const double *lower, const double *upper, LabLpRes
         for (size_t i = 0; i < lp->farkas_rows; i++) {
             if (i)
                 fputc(',', s->trace);
-            lab_json_string(s->trace, s->model->row_name[i]);
+            lab_json_string(s->trace, s->lp_model.row_name[i]);
             fputc(':', s->trace);
             lab_json_string(s->trace, lp->farkas[i]);
         }
@@ -272,6 +332,95 @@ static int call_lp(Search *s, const double *lower, const double *upper, LabLpRes
         return -1;
     }
     return 0;
+}
+/* A single bounded root round. New rows and their session are constructed
+ * before changing the live search view; the original candidate model never
+ * changes. Failure to derive/allocate usable cuts leaves the old LP intact. */
+static int root_cuts(Search *s) {
+    s->result->root_cut_attempts++;
+    if (!s->session) {
+        s->result->root_cut_status = "session_unavailable";
+        return 0;
+    }
+    LabRootCutBatch candidate;
+    lab_root_cut_batch_init(&candidate);
+    double budget = fmin(1, .05 * remaining(s));
+    LabRootCutLimits cut_limits = lab_root_cut_limits(lab_now() + budget);
+    LabRootCutStatus status = lab_root_cut_derive(s->session, s->model, &cut_limits, &candidate);
+    s->result->root_cut_status = lab_root_cut_status_name(status);
+    if (remaining(s) <= 0) {
+        lab_root_cut_batch_free(&candidate);
+        outcome(s, "time_limit", "MILP time budget exhausted deriving root cuts");
+        return -1;
+    }
+    if (status != LAB_ROOT_CUT_OK || !candidate.count) {
+        lab_root_cut_batch_free(&candidate);
+        return 0;
+    }
+    if (!cut_box_contains(s, &candidate, s->lower, s->upper)) {
+        s->result->root_cut_status = "box_mismatch";
+        lab_root_cut_batch_free(&candidate);
+        return 0;
+    }
+    LabAddedRow *rows = lab_alloc(candidate.count, sizeof *rows);
+    char **names = lab_alloc(candidate.count, sizeof *names);
+    size_t serial = 0;
+    for (size_t r = 0; r < candidate.count; r++) {
+        char name[80];
+        int collision;
+        do {
+            snprintf(name, sizeof name, "__milplab_gmi_%zu", serial++);
+            collision = 0;
+            for (size_t i = 0; i < s->lp_model.rows; i++)
+                if (!strcmp(name, s->lp_model.row_name[i]))
+                    collision = 1;
+        } while (collision);
+        names[r] = lab_strdup(name);
+        rows[r] = (LabAddedRow){names[r], candidate.cut[r].coefficient,
+                                candidate.cut[r].lower, INFINITY};
+    }
+    LabAugmentLimits limits = {.max_rows = 8000000, .max_nonzeros = 128000000,
+                               .max_added_rows = 4};
+    LabAugmentStatus augmented = lab_model_append_rows(&s->lp_model, candidate.count,
+                                                       rows, &limits, &s->augmented);
+    for (size_t r = 0; r < candidate.count; r++)
+        free(names[r]);
+    free(names);
+    free(rows);
+    if (augmented != LAB_AUGMENT_OK) {
+        s->result->root_cut_status = augmented == LAB_AUGMENT_RESOURCE
+            ? "augmentation_resource_limit" : "augmentation_invalid";
+        lab_root_cut_batch_free(&candidate);
+        return 0;
+    }
+    LabLpSession *next = NULL;
+    if (!s->options->cold) {
+        LabLpOptions options = s->options->lp;
+        options.basis_in = options.basis_out = NULL;
+        options.time_limit = fmin(options.time_limit, remaining(s));
+        next = lab_lp_session_create(&s->augmented, &options);
+        if (!next) {
+            s->result->root_cut_status = "augmented_session_unavailable";
+            lab_model_free(&s->augmented);
+            lab_root_cut_batch_free(&candidate);
+            return 0;
+        }
+    }
+    lab_lp_session_free(s->session);
+    s->session = next;
+    s->lp_model = s->augmented;
+    s->cuts = candidate;
+    s->result->root_cuts = candidate.count;
+    s->result->root_cut_status = "applied";
+    if (s->trace)
+        for (size_t r = 0; r < candidate.count; r++) {
+            fputs("{\"event\":\"root_gmi_cut\",\"cut_id\":", s->trace);
+            lab_json_string(s->trace, s->lp_model.row_name[s->model->rows + r]);
+            fputs(",\"scope\":\"ORIGINAL_MIP_IN_BOX\",\"certificate\":", s->trace);
+            lab_json_string(s->trace, candidate.cut[r].certificate);
+            fputs("}\n", s->trace);
+        }
+    return 1;
 }
 static int unresolved(Search *s, const LabLpResult *lp) {
     if (!strcmp(lp->status, "optimal") || !strcmp(lp->status, "infeasible"))
@@ -428,6 +577,7 @@ void lab_bb_solve(const LabModel *model, const LabBbOptions *options, LabBbResul
     s.sense = model->maximize ? -1 : 1;
     s.incumbent = INFINITY;
     s.started = lab_now();
+    result->root_cut_status = options->no_root_cuts ? "disabled" : "not_attempted";
     outcome(&s, "numerical_failure", "MILP search did not complete");
     if (!isfinite(options->time_limit) || !options->node_limit) {
         outcome(&s, "input_error", "Positive finite time and node limits are required");
@@ -532,7 +682,7 @@ void lab_bb_solve(const LabModel *model, const LabBbOptions *options, LabBbResul
     if (!options->first_fractional)
         (void)lab_search_init(&s.branching, n); /* allocation failure keeps deterministic fallback */
 #ifdef LAB_LP_SESSION_API
-    if (!options->cold) {
+    if (!options->cold || !options->no_root_cuts) {
         LabLpOptions opt = options->lp;
         opt.basis_in = opt.basis_out = NULL;
         opt.time_limit = fmin(opt.time_limit, remaining(&s));
@@ -570,6 +720,7 @@ void lab_bb_solve(const LabModel *model, const LabBbOptions *options, LabBbResul
             release(node);
             goto cleanup;
         }
+node_lp_ready:
         trace(&s, node, lp.status, SIZE_MAX, lp.objective, lp.has_primal);
         if (unresolved(&s, &lp)) {
             global_bound(&s, node);
@@ -609,6 +760,34 @@ void lab_bb_solve(const LabModel *model, const LabBbOptions *options, LabBbResul
             lab_lp_result_free(&lp);
             release(node);
             goto cleanup;
+        }
+        if (!node->parent && !options->no_root_cuts && !result->root_cut_attempts) {
+            int fractional = 0;
+            for (size_t j = 0; j < model->cols; j++)
+                if (model->integer[j] && fabs(lp.primal[j] - round(lp.primal[j])) > 1e-7)
+                    fractional = 1;
+            int added = fractional ? root_cuts(&s) : 0;
+            if (added < 0) {
+                global_bound(&s, node);
+                lab_lp_result_free(&lp);
+                release(node);
+                goto cleanup;
+            }
+            if (options->cold) {
+                lab_lp_session_free(s.session);
+                s.session = NULL;
+            }
+            if (added) {
+                lab_lp_result_free(&lp);
+                result->root_cut_lp_solves++;
+                if (call_lp(&s, s.lower, s.upper, &lp)) {
+                    global_bound(&s, node);
+                    lab_lp_result_free(&lp);
+                    release(node);
+                    goto cleanup;
+                }
+                goto node_lp_ready;
+            }
         }
         long double normalized = score(&s, lp.primal);
         long double lower = normalized - 1e-7L * (1 + fabsl(normalized));
@@ -694,6 +873,8 @@ cleanup:
 #ifdef LAB_LP_SESSION_API
     lab_lp_session_free(s.session);
 #endif
+    lab_model_free(&s.augmented);
+    lab_root_cut_batch_free(&s.cuts);
     lab_search_free(&s.branching);
     if (s.trace) {
         int failed = ferror(s.trace);

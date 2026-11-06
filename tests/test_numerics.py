@@ -247,6 +247,24 @@ class Numerics(unittest.TestCase):
         self.assertGreaterEqual(result['max_backward_error'], 0, result)
         self.assertTrue(math.isfinite(result['max_backward_error']), result)
 
+    def test_excluded_unsafe_entering_column_never_establishes_an_optimum(self):
+        # Exact feasible set is x=0. Without scaling, the positive limiting
+        # direction is too weak for a stable pivot. Rejecting its improving
+        # column must remain an unresolved numerical outcome, not an optimum
+        # or an unbounded-ray claim. Normal scaling solves the same model.
+        model = {'cost': [-1], 'bounds': [(0, None)],
+                 'rows': [([F(1, 10**13)], None, 0)]}
+        self.compare(model)
+        for flags in [[], ['--no-updates'], ['--bland-ratio']]:
+            with self.subTest(flags=flags):
+                code, result, values, check = self.invoke(model, ['--no-scaling', *flags])
+                self.assertEqual(code, 4, result)
+                self.assertEqual(result['status'], 'numerical_failure')
+                self.assertIn('no validated primal pivot', result['message'])
+                self.assertEqual(result['primal_candidate_rejections'], 1)
+                self.assertFalse(values)
+                self.assertIsNone(check)
+
 
 if __name__ == '__main__':
     unittest.main()

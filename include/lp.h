@@ -41,6 +41,7 @@ typedef struct {
     size_t basis_updates, basis_update_rejections;
     size_t factor_core_peak, singleton_eliminations_peak;
     size_t primal_accepted_pivots, primal_zero_steps, primal_short_steps, pricing_bland_fallbacks;
+    size_t primal_candidate_rejections;
 } LabLpResult;
 void lab_lp_solve(const LabModel *m, const LabLpOptions *options, LabLpResult *result);
 void lab_lp_result_free(LabLpResult *result);

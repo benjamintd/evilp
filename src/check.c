@@ -923,52 +923,78 @@ static void json_q(const mpq_t q) {
     lab_json_string(stdout, s);
     free(s);
 }
+#include "check_gmi.inc"
+
 int main(int argc, char **argv) {
     if (argc == 2 && !strcmp(argv[1], "--help")) {
-        puts("milpcheck --model FILE [--inspect | --solution FILE | --dual FILE | --farkas FILE]\n"
+        puts("milpcheck --model FILE [--inspect | --solution FILE | --dual FILE | --farkas FILE | --gmi FILE]\n"
              "          [--format simple|rational|highs|scip|cbc] [--relax] [--dual FILE]\n"
              "          [--lin-tol DECIMAL] [--int-tol DECIMAL] [--obj-tol DECIMAL] [--exact]\n"
              "Independent exact primal, LP-bound and Farkas infeasibility checking.\n"
              "Matching exact primal/dual witnesses can certify optimality. Farkas proof\n"
-             "validity ignores tolerances; no unboundedness proof is implemented.");
+             "validity ignores tolerances; no unboundedness proof is implemented.\n"
+             "GMI mode checks a cut for the original MIP in its recorded box.\n"
+             "Use --model FILE --gmi FILE without other mode/tolerance options.");
         return 0;
     }
-    const char *model = NULL, *sol = NULL, *dual = NULL, *farkas = NULL, *format = "simple",
+    const char *model = NULL, *sol = NULL, *dual = NULL, *farkas = NULL, *gmi = NULL,
+               *format = "simple",
                *lt = "1e-4", *it = "1e-5", *ot = "1e-4";
-    int inspect = 0, relax = 0;
+    int inspect = 0, relax = 0, gmi_conflict = 0, model_count = 0;
     for (int i = 1; i < argc; i++) {
-        if (!strcmp(argv[i], "--inspect"))
+        if (!strcmp(argv[i], "--inspect")) {
             inspect = 1;
-        else if (!strcmp(argv[i], "--relax"))
+            gmi_conflict = 1;
+        } else if (!strcmp(argv[i], "--relax")) {
             relax = 1;
-        else if (!strcmp(argv[i], "--exact"))
+            gmi_conflict = 1;
+        } else if (!strcmp(argv[i], "--exact")) {
             lt = it = ot = "0";
-        else if (i + 1 < argc && !strcmp(argv[i], "--model"))
+            gmi_conflict = 1;
+        } else if (i + 1 < argc && !strcmp(argv[i], "--model")) {
             model = argv[++i];
-        else if (i + 1 < argc && !strcmp(argv[i], "--solution"))
+            model_count++;
+        } else if (i + 1 < argc && !strcmp(argv[i], "--gmi")) {
+            if (gmi) {
+                fputs("duplicate --gmi argument\n", stderr);
+                return 64;
+            }
+            gmi = argv[++i];
+        } else if (i + 1 < argc && !strcmp(argv[i], "--solution"))
             sol = argv[++i];
         else if (i + 1 < argc && !strcmp(argv[i], "--dual"))
             dual = argv[++i];
         else if (i + 1 < argc && !strcmp(argv[i], "--farkas"))
             farkas = argv[++i];
-        else if (i + 1 < argc && !strcmp(argv[i], "--format"))
+        else if (i + 1 < argc && !strcmp(argv[i], "--format")) {
             format = argv[++i];
-        else if (i + 1 < argc && !strcmp(argv[i], "--lin-tol"))
+            gmi_conflict = 1;
+        } else if (i + 1 < argc && !strcmp(argv[i], "--lin-tol")) {
             lt = argv[++i];
-        else if (i + 1 < argc && !strcmp(argv[i], "--int-tol"))
+            gmi_conflict = 1;
+        } else if (i + 1 < argc && !strcmp(argv[i], "--int-tol")) {
             it = argv[++i];
-        else if (i + 1 < argc && !strcmp(argv[i], "--obj-tol"))
+            gmi_conflict = 1;
+        } else if (i + 1 < argc && !strcmp(argv[i], "--obj-tol")) {
             ot = argv[++i];
-        else {
+            gmi_conflict = 1;
+        } else {
             fprintf(stderr, "unknown/missing argument: %s\n", argv[i]);
             return 64;
         }
+    }
+    if (gmi) {
+        if (!model || model_count != 1 || gmi_conflict || sol || dual || farkas) {
+            fputs("usage: milpcheck --model FILE --gmi FILE (no other modes/options)\n", stderr);
+            return 64;
+        }
+        return gmi_check_model(model, gmi);
     }
     if (!model || (!inspect && !sol && !dual && !farkas) ||
         (inspect && (sol || dual || farkas)) || (farkas && (sol || dual)) ||
         (strcmp(format, "simple") && strcmp(format, "highs") && strcmp(format, "scip") &&
          strcmp(format, "cbc") && strcmp(format, "rational"))) {
-        fputs("usage: milpcheck --model FILE [--inspect | --solution FILE | --dual FILE | --farkas FILE] "
+        fputs("usage: milpcheck --model FILE [--inspect | --solution FILE | --dual FILE | --farkas FILE | --gmi FILE] "
               "[--format simple|rational|highs|scip|cbc] [--relax] [--dual FILE] [--exact]\n",
               stderr);
         return 64;

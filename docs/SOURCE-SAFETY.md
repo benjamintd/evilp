@@ -139,6 +139,41 @@ do not replace the frozen full-corpus counts.
 The node-78 residual involves meaningful multipliers rather than tiny terms.
 Offline nearest-rational reconstruction with denominator limit `2^20` gives a
 new vector whose complete source-enclosure proof has margin `13/420`; the
-independent checker confirms it. A fourth C constructor is being validated as
-a separate candidate proposal. Its acceptance still requires the complete
-unchanged proof. No nonzero combined coefficient is clipped.
+independent checker confirms it. The fourth C constructor is committed at
+`4eead21`; all 26 Release and sanitizer suites pass at that checkpoint. A fresh
+`glass4` diagnostic advances to node 459, where another numerical stop remains.
+All 148 emitted local proofs pass independent replay in
+`work/reconstructed-glass-proof-replay-v1/summary.json`. Its acceptance still
+requires the complete unchanged proof. No nonzero combined coefficient is
+clipped.
+
+## Source-unit primal ratios and bounded retries
+
+A captured `mas76` basis exposed a separate primal issue: scaled row slacks
+with equation scale `2^-39` could be clamped by a global canonical `1e-7`
+allowance despite material violations in original row units. Basic feasibility
+and both leaving-row choices now use the existing original-unit allowance.
+Every positive direction limits the step, including directions too weak for a
+stable pivot. Tiny-step ties are relative, and the chosen actual binary step
+must stay inside each row's own allowance. Exact dyadic unit-change controls
+preserve the true limiting row in all 50 cases; the old tie rule crosses a
+material allowance in 25 comparison cases.
+
+Rejected trial bases restore and revalidate the old basis and factor before
+continuing. Up to 32 unsafe entering candidates can be excluded for that basis
+only, with the existing budget guards. A validated basis change clears the
+exclusions. If every eligible candidate has been excluded, the result is an
+unresolved numerical failure, never an optimum or unboundedness claim. A weak
+positive-direction LP explicitly tests this behavior with updates enabled and
+disabled and under the Bland-ratio control. Retained dual-feasible bases use
+the guarded dual repair when source-unit basic feasibility requires it.
+
+The captured `mas76` node now solves with zero independently checked row and
+bound violations. Selected full `mas76` and Nidda runs pass their prior
+numerical stops and reach time limits with checked incumbents. A captured
+Nidda node reprices once and produces an independently checked exact local
+Farkas contradiction. The patch's 26-suite Release and sanitizer evidence,
+generic cases and selected positive/negative controls are retained in
+`work/pivot-recovery-next/handoff.json`. Later combined tests additionally
+exercise these paths with active root cuts. None of these selected outcomes
+establishes full MIPLIB completion or matched solver speed.
