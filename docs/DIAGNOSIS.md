@@ -27,16 +27,35 @@ its MILP still times out. The ran relaxation times out in our solver while
 HiGHS finishes it. These diagnostic runs had concurrent engineering activity
 and do not establish fair speed ratios.
 
-Basis-update application and compensated residuals dominate the CPU samples.
-Stored update directions are frequently sparse, but the current application
-scans every entry. The first proposed experiment is a sparse representation
-using exact zeros only, with a dense fallback. Keep original-unit residuals,
-refinement, finite-input rejection, underflow and weak-pivot guards, and current
-resource limits. Ascending nonzero order alone does not prove arithmetic
+Basis-update application and compensated residuals dominated the initial CPU
+samples. Stored update directions were frequently sparse, but application
+scanned every entry. The first experiment used a sparse representation
+using exact zeros only, with a dense fallback. It retained original-unit
+residuals, refinement, finite-input rejection, underflow and weak-pivot guards,
+and resource limits. Ascending nonzero order alone did not prove arithmetic
 equivalence: compensated addition renormalizes even on zero terms, and signed
-zero needs explicit examination. Validate these semantics before interpreting
-performance. Compare fixed-work prefixes against a frozen version containing
-the same correctness fixes, retaining all changed outcomes and failed runs.
+zero required explicit examination. The experiment validated these semantics
+and compared fixed-work prefixes against a frozen version with the same
+correctness fixes, retaining all changed outcomes and failed runs.
+The [completed sparse-update experiment](SPARSE-BASIS-UPDATES.md) passed this
+contract and reduced fixed-work CPU with a workload-dependent benefit.
+
+The subsequent [bound-row experiment](IMPLICIT-BOUND-ROWS.md) removes only
+source-proved redundant transform bounds and reanchors reusable LP sessions.
+It passes all 45 Release and sanitizer suites. The original sp relaxation
+shrinks from 1,650 to 1,050 rows and uses 0.069 versus 0.101 seconds median
+CPU, with the same 447 pivots and independently checked point/lower bound.
+The six-model search panel processes more nodes on four time-limited models,
+but still completes none. ran14x18-disj-8 remains in its first LP; glass4 has
+unresolved numerical stops in both forms. The full inventory above was not
+rerun and does not describe the new engine's measured coverage.
+
+The next controlled LP investigation should distinguish cost from remaining
+explicit finite-bound rows, degenerate zero-step pivots and cold fallbacks.
+The compact ran relaxation's first attempt has 3,775 zero steps among 7,070
+accepted primal pivots. Removing redundant rows therefore addresses only
+part of its difficulty. Native finite-bound handling and stronger pricing
+need separate experiments, source-unit checks and preserved controls.
 
 Faster kernels will not by themselves supply HiGHS's cuts, presolve and search
 strength. First establish a correct completed real benchmark, then measure the

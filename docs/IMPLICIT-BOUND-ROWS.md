@@ -38,5 +38,49 @@ and 1,455 to 951 for ran14x18-disj-8. sp150x300d reaches the same checked LP
 objective and valid lower bound in 447 pivots with median CPU time decreasing
 from 0.101 to 0.069 seconds across three alternating pairs. ran14x18-disj-8
 still reaches ten seconds in its first LP. The declared ten-second target is
-therefore not met by this change alone. The MILP comparison is recorded after
-all panel runs terminate.
+therefore not met by this change alone.
+
+The completed MILP panel uses three serial alternating pairs per model, with
+ten seconds per attempt. Median nodes are:
+
+| Model | Control | Compact form | Outcome |
+| --- | ---: | ---: | --- |
+| sp150x300d | 394 | 505 | time limit |
+| ran14x18-disj-8 | 1 | 1 | time limit in first LP |
+| gen-ip002 | 2,055 | 2,353 | time limit |
+| mas76 | 1,617 | 1,995 | time limit |
+| pk1 | 497 | 713 | time limit |
+| glass4 | 441 | 534 | numerical failure |
+
+All 30 incumbent files from the 36 runs pass the independent checker. The
+best sp150x300d incumbent improves from 97 to 96; its locked optimum is 69.
+Node throughput improves by 14–43% on four models that reach the full time
+budget. Because the formulation can change search paths, those node counts
+are not fixed-work speed ratios. External host activity was uncontrolled.
+The two variants have zero completed MILP runs and no watchdogs or signals.
+
+Both forms still stop numerically on glass4. The control stops on an uncertain
+Phase I source dual sign at node 441 / 15,655 pivots. The compact form stops
+during fixed-integer repair at node 534 / 22,033 pivots. A separate candidate
+run with `--keep-bound-rows` reproduces the original control stop. Both
+failures and all emitted points are retained. The compact incumbent passes
+the checker; that does not validate its unresolved node or complete the solve.
+A separate 32-node mas76 trace emits four root cuts, all independently
+accepted from original-source certificates. This is a local cut validation,
+not a proof of the entire search.
+
+The decision is to keep the reduction at `eda3561`. The frozen
+[report](../results/implicit-bound-rows-v1/REPORT.md),
+[summary](../results/implicit-bound-rows-v1/summary.json) and
+[verification](../results/implicit-bound-rows-v1/verification.json) bind the
+129 tested source files, binaries, settings, source models and terminal
+process records. Historical results are unchanged. Native finite-bound
+handling and pricing are outside this experiment.
+
+Warm-start reuse holds in the targeted contracts, but cold fallbacks remain
+substantial in real search. Degenerate pivots also remain: the first compact
+ran LP attempt records 3,775 zero-step pivots among 7,070 accepted primal
+pivots. The next LP investigation should measure remaining bound-row costs,
+zero-step pivots and failed reuse before selecting the next change. No full
+240-model campaign was rerun; its completion gate and paper-driven
+autoresearch remain closed.

@@ -24,10 +24,15 @@ The [source-accuracy safeguards](docs/SOURCE-ACCURACY.md) preserve decimal
 cancellation through optimization, objective comparisons and solution files.
 Their frozen combined checkpoint passes all 43 Release and sanitizer suites;
 the full MIPLIB completion gate remains closed.
-The [sparse basis-update experiment](docs/SPARSE-BASIS-UPDATES.md) passes all 44
-current suites in Release and sanitizer builds. Fixed-work MIPLIB prefixes use
-less CPU, with a workload-dependent benefit; the six-model ten-second MILP
-panel still has no completed solves.
+The [sparse basis-update experiment](docs/SPARSE-BASIS-UPDATES.md) passed all 44
+suites at its checkpoint in Release and sanitizer builds. Fixed-work MIPLIB
+prefixes use less CPU, with a workload-dependent benefit; the six-model
+ten-second MILP panel still has no completed solves.
+The [implicit bound-row reduction](docs/IMPLICIT-BOUND-ROWS.md) passes all 45
+current suites in both builds. It reduces two original LP formulations by
+roughly a third and improves measured search throughput on four panel models.
+The first-LP timeout on ran14x18-disj-8 and numerical stops on glass4 remain;
+neither variant completes a panel MILP problem.
 The independent checker validates original-model witnesses, rational LP bounds
 and exact infeasibility certificates.
 
