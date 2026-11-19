@@ -174,6 +174,46 @@ class BinarySAT(unittest.TestCase):
         self.assertEqual(v, F(0))
         self.assertGreater(r['sat_calls'], 0)
 
+    def test_pb_adder_large_weighted_constraint(self):
+        # 36 binary variables with weighted constraint capacity > 512 (triggers pb_adder_at_most)
+        # and > 16 objective terms (triggers cached-CNF pb_mode binary search).
+        n = 36
+        weights = [37 + 13 * j for j in range(n)]
+        cap = 1500  # > 512, gcd(weights) = 1 -> forces pb_adder_at_most
+        costs = [-(1 + (j % 3)) for j in range(n)]
+        rows = [
+            (weights, None, cap),
+            ([1 if j < 18 else -2 for j in range(n)], None, 3),
+            ([1 if j % 2 == 0 else -1 for j in range(n)], -2, 2),
+        ]
+        m = model(costs, rows, maximize=False)
+        r, v = self.solve(m)
+        self.assertEqual(r['status'], 'optimal', r)
+        self.assertGreater(r['sat_calls'], 0)
+        r_ref, v_ref = self.solve(m, ['--no-binary-sat'])
+        self.assertEqual(r_ref['status'], 'optimal', r_ref)
+        self.assertEqual(v, v_ref)
+
+    def test_small_integer_pb_optimization_and_wide_binary_encoding(self):
+        # Pure-integer model mixing small-domain (order-encoded) and wide-domain (binary-encoded,
+        # width = 75 > 32) variables with a non-constant objective.
+        costs = [-3, -5, -1, 2, -2, -4]
+        bounds = [(0, 6), (0, 5), (0, 75), (0, 4), (0, 1), (0, 1)]
+        integer = [True] * 6
+        rows = [
+            ([2, 3, 1, -2, 4, 5], None, 55),
+            ([1, 1, 0, 1, 1, 1], 3, 10),
+            ([0, 0, 1, -10, 0, 0], None, 40),
+        ]
+        m = dict(cost=costs, bounds=bounds, integer=integer, rows=rows, offset=F(3, 2), maximize=False)
+        r, v = self.solve(m)
+        self.assertEqual(r['status'], 'optimal', r)
+        self.assertGreater(r['sat_calls'], 0)
+        # Verify exact optimality against native B&B (--no-binary-sat --no-root-diving)
+        r_nat, v_nat = self.solve(m, ['--no-binary-sat', '--no-root-diving'])
+        self.assertEqual(r_nat['status'], 'optimal', r_nat)
+        self.assertEqual(v, v_nat)
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -17,14 +17,27 @@
 /* Emit clauses for minimal overweight subsets. Two common long cardinality
  * cases have linear encodings. Every arithmetic operation stays within the
  * exact integer range (model size and individual weights are capped). */
-enum { SHORT_ROW = 16, MAX_OBJ_TERMS = 512, MAX_TERMS = 2000000, MAX_WEIGHT = 1000000000 };
+enum {
+    SHORT_ROW = 16,
+    MAX_OBJ_TERMS = 1024,
+    MAX_TERMS = 2000000,
+    MAX_WEIGHT = 1000000000,
+    MAX_CLAUSES = 3500000
+};
 typedef struct {
     int lit;
     int64_t weight;
     size_t entry;
 } Term;
 typedef struct {
+    int *data;
+    size_t len;
+    size_t cap;
+    int oom;
+} ClauseBuf;
+typedef struct {
     kissat *solver;
+    ClauseBuf *buf;
     int variables, base_vars;
     int *map;
     int mapped;
@@ -32,8 +45,37 @@ typedef struct {
     double deadline;
 } Encoder;
 
+static void cb_free(ClauseBuf *cb) {
+    free(cb->data);
+    cb->data = NULL;
+    cb->len = cb->cap = 0;
+    cb->oom = 0;
+}
+
+static void cb_push(ClauseBuf *cb, int lit) {
+    if (cb->oom)
+        return;
+    if (cb->len == cb->cap) {
+        size_t ncap = cb->cap ? cb->cap * 2 : 4096;
+        if (ncap > 32000000)
+            ncap = 32000000;
+        if (cb->len >= ncap) {
+            cb->oom = 1;
+            return;
+        }
+        int *nd = realloc(cb->data, ncap * sizeof *nd);
+        if (!nd) {
+            cb->oom = 1;
+            return;
+        }
+        cb->data = nd;
+        cb->cap = ncap;
+    }
+    cb->data[cb->len++] = lit;
+}
+
 static int stopped(const Encoder *e) {
-    return lab_now() >= e->deadline;
+    return lab_now() >= e->deadline || (e->buf && e->buf->oom);
 }
 
 /* 4.0.4 stores the termination callback without polling it. Run a decision
@@ -127,7 +169,10 @@ static void literal(Encoder *e, int lit) {
         }
         lit = lit < 0 ? -mapped : mapped;
     }
-    kissat_add(e->solver, lit);
+    if (e->buf)
+        cb_push(e->buf, lit);
+    else
+        kissat_add(e->solver, lit);
 }
 
 static int64_t gcd64(int64_t a, int64_t b) {
@@ -189,7 +234,7 @@ static int heavier(const void *a, const void *b) {
 static int covers(Encoder *e, const Term *t, int count, int index, int64_t capacity,
                   int64_t remaining, int *clause, int used) {
     if (capacity < 0) {
-        if (++e->clauses > 2000000 || (!(e->clauses % 1024) && stopped(e)))
+        if (++e->clauses > MAX_CLAUSES || (!(e->clauses % 1024) && stopped(e)))
             return 0;
         for (int k = 0; k < used; ++k)
             literal(e, clause[k]);
@@ -219,6 +264,141 @@ static void ternary_clause(Encoder *e, int a, int b, int c) {
     ++e->clauses;
 }
 
+static void quat_clause(Encoder *e, int a, int b, int c, int d) {
+    literal(e, a);
+    literal(e, b);
+    literal(e, c);
+    literal(e, d);
+    literal(e, 0);
+    ++e->clauses;
+}
+
+/* Exact O(n log W) monotonic binary adder network for sum w_i * l_i <= cap
+ * with w_i >= 1, 1 <= cap < total < 2^56. */
+static int pb_adder_at_most(Encoder *e, const Term *t, int n, int64_t cap, int64_t total) {
+    if (n <= 0 || cap < 0 || total <= 0 || (uint64_t)total >= (UINT64_C(1) << 56))
+        return 0;
+    int bits = 1;
+    while (bits < 57 && ((UINT64_C(1) << bits) <= (uint64_t)total))
+        ++bits;
+    int nb = bits + 1;
+    int *bdata[60];
+    size_t blen[60], bhead[60], bcap[60];
+    memset(bdata, 0, sizeof bdata);
+    memset(blen, 0, sizeof blen);
+    memset(bhead, 0, sizeof bhead);
+    memset(bcap, 0, sizeof bcap);
+
+    int ok = 1;
+    for (int i = 0; i < n && ok; ++i) {
+        uint64_t w = (uint64_t)t[i].weight;
+        int lit = t[i].lit;
+        for (int b = 0; b < bits && w; ++b, w >>= 1) {
+            if (!(w & 1ULL))
+                continue;
+            if (blen[b] == bcap[b]) {
+                size_t nc = bcap[b] ? bcap[b] * 2 : 32;
+                int *nd = realloc(bdata[b], nc * sizeof *nd);
+                if (!nd) {
+                    ok = 0;
+                    break;
+                }
+                bdata[b] = nd;
+                bcap[b] = nc;
+            }
+            bdata[b][blen[b]++] = lit;
+        }
+    }
+
+    int sum_bit[60];
+    memset(sum_bit, 0, sizeof sum_bit);
+    for (int b = 0; b < bits && ok; ++b) {
+        while (blen[b] - bhead[b] >= 2 && ok) {
+            if (e->clauses > MAX_CLAUSES || stopped(e)) {
+                ok = 0;
+                break;
+            }
+            int x = bdata[b][bhead[b]++];
+            int y = bdata[b][bhead[b]++];
+            int s = fresh_var(e);
+            int c = fresh_var(e);
+            if (blen[b] - bhead[b] >= 1) {
+                int z = bdata[b][bhead[b]++];
+                /* Monotonic Full Adder: x + y + z <= s + 2*c (7 clauses) */
+                ternary_clause(e, -x, -y, c);
+                ternary_clause(e, -x, -z, c);
+                ternary_clause(e, -y, -z, c);
+                ternary_clause(e, -x, c, s);
+                ternary_clause(e, -y, c, s);
+                ternary_clause(e, -z, c, s);
+                quat_clause(e, -x, -y, -z, s);
+            } else {
+                /* Monotonic Half Adder: x + y <= s + 2*c (3 clauses) */
+                ternary_clause(e, -x, -y, c);
+                ternary_clause(e, -x, c, s);
+                ternary_clause(e, -y, c, s);
+            }
+            /* Push s back to bucket[b], carry c to bucket[b+1] */
+            if (blen[b] == bcap[b]) {
+                size_t nc = bcap[b] ? bcap[b] * 2 : 32;
+                int *nd = realloc(bdata[b], nc * sizeof *nd);
+                if (!nd) {
+                    ok = 0;
+                    break;
+                }
+                bdata[b] = nd;
+                bcap[b] = nc;
+            }
+            bdata[b][blen[b]++] = s;
+
+            if (blen[b + 1] == bcap[b + 1]) {
+                size_t nc = bcap[b + 1] ? bcap[b + 1] * 2 : 32;
+                int *nd = realloc(bdata[b + 1], nc * sizeof *nd);
+                if (!nd) {
+                    ok = 0;
+                    break;
+                }
+                bdata[b + 1] = nd;
+                bcap[b + 1] = nc;
+            }
+            bdata[b + 1][blen[b + 1]++] = c;
+        }
+        if (blen[b] > bhead[b])
+            sum_bit[b] = bdata[b][bhead[b]];
+    }
+
+    if (ok) {
+        /* Any overflow carry at bit >= bits must be 0 since cap < total < 2^bits. */
+        for (size_t k = bhead[bits]; k < blen[bits]; ++k) {
+            literal(e, -bdata[bits][k]);
+            literal(e, 0);
+            ++e->clauses;
+        }
+        /* Exact lexicographic comparator: sum_bit[bits-1..0] <= cap. */
+        int ones[60];
+        int n_ones = 0;
+        for (int b = bits - 1; b >= 0; --b) {
+            if (((uint64_t)cap >> b) & 1ULL) {
+                if (!sum_bit[b])
+                    break; /* constant 0 < 1 at bit b => strictly < cap */
+                ones[n_ones++] = sum_bit[b];
+            } else if (sum_bit[b]) {
+                for (int k = 0; k < n_ones; ++k)
+                    literal(e, -ones[k]);
+                literal(e, -sum_bit[b]);
+                literal(e, 0);
+                ++e->clauses;
+            }
+        }
+        if (e->clauses > MAX_CLAUSES || stopped(e))
+            ok = 0;
+    }
+
+    for (int b = 0; b < nb; ++b)
+        free(bdata[b]);
+    return ok;
+}
+
 /* Exact weighted sequential counter for sum_{i=0..n-1} w_i * l_i <= cap
  * with w_i >= 1, 1 <= cap <= 512. Auxiliary variable s[u] encodes prefix sum >= u. */
 static int sequential_counter(Encoder *e, const Term *t, int n, int64_t cap) {
@@ -227,7 +407,7 @@ static int sequential_counter(Encoder *e, const Term *t, int n, int64_t cap) {
     int *curr = lab_alloc((size_t)C + 1, sizeof *curr);
     int prev_max = 0, ok = 1;
     for (int i = 0; i < n && ok; ++i) {
-        if ((i & 15) == 0 && (e->clauses > 2000000 || stopped(e))) {
+        if ((i & 15) == 0 && (e->clauses > MAX_CLAUSES || stopped(e))) {
             ok = 0;
             break;
         }
@@ -263,7 +443,7 @@ static int sequential_counter(Encoder *e, const Term *t, int n, int64_t cap) {
                 if (u + w > C)
                     binary_clause(e, -lit, -prev[u]);
         }
-        if (e->clauses > 2000000)
+        if (e->clauses > MAX_CLAUSES)
             ok = 0;
     }
     free(curr);
@@ -279,6 +459,8 @@ static int at_most(Encoder *e, Term *t, int n, int64_t cap) {
             t[i].weight = -t[i].weight;
             t[i].lit = -t[i].lit;
         }
+        if (total > INT64_MAX - t[i].weight)
+            return 0;
         total += t[i].weight;
         if (t[i].weight < minimum)
             minimum = t[i].weight;
@@ -323,6 +505,7 @@ static int at_most(Encoder *e, Term *t, int n, int64_t cap) {
         if (!m || cap >= rem_total)
             return 1;
         int64_t scaled_cap = cap / g;
+        int64_t scaled_total = rem_total / g;
         for (int i = 0; i < m; ++i)
             t[i].weight /= g;
         if (scaled_cap == 1) {
@@ -339,10 +522,12 @@ static int at_most(Encoder *e, Term *t, int n, int64_t cap) {
                     prev = next;
                 }
             }
-            return e->clauses <= 2000000;
+            return e->clauses <= MAX_CLAUSES;
         }
         if (scaled_cap <= 512 && (int64_t)m * scaled_cap <= 120000)
             return sequential_counter(e, t, m, scaled_cap);
+        if (m <= 65536)
+            return pb_adder_at_most(e, t, m, scaled_cap, scaled_total);
         return 0;
     }
     int clause[SHORT_ROW];
@@ -428,7 +613,7 @@ static int truth_table(const LabModel *m, Encoder *e, const Term *t, size_t n, s
             if (!sub)
                 break;
         }
-        if (++e->clauses > 2000000 || stopped(e))
+        if (++e->clauses > MAX_CLAUSES || stopped(e))
             return 0;
         for (size_t k = 0; k < n; ++k)
             if (!(free_mask & (1u << k)))
@@ -506,7 +691,7 @@ static int encode(const LabModel *m, Encoder *e, const size_t *start, const Term
         if (interval) {
             int row_ok = truth_table(m, e, terms + start[i], n, i);
             if (!row_ok) {
-                if (skipped && !stopped(e) && e->clauses < 1900000)
+                if (skipped && !stopped(e) && e->clauses < MAX_CLAUSES - 100000)
                     ++(*skipped);
                 else
                     ok = 0;
@@ -522,7 +707,7 @@ static int encode(const LabModel *m, Encoder *e, const size_t *start, const Term
                 !convert_scaled(q, rhs, row_scale[i], &cap)) {
                 int row_ok = truth_table(m, e, terms + start[i], n, i);
                 if (!row_ok) {
-                    if (skipped && !stopped(e) && e->clauses < 1900000)
+                    if (skipped && !stopped(e) && e->clauses < MAX_CLAUSES - 100000)
                         ++(*skipped);
                     else
                         ok = 0;
@@ -537,7 +722,7 @@ static int encode(const LabModel *m, Encoder *e, const size_t *start, const Term
             }
             int row_ok = at_most(e, row, (int)n, cap);
             if (!row_ok) {
-                if (skipped && !stopped(e) && e->clauses < 1900000)
+                if (skipped && !stopped(e) && e->clauses < MAX_CLAUSES - 100000)
                     ++(*skipped);
                 else
                     ok = 0;
@@ -696,23 +881,31 @@ static int cheapest_face(const LabModel *m, const size_t *start, const Term *ter
                 }
                 /* MAX_TERMS * MAX_WEIGHT fits in int64_t. In the checking
                  * pass every column has a value and both extrema are zero. */
-                if (minimum > cap)
+                if (minimum > cap) {
+                    if (!check)
+                        valid = -1;
                     goto done;
-                if (maximum > cap && e.clauses < 1800000)
+                }
+                if (maximum > cap && e.clauses < MAX_CLAUSES - 100000)
                     (void)at_most(&e, row, (int)count, cap);
             }
         }
         if (!check) {
             kissat_set_decision_limit(e.solver, (unsigned)fmin(UINT_MAX, (double)budget));
             ++*calls;
-            if (bounded_solve(&e, m->cols, point) != 10)
+            int st = bounded_solve(&e, m->cols, point);
+            if (st == 20) {
+                valid = -1;
+                goto done;
+            }
+            if (st != 10)
                 goto done;
             for (size_t j = 0; j < m->cols; ++j)
                 if (fixed[j] >= 0)
                     point[j] = fixed[j];
         }
     }
-    valid = !stopped(&e);
+    valid = !stopped(&e) ? 1 : 0;
 done:
     mpq_clear(q);
     kissat_release(e.solver);
@@ -792,16 +985,24 @@ static int order_lit(int base, int width, int neg, int v) {
     return neg ? -(base + width - v) : (base + v - 1);
 }
 
-/* Order-encoded SAT/PB translation for pure-integer models whose non-binary
- * variables all have small finite integer domains (width <= 32). Handles exact
- * feasibility, infeasibility, and constant-objective optimality. */
+/* Hybrid order/binary-encoded SAT/PB translation for pure-integer models whose
+ * non-binary variables all have finite integer domains (order-encoded for
+ * width <= 32, binary-encoded for 32 < width <= 1048576). Handles exact
+ * feasibility, infeasibility, constant-objective optimality, and PB optimization. */
 static int small_integer_sat(const LabModel *m, const double *lo, const double *hi, double deadline,
                              size_t budget, double *point, size_t *calls) {
-    enum { MAX_DOMAIN_WIDTH = 32, MAX_ORDER_BITS = 524288 };
+    enum {
+        MAX_ORDER_WIDTH = 32,
+        MAX_BIN_WIDTH = 1048576,
+        MAX_ENC_BITS = 524288,
+        MAX_PB_OBJ_BITS = 2048
+    };
     mpq_t q;
     mpq_init(q);
     int64_t *col_lo = lab_alloc(m->cols, sizeof *col_lo);
     int *width = lab_alloc(m->cols, sizeof *width);
+    int *nbits = lab_alloc(m->cols, sizeof *nbits);
+    unsigned char *bin_enc = lab_alloc(m->cols, 1);
     int *base = lab_alloc(m->cols, sizeof *base);
     size_t total_bits = 0;
     int ok = 1, has_obj = 0;
@@ -811,44 +1012,131 @@ static int small_integer_sat(const LabModel *m, const double *lo, const double *
             break;
         }
         double l = m->col_lower[j], u = m->col_upper[j];
-        if (!m->integer[j] || !isfinite(l) || !isfinite(u) || !isfinite(lo[j]) || !isfinite(hi[j]) ||
-            trunc(l) != l || trunc(u) != u || trunc(lo[j]) != lo[j] || trunc(hi[j]) != hi[j] ||
-            l > lo[j] || u < hi[j] || lo[j] > hi[j] ||
-            lab_source_exact_column_bound(m, j, 0, q) || mpz_cmp_ui(mpq_denref(q), 1) ||
-            !mpz_fits_slong_p(mpq_numref(q)) || (double)mpz_get_si(mpq_numref(q)) != l ||
-            lab_source_exact_column_bound(m, j, 1, q) || mpz_cmp_ui(mpq_denref(q), 1) ||
-            !mpz_fits_slong_p(mpq_numref(q)) || (double)mpz_get_si(mpq_numref(q)) != u ||
-            lab_source_exact_objective(m, j, q)) {
+        if (!m->integer[j] || !isfinite(lo[j]) || !isfinite(hi[j]) ||
+            trunc(lo[j]) != lo[j] || trunc(hi[j]) != hi[j] ||
+            (isfinite(l) && (trunc(l) != l || l > lo[j] ||
+                             lab_source_exact_column_bound(m, j, 0, q) ||
+                             mpz_cmp_ui(mpq_denref(q), 1) ||
+                             !mpz_fits_slong_p(mpq_numref(q)) ||
+                             (double)mpz_get_si(mpq_numref(q)) != l)) ||
+            (isfinite(u) && (trunc(u) != u || u < hi[j] ||
+                             lab_source_exact_column_bound(m, j, 1, q) ||
+                             mpz_cmp_ui(mpq_denref(q), 1) ||
+                             !mpz_fits_slong_p(mpq_numref(q)) ||
+                             (double)mpz_get_si(mpq_numref(q)) != u)) ||
+            lo[j] > hi[j] || lab_source_exact_objective(m, j, q)) {
             ok = 0;
             break;
         }
         if (mpq_sgn(q) && lo[j] != hi[j])
             has_obj = 1;
         int64_t ilo = (int64_t)lo[j], ihi = (int64_t)hi[j];
-        if (llabs(ilo) > MAX_WEIGHT || llabs(ihi) > MAX_WEIGHT || ihi - ilo > MAX_DOMAIN_WIDTH) {
+        if (llabs(ilo) > MAX_WEIGHT || llabs(ihi) > MAX_WEIGHT || ihi - ilo > MAX_BIN_WIDTH) {
             ok = 0;
             break;
         }
         col_lo[j] = ilo;
         width[j] = (int)(ihi - ilo);
         if (width[j] > 0) {
-            if (total_bits + (size_t)width[j] > MAX_ORDER_BITS) {
+            int nb = width[j];
+            if (width[j] > MAX_ORDER_WIDTH) {
+                bin_enc[j] = 1;
+                nb = 1;
+                while ((1 << nb) <= width[j])
+                    ++nb;
+            }
+            if (total_bits + (size_t)nb > MAX_ENC_BITS) {
                 ok = 0;
                 break;
             }
+            nbits[j] = nb;
             base[j] = (int)total_bits + 1;
-            total_bits += (size_t)width[j];
+            total_bits += (size_t)nb;
         }
     }
     if (!ok || !total_bits) {
         mpq_clear(q);
         free(col_lo);
         free(width);
+        free(nbits);
+        free(bin_enc);
         free(base);
         return 0;
     }
     int const_obj = !has_obj || constant_objective_via_equalities(m, fmin(deadline, lab_now() + .5));
-    /* Build CSR of exact converted entries. */
+
+    /* Collect PB objective over encoded bits when optimizing a non-constant objective. */
+    Term *obj_terms = NULL;
+    int n_obj_bits = 0;
+    int64_t obj_gcd = 0, obj_total = 0;
+    int pb_opt = 0;
+    if (!const_obj) {
+        int64_t obj_scale = 1;
+        size_t est_bits = 0;
+        int obj_ok = 1;
+        for (size_t j = 0; j < m->cols && obj_ok; ++j) {
+            if (!width[j])
+                continue;
+            if (lab_source_exact_objective(m, j, q)) {
+                obj_ok = 0;
+                break;
+            }
+            if (mpq_sgn(q)) {
+                if (!include_row_den(&obj_scale, q))
+                    obj_ok = 0;
+                est_bits += (size_t)nbits[j];
+                if (est_bits > MAX_PB_OBJ_BITS)
+                    obj_ok = 0;
+            }
+        }
+        if (obj_ok && est_bits > 0) {
+            obj_terms = lab_alloc(est_bits, sizeof *obj_terms);
+            for (size_t j = 0; j < m->cols && obj_ok; ++j) {
+                if (!width[j])
+                    continue;
+                if (lab_source_exact_objective(m, j, q)) {
+                    obj_ok = 0;
+                    break;
+                }
+                if (!mpq_sgn(q))
+                    continue;
+                int64_t sw = 0;
+                if (!convert_scaled(q, m->objective[j], obj_scale, &sw) || !sw) {
+                    obj_ok = 0;
+                    break;
+                }
+                if (m->maximize)
+                    sw = -sw;
+                int neg = sw < 0;
+                int64_t aw = llabs(sw);
+                for (int t = 0; t < nbits[j]; ++t) {
+                    int64_t bw = bin_enc[j] ? (INT64_C(1) << t) : 1;
+                    if (aw > (INT64_C(1) << 46) / bw) {
+                        obj_ok = 0;
+                        break;
+                    }
+                    int64_t w = aw * bw;
+                    int lit = neg ? -(base[j] + t) : (base[j] + t);
+                    obj_terms[n_obj_bits++] = (Term){lit, w, 0};
+                    obj_gcd = gcd64(obj_gcd, w);
+                    if (obj_total > (INT64_C(1) << 54) - w) {
+                        obj_ok = 0;
+                        break;
+                    }
+                    obj_total += w;
+                }
+            }
+            if (obj_ok && n_obj_bits > 0 && obj_gcd > 0 && obj_total / obj_gcd <= 1000000)
+                pb_opt = 1;
+            else {
+                free(obj_terms);
+                obj_terms = NULL;
+                n_obj_bits = 0;
+            }
+        }
+    }
+
+    /* Build CSR of per-row LCM-scaled exact integer entries. */
     size_t *start = lab_alloc(m->rows + 1, sizeof *start);
     for (size_t k = 0; k < m->nnz; ++k)
         ++start[m->row_index[k] + 1];
@@ -857,6 +1145,33 @@ static int small_integer_sat(const LabModel *m, const double *lo, const double *
         if (start[i + 1] > max_row)
             max_row = start[i + 1];
         start[i + 1] += start[i];
+    }
+    int64_t *row_scale = lab_alloc(m->rows ? m->rows : 1, sizeof *row_scale);
+    for (size_t i = 0; i < m->rows && ok; ++i) {
+        row_scale[i] = 1;
+        for (int upper = 0; upper < 2; ++upper) {
+            double rhs = upper ? m->row_upper[i] : m->row_lower[i];
+            if (isfinite(rhs)) {
+                if (lab_source_exact_row_bound(m, i, upper, q) ||
+                    !include_row_den(&row_scale[i], q)) {
+                    ok = 0;
+                    break;
+                }
+            }
+        }
+    }
+    for (size_t j = 0; j < m->cols && ok; ++j) {
+        if ((j & 255U) == 0 && lab_now() >= deadline) {
+            ok = 0;
+            break;
+        }
+        for (size_t k = m->col_start[j]; k < m->col_start[j + 1]; ++k) {
+            size_t i = m->row_index[k];
+            if (lab_source_exact_coefficient(m, k, q) || !include_row_den(&row_scale[i], q)) {
+                ok = 0;
+                break;
+            }
+        }
     }
     size_t *next = lab_alloc(m->rows, sizeof *next);
     memcpy(next, start, m->rows * sizeof *next);
@@ -867,30 +1182,48 @@ static int small_integer_sat(const LabModel *m, const double *lo, const double *
             break;
         }
         for (size_t k = m->col_start[j]; k < m->col_start[j + 1]; ++k) {
+            size_t i = m->row_index[k];
             int64_t w = 0;
-            if (lab_source_exact_coefficient(m, k, q) || !convert(q, m->value[k], &w)) {
+            if (lab_source_exact_coefficient(m, k, q) ||
+                !convert_scaled(q, m->value[k], row_scale[i], &w)) {
                 ok = 0;
                 break;
             }
-            terms[next[m->row_index[k]]++] = (Term){(int)j, w, k};
+            terms[next[i]++] = (Term){(int)j, w, k};
         }
     }
-    Encoder e = {.solver = kissat_init(), .variables = (int)total_bits,
-                 .base_vars = (int)total_bits, .deadline = deadline};
+
+    ClauseBuf base_cnf = {0};
+    Encoder e = {.solver = pb_opt ? NULL : kissat_init(),
+                 .buf = pb_opt ? &base_cnf : NULL,
+                 .variables = (int)total_bits,
+                 .base_vars = (int)total_bits,
+                 .deadline = deadline};
     Term *expanded = NULL;
     double *bits = NULL;
-    int result = 0;
+    int result = 0, incumbent = 0;
     if (!ok)
         goto done;
-    kissat_reserve(e.solver, e.variables);
-    /* Symmetry-breaking order clauses: b_{t} => b_{t-1}. */
-    for (size_t j = 0; j < m->cols; ++j)
-        for (int t = 1; t < width[j]; ++t)
-            binary_clause(&e, -(base[j] + t), base[j] + t - 1);
-    size_t exp_cap = max_row * MAX_DOMAIN_WIDTH + 1;
+    if (e.solver)
+        kissat_reserve(e.solver, e.variables);
+    /* Order-encoding monotonicity clauses & binary-encoding upper-bound clauses. */
+    for (size_t j = 0; j < m->cols && ok; ++j) {
+        if (!width[j])
+            continue;
+        if (!bin_enc[j]) {
+            for (int t = 1; t < width[j]; ++t)
+                binary_clause(&e, -(base[j] + t), base[j] + t - 1);
+        } else if (width[j] < (1 << nbits[j]) - 1) {
+            Term bt[24];
+            for (int t = 0; t < nbits[j]; ++t)
+                bt[t] = (Term){base[j] + t, INT64_C(1) << t, 0};
+            ok = at_most(&e, bt, nbits[j], width[j]);
+        }
+    }
+    size_t exp_cap = max_row * MAX_ORDER_WIDTH + 1;
     expanded = lab_alloc(exp_cap, sizeof *expanded);
     for (size_t i = 0; i < m->rows && ok; ++i) {
-        if ((i & 127U) == 0 && (e.clauses > 3000000 || stopped(&e))) {
+        if ((i & 127U) == 0 && (e.clauses > MAX_CLAUSES || stopped(&e))) {
             ok = 0;
             break;
         }
@@ -899,7 +1232,8 @@ static int small_integer_sat(const LabModel *m, const double *lo, const double *
             if (!isfinite(rhs))
                 continue;
             int64_t cap = 0;
-            if (lab_source_exact_row_bound(m, i, upper, q) || !convert(q, rhs, &cap)) {
+            if (lab_source_exact_row_bound(m, i, upper, q) ||
+                !convert_scaled(q, rhs, row_scale[i], &cap)) {
                 ok = 0;
                 break;
             }
@@ -909,7 +1243,7 @@ static int small_integer_sat(const LabModel *m, const double *lo, const double *
             int k_act = 0;
             int act_col[4], act_w[4], act_neg[4];
             int64_t act_coef[4];
-            int has_multi = 0;
+            int has_multi = 0, has_bin_enc = 0;
             int64_t adj_cap = cap;
             for (size_t p = start[i]; p < start[i + 1]; ++p) {
                 size_t j = (size_t)terms[p].lit;
@@ -925,9 +1259,11 @@ static int small_integer_sat(const LabModel *m, const double *lo, const double *
                 }
                 if (!width[j])
                     continue;
+                if (bin_enc[j])
+                    has_bin_enc = 1;
                 if (width[j] > 1)
                     has_multi = 1;
-                if (k_act < 4) {
+                if (k_act < 4 && !has_bin_enc) {
                     act_col[k_act] = (int)j;
                     act_w[k_act] = width[j];
                     if (a < 0) {
@@ -950,7 +1286,7 @@ static int small_integer_sat(const LabModel *m, const double *lo, const double *
                 }
                 continue;
             }
-            if (k_act == 1) {
+            if (k_act == 1 && !has_bin_enc) {
                 int64_t v = adj_cap < 0 ? 0 : (adj_cap / act_coef[0] + 1);
                 if (v == 0) {
                     literal(&e, 0);
@@ -962,7 +1298,7 @@ static int small_integer_sat(const LabModel *m, const double *lo, const double *
                 }
                 continue;
             }
-            if (k_act == 2 && has_multi) {
+            if (k_act == 2 && has_multi && !has_bin_enc) {
                 for (int v0 = 0; v0 <= act_w[0]; ++v0) {
                     int64_t rem = adj_cap - act_coef[0] * v0;
                     int64_t v1 = rem < 0 ? 0 : (rem / act_coef[1] + 1);
@@ -977,7 +1313,7 @@ static int small_integer_sat(const LabModel *m, const double *lo, const double *
                 }
                 continue;
             }
-            if (k_act == 3 && has_multi) {
+            if (k_act == 3 && has_multi && !has_bin_enc) {
                 /* Order by smallest domain first for minimal clause count. */
                 for (int a = 0; a < 3; ++a)
                     for (int b = a + 1; b < 3; ++b)
@@ -1009,52 +1345,142 @@ static int small_integer_sat(const LabModel *m, const double *lo, const double *
                     continue;
                 }
             }
-            /* General expansion into order-encoded binary terms. */
+            /* General expansion into order-encoded / binary-encoded terms. */
             int exp_n = 0;
             int64_t exp_cap_rhs = cap;
-            for (size_t p = start[i]; p < start[i + 1]; ++p) {
+            for (size_t p = start[i]; p < start[i + 1] && ok; ++p) {
                 size_t j = (size_t)terms[p].lit;
                 int64_t a = upper ? terms[p].weight : -terms[p].weight;
                 if (!a)
                     continue;
                 exp_cap_rhs -= a * col_lo[j];
-                for (int t = 0; t < width[j]; ++t)
-                    expanded[exp_n++] = (Term){base[j] + t, a, terms[p].entry};
+                for (int t = 0; t < nbits[j]; ++t) {
+                    int64_t bw = bin_enc[j] ? (INT64_C(1) << t) : 1;
+                    if (llabs(a) > (INT64_C(1) << 46) / bw) {
+                        ok = 0;
+                        break;
+                    }
+                    expanded[exp_n++] = (Term){base[j] + t, a * bw, terms[p].entry};
+                }
             }
-            ok = at_most(&e, expanded, exp_n, exp_cap_rhs);
+            if (ok)
+                ok = at_most(&e, expanded, exp_n, exp_cap_rhs);
         }
     }
     if (!ok || stopped(&e))
         goto done;
-    unsigned slice = (unsigned)fmin(UINT_MAX, (double)budget);
-    kissat_set_decision_limit(e.solver, slice);
-    ++*calls;
+
     bits = lab_alloc(total_bits, sizeof *bits);
-    int status = bounded_solve(&e, total_bits, bits);
-    if (status == 20) {
-        result = -1;
-    } else if (status == 10) {
-        for (size_t j = 0; j < m->cols; ++j) {
-            int64_t val = col_lo[j];
-            for (int t = 0; t < width[j]; ++t)
-                if (bits[base[j] - 1 + t] != 0)
-                    ++val;
-            point[j] = (double)val;
+    if (!pb_opt) {
+        unsigned slice = (unsigned)fmin(UINT_MAX, (double)budget);
+        kissat_set_decision_limit(e.solver, slice);
+        ++*calls;
+        int status = bounded_solve(&e, total_bits, bits);
+        if (status == 20) {
+            result = -1;
+        } else if (status == 10) {
+            for (size_t j = 0; j < m->cols; ++j) {
+                int64_t val = col_lo[j];
+                for (int t = 0; t < nbits[j]; ++t)
+                    if (bits[base[j] - 1 + t] != 0)
+                        val += bin_enc[j] ? (INT64_C(1) << t) : 1;
+                point[j] = (double)val;
+            }
+            result = const_obj ? 1 : 2;
         }
-        result = const_obj ? 1 : 2;
+    } else {
+        int64_t pb_lo = 0, pb_hi = obj_total / obj_gcd;
+        Term *cut_terms = lab_alloc((size_t)n_obj_bits, sizeof *cut_terms);
+        while (lab_now() < deadline && budget) {
+            int64_t pb_probe = -1;
+            if (incumbent) {
+                if (pb_lo >= pb_hi) {
+                    result = 1;
+                    break;
+                }
+                pb_probe = pb_hi - pb_lo <= 2 ? pb_hi - 1 : pb_lo + (pb_hi - pb_lo) / 2;
+            }
+            Encoder es = {.solver = kissat_init(),
+                          .variables = e.variables,
+                          .base_vars = (int)total_bits,
+                          .clauses = e.clauses,
+                          .deadline = deadline};
+            kissat_reserve(es.solver, es.variables);
+            for (size_t k = 0; k < base_cnf.len; ++k)
+                kissat_add(es.solver, base_cnf.data[k]);
+            int cut_ok = 1;
+            if (incumbent && pb_probe >= 0) {
+                memcpy(cut_terms, obj_terms, (size_t)n_obj_bits * sizeof *cut_terms);
+                cut_ok = at_most(&es, cut_terms, n_obj_bits, pb_probe * obj_gcd);
+            }
+            if (!cut_ok) {
+                kissat_release(es.solver);
+                break;
+            }
+            size_t want = budget > 6 ? budget / 3 : budget;
+            unsigned slice = (unsigned)fmin(UINT_MAX, (double)want);
+            budget -= slice;
+            kissat_set_decision_limit(es.solver, slice);
+            ++*calls;
+            int status = bounded_solve(&es, total_bits, bits);
+            kissat_release(es.solver);
+            if (status == 10) {
+                for (size_t j = 0; j < m->cols; ++j) {
+                    int64_t val = col_lo[j];
+                    for (int t = 0; t < nbits[j]; ++t)
+                        if (bits[base[j] - 1 + t] != 0)
+                            val += bin_enc[j] ? (INT64_C(1) << t) : 1;
+                    point[j] = (double)val;
+                }
+                int64_t cur_scaled = 0;
+                for (int k = 0; k < n_obj_bits; ++k) {
+                    int lit = obj_terms[k].lit;
+                    int bv = bits[abs(lit) - 1] != 0;
+                    if (bv == (lit > 0))
+                        cur_scaled += obj_terms[k].weight;
+                }
+                incumbent = 1;
+                pb_hi = cur_scaled / obj_gcd;
+                if (pb_hi <= pb_lo) {
+                    result = 1;
+                    break;
+                }
+            } else if (status == 20) {
+                if (!incumbent) {
+                    result = -1;
+                    break;
+                }
+                pb_lo = pb_probe + 1;
+                if (pb_lo >= pb_hi) {
+                    result = 1;
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+        free(cut_terms);
     }
 done:
     free(bits);
     free(expanded);
-    kissat_release(e.solver);
+    if (e.solver)
+        kissat_release(e.solver);
+    cb_free(&base_cnf);
+    free(obj_terms);
     free(terms);
     free(next);
+    free(row_scale);
     free(start);
     free(base);
+    free(bin_enc);
+    free(nbits);
     free(width);
     free(col_lo);
     mpq_clear(q);
-    return lab_now() < deadline ? result : 0;
+    if (result && lab_now() < deadline)
+        return result;
+    return incumbent ? 2 : 0;
 }
 
 /* Fix all priced integer variables to their cheapest finite box endpoint,
@@ -1066,7 +1492,7 @@ static int cheapest_face_general_int(const LabModel *m, const double *lo, const 
     if (!m->cols || m->cols > MAX_TERMS || m->rows > MAX_TERMS || m->nnz > MAX_TERMS ||
         lab_now() >= deadline)
         return 0;
-    double face_dl = fmin(deadline, lab_now() + fmin(8.0, .35 * (deadline - lab_now())));
+    double face_dl = fmin(deadline, lab_now() + fmin(12.0, .45 * (deadline - lab_now())));
     mpq_t q;
     mpq_init(q);
     double *clo = lab_alloc(m->cols, sizeof *clo);
@@ -1264,14 +1690,23 @@ static int cheapest_face_general_int(const LabModel *m, const double *lo, const 
     }
 
     int solved = 0;
-    if (ok && !infeasible && nfree > 0 && nfree <= 524288) {
+    if (ok && !infeasible && nfree == 0) {
+        for (size_t j = 0; j < m->cols; ++j)
+            point[j] = clo[j];
+        LabModel view = *m;
+        view.col_lower = (double *)lo;
+        view.col_upper = (double *)hi;
+        double eval_obj = 0, eval_viol = 0;
+        if (!lab_exact_evaluate(&view, point, &eval_obj, &eval_viol) && eval_viol <= 1e-7)
+            solved = 1;
+    } else if (ok && !infeasible && nfree > 0 && nfree <= 524288) {
         Encoder e = {.solver = kissat_init(), .variables = (int)nfree, .base_vars = (int)nfree,
                      .deadline = face_dl};
         kissat_reserve(e.solver, e.variables);
         Term *row = lab_alloc(max_row + 1, sizeof *row);
         int enc_ok = 1;
         for (size_t i = 0; i < m->rows && enc_ok; ++i) {
-            if ((i & 255U) == 0 && (e.clauses > 2000000 || stopped(&e))) {
+            if ((i & 255U) == 0 && (e.clauses > MAX_CLAUSES || stopped(&e))) {
                 enc_ok = 0;
                 break;
             }
@@ -1314,7 +1749,7 @@ static int cheapest_face_general_int(const LabModel *m, const double *lo, const 
                     enc_ok = 0;
                     break;
                 }
-                if (max_s > cap && e.clauses < 1900000)
+                if (max_s > cap && e.clauses < MAX_CLAUSES - 100000)
                     (void)at_most(&e, row, (int)cnt, cap);
             }
         }
@@ -1428,7 +1863,9 @@ int lab_binary_sat(const LabModel *m, const double *lo, const double *hi, double
         ++cost.n;
     }
     if (cost.n > SHORT_ROW &&
-        (!cost.pb_exact || !cost.scaled_gcd || cost.scaled_total / cost.scaled_gcd > 512))
+        (!cost.pb_exact || !cost.scaled_gcd ||
+         (cost.n > 256 && cost.scaled_total / cost.scaled_gcd > 4096) ||
+         cost.scaled_total / cost.scaled_gcd > 1000000))
         face_only = 1;
     double orig_deadline = deadline;
     if (face_only)
@@ -1485,19 +1922,22 @@ int lab_binary_sat(const LabModel *m, const double *lo, const double *hi, double
             terms[next[i]++] = (Term){(int)j + 1, w, k};
         }
     }
+    int face_unsat = 0;
     if (try_face || face_only) {
         double face_dl = face_only
-                             ? fmin(orig_deadline, lab_now() + fmin(8.0, .35 * (orig_deadline - lab_now())))
-                             : fmin(orig_deadline, lab_now() + fmin(3.0, .25 * (orig_deadline - lab_now())));
+                             ? fmin(orig_deadline, lab_now() + fmin(10.0, .40 * (orig_deadline - lab_now())))
+                             : fmin(orig_deadline, lab_now() + fmin(0.8, .12 * (orig_deadline - lab_now())));
         int faced = cheapest_face(m, start, terms, row_scale, row, fixed, face_dl, budget, point, calls);
-        if (faced) {
+        if (faced > 0) {
             result = 1;
             goto done;
         }
+        if (faced < 0)
+            face_unsat = 1;
         if (face_only) {
             /* Before giving up on a large-objective pure-binary model, run one
              * fast feasibility check; UNSAT on a relaxation proves infeasibility. */
-            double feas_dl = fmin(orig_deadline, lab_now() + fmin(2.0, .20 * (orig_deadline - lab_now())));
+            double feas_dl = fmin(orig_deadline, lab_now() + fmin(2.5, .22 * (orig_deadline - lab_now())));
             if (lab_now() < feas_dl && budget) {
                 Encoder ef = {.solver = kissat_init(), .variables = (int)m->cols,
                               .base_vars = (int)m->cols, .deadline = feas_dl};
@@ -1526,9 +1966,38 @@ int lab_binary_sat(const LabModel *m, const double *lo, const double *hi, double
     interior = lab_alloc(m->cols, 1);
     trial = lab_alloc(m->cols, sizeof *trial);
     int pb_mode = cost.n > SHORT_ROW && cost.pb_exact && cost.scaled_gcd > 0;
-    int64_t pb_lo = 0, pb_hi = pb_mode ? cost.scaled_total / cost.scaled_gcd : 0;
+    int64_t pb_lo = (pb_mode && face_unsat) ? 1 : 0;
+    int64_t pb_hi = pb_mode ? cost.scaled_total / cost.scaled_gcd : 0;
+    ClauseBuf base_cnf = {0};
+    int base_vars = (int)m->cols;
+    size_t base_clauses = 0;
+    int base_skipped = 0;
+    int have_base = 0;
+    if (pb_mode) {
+        Encoder eb = {.buf = &base_cnf, .variables = (int)m->cols, .base_vars = (int)m->cols,
+                      .deadline = deadline};
+        for (size_t j = 0; j < m->cols; ++j) {
+            if (lo[j] == hi[j]) {
+                literal(&eb, lo[j] == 1 ? (int)j + 1 : -((int)j + 1));
+                literal(&eb, 0);
+            }
+        }
+        if (encode(m, &eb, start, terms, row_scale, row, &cost, 0, -1, NULL, m->rows, &base_skipped) &&
+            !base_cnf.oom) {
+            base_vars = eb.variables;
+            base_clauses = eb.clauses;
+            have_base = 1;
+        } else {
+            cb_free(&base_cnf);
+        }
+    }
     while (lab_now() < deadline && budget) {
-        Encoder e = {.solver = kissat_init(), .variables = (int)m->cols, .base_vars = (int)m->cols,
+        if (pb_mode && !have_base)
+            break;
+        Encoder e = {.solver = kissat_init(),
+                     .variables = have_base ? base_vars : (int)m->cols,
+                     .base_vars = (int)m->cols,
+                     .clauses = have_base ? base_clauses : 0,
                      .deadline = deadline};
         size_t indices[3000], count = m->rows;
         int local = !pb_mode && incumbent && cost.n > 1 && m->cols > 512 && seed < regions_count &&
@@ -1542,27 +2011,41 @@ int lab_binary_sat(const LabModel *m, const double *lo, const double *hi, double
             }
             pb_probe = pb_hi - pb_lo <= 2 ? pb_hi - 1 : pb_lo + (pb_hi - pb_lo) / 2;
         }
-        if (local) {
-            uint64_t shape;
-            count = neighborhood(m, start, terms, regions[seed++].seed, interior, indices, 3000,
-                                 &shape);
-            e.deadline = fmin(local_deadline, lab_now() + .15);
-            e.map = lab_alloc(m->cols, sizeof *e.map);
-        } else {
+        int skipped_rows = 0;
+        int encoded = 1;
+        if (have_base) {
+            if (base_skipped > 0 && incumbent) {
+                kissat_release(e.solver);
+                break;
+            }
+            skipped_rows = base_skipped;
             kissat_reserve(e.solver, e.variables);
-            for (size_t j = 0; j < m->cols; ++j) {
-                if (lo[j] == hi[j]) {
-                    literal(&e, lo[j] == 1 ? (int)j + 1 : -((int)j + 1));
-                    literal(&e, 0);
+            for (size_t k = 0; k < base_cnf.len; ++k)
+                kissat_add(e.solver, base_cnf.data[k]);
+            if (incumbent && pb_probe >= 0)
+                encoded = objective_pb_cut(&e, &cost, pb_probe * cost.scaled_gcd + 1);
+        } else {
+            if (local) {
+                uint64_t shape;
+                count = neighborhood(m, start, terms, regions[seed++].seed, interior, indices, 3000,
+                                     &shape);
+                e.deadline = fmin(local_deadline, lab_now() + .15);
+                e.map = lab_alloc(m->cols, sizeof *e.map);
+            } else {
+                kissat_reserve(e.solver, e.variables);
+                for (size_t j = 0; j < m->cols; ++j) {
+                    if (lo[j] == hi[j]) {
+                        literal(&e, lo[j] == 1 ? (int)j + 1 : -((int)j + 1));
+                        literal(&e, 0);
+                    }
                 }
             }
-        }
-        int skipped_rows = 0;
-        int allow_skip = !incumbent && !local;
-        int encoded = encode(m, &e, start, terms, row_scale, row, &cost, incumbent,
+            int allow_skip = !incumbent && !local;
+            encoded = encode(m, &e, start, terms, row_scale, row, &cost, incumbent,
                              pb_probe >= 0 ? pb_probe * cost.scaled_gcd : -1,
                              local ? indices : NULL, count, allow_skip ? &skipped_rows : NULL);
-        free(e.map);
+            free(e.map);
+        }
         if (!encoded) {
             kissat_release(e.solver);
             if (local)
@@ -1570,7 +2053,7 @@ int lab_binary_sat(const LabModel *m, const double *lo, const double *hi, double
             break;
         }
         /* Reserve a disjoint part of the decision budget for each call. */
-        size_t want = pb_mode ? (budget > 8 ? budget / 4 : budget) : (budget / 2 + budget % 2);
+        size_t want = pb_mode ? (budget > 6 ? budget / 3 : budget) : (budget / 2 + budget % 2);
         unsigned slice = (unsigned)fmin(UINT_MAX, (double)want);
         if (local && slice > 1024)
             slice = 1024;
@@ -1626,6 +2109,7 @@ int lab_binary_sat(const LabModel *m, const double *lo, const double *hi, double
         if (result || (status != 10 && !(pb_mode && incumbent && status == 20)))
             break;
     }
+    cb_free(&base_cnf);
 done:
     for (int k = 0; k < cost.n; ++k)
         mpq_clear(cost.weight[k]);
