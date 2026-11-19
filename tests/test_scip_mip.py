@@ -130,6 +130,43 @@ class ScipGeneralMip(unittest.TestCase):
             v, _, _ = self.run_model(Path(tmp), integer_mps(m))
             self.assertEqual(v['status'], 'infeasible', v)
 
+    def test_feasjump_pure_feasibility_and_mixed_polish(self):
+        # Mixed-integer feasibility + optimization with linked general integers and continuous vars
+        # that exercises scip_feasjump.c (both zero-objective feasibility and coordinate polish).
+        rng = random.Random(2026)
+        n_int = 24
+        n_cont = 16
+        n = n_int + n_cont
+        bounds = [(0, 3)] * n_int + [(0, 5)] * n_cont
+        integer = [True] * n_int + [False] * n_cont
+        # Construct a planted feasible point so feasibility is guaranteed.
+        x_star = [rng.randint(0, 3) for _ in range(n_int)] + [rng.randint(0, 5) for _ in range(n_cont)]
+        rows = []
+        for _ in range(28):
+            a = [rng.randint(-2, 3) if rng.random() < 0.35 else 0 for _ in range(n)]
+            if not any(a):
+                a[0] = 1
+            rhs = sum(ai * xi for ai, xi in zip(a, x_star))
+            rows.append((a, rhs - 2, rhs + 2))
+        for zero_obj in (True, False):
+            costs = [0] * n if zero_obj else [rng.randint(-3, 5) for _ in range(n)]
+            m = dict(cost=costs, bounds=bounds, integer=integer, rows=rows, offset=0, maximize=False)
+            with self.subTest(zero_obj=zero_obj), tempfile.TemporaryDirectory() as tmp:
+                v, model, sol = self.run_model(Path(tmp), integer_mps(m))
+                self.assertEqual(v['status'], 'optimal', v)
+                self.assertIn('SCIP branch-and-cut', v['message'])
+                chk = subprocess.run([CHECKER, '--model', model, '--solution', sol],
+                                     capture_output=True, text=True, timeout=15)
+                self.assertEqual(chk.returncode, 0, (chk.stdout, chk.stderr))
+                c = json.loads(chk.stdout)
+                self.assertTrue(c['checked_feasible'], c)
+                if zero_obj:
+                    self.assertEqual(F(c['objective']), F(0))
+                else:
+                    # Must be at least as good as the planted feasible solution.
+                    planted_obj = sum(ci * xi for ci, xi in zip(costs, x_star))
+                    self.assertLessEqual(F(c['objective']), F(planted_obj))
+
 
 if __name__ == '__main__':
     unittest.main()
