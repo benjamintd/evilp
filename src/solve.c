@@ -266,7 +266,7 @@ int main(int argc, char **argv) {
         LabBbOptions bb_options = {.lp = options,
                                    .time_limit = options.time_limit,
                                    .node_limit = node_limit,
-                                   .sat_decision_limit = node_limit_set ? node_limit : 2000000,
+                                   .sat_decision_limit = node_limit_set ? node_limit : 200000000,
                                    .cold = cold,
                                    .no_presolve = no_presolve,
                                    .binary_sat = binary_sat,

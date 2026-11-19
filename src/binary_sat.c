@@ -1417,9 +1417,14 @@ static int small_integer_sat(const LabModel *m, const double *lo, const double *
                 kissat_release(es.solver);
                 break;
             }
-            size_t want = budget > 6 ? budget / 3 : budget;
+            size_t want = (incumbent && pb_hi - pb_lo <= 1) ? budget
+                                                            : (budget > 6 ? budget / 3 : budget);
             unsigned slice = (unsigned)fmin(UINT_MAX, (double)want);
             budget -= slice;
+            if (!incumbent) {
+                double rem = deadline - lab_now();
+                es.deadline = lab_now() + fmin(rem, fmax(2.0, 0.35 * rem));
+            }
             kissat_set_decision_limit(es.solver, slice);
             ++*calls;
             int status = bounded_solve(&es, total_bits, bits);
@@ -2052,12 +2057,21 @@ int lab_binary_sat(const LabModel *m, const double *lo, const double *hi, double
                 continue;
             break;
         }
-        /* Reserve a disjoint part of the decision budget for each call. */
-        size_t want = pb_mode ? (budget > 6 ? budget / 3 : budget) : (budget / 2 + budget % 2);
+        /* Reserve a disjoint part of the decision budget for each call; give
+         * the final closing PB proof full remaining budget. */
+        size_t want = pb_mode
+                          ? ((incumbent && pb_hi - pb_lo <= 1)
+                                 ? budget
+                                 : (budget > 6 ? budget / 3 : budget))
+                          : (budget / 2 + budget % 2);
         unsigned slice = (unsigned)fmin(UINT_MAX, (double)want);
         if (local && slice > 1024)
             slice = 1024;
         budget -= slice;
+        if (pb_mode && !incumbent && cost.n > 0) {
+            double rem = deadline - lab_now();
+            e.deadline = lab_now() + fmin(rem, fmax(2.0, 0.35 * rem));
+        }
         kissat_set_decision_limit(e.solver, slice);
         ++*calls;
         int status = bounded_solve(&e, m->cols, local ? NULL : trial);

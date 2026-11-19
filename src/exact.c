@@ -687,7 +687,7 @@ static int source_scalar(const LabModel *m,const double *left,const double *righ
                 cost.lower <= m->objective[j] && m->objective[j] <= cost.upper)
                 continue;
         }
-        if (++exact_products > 65536) {bad=1;break;}
+        if (++exact_products > 524288) {bad=1;break;}
         bad=lab_source_exact_objective(m,j,c);if(bad)break;
         mpq_set_d(x,left[j]);if(right){mpq_set_d(y,right[j]);mpq_sub(x,x,y);}
         mpq_mul(term,c,x);mpq_add(total,total,term);

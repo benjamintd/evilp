@@ -124,13 +124,21 @@ int lab_scip_mip(const LabModel *m, const double *lower, const double *upper,
         SCIPsetIntParam(s, "presolving/stuffing/maxrounds", -1) != SCIP_OKAY ||
         SCIPsetIntParam(s, "presolving/tworowbnd/maxrounds", -1) != SCIP_OKAY ||
         SCIPsetIntParam(s, "presolving/redvub/maxrounds", -1) != SCIP_OKAY ||
+        SCIPsetIntParam(s, "presolving/sparsify/maxnonzeros", 64) != SCIP_OKAY ||
+        SCIPsetRealParam(s, "presolving/restartfac", 0.02) != SCIP_OKAY ||
+        SCIPsetRealParam(s, "presolving/immrestartfac", 0.08) != SCIP_OKAY ||
+        SCIPsetRealParam(s, "presolving/restartminred", 0.05) != SCIP_OKAY ||
         SCIPsetIntParam(s, "propagating/probing/maxprerounds", 2) != SCIP_OKAY ||
         SCIPsetIntParam(s, "propagating/probing/maxuseless", 200) != SCIP_OKAY ||
         SCIPsetIntParam(s, "propagating/probing/maxtotaluseless", 400) != SCIP_OKAY ||
         SCIPsetIntParam(s, "separating/rapidlearning/freq", 0) != SCIP_OKAY ||
         SCIPsetIntParam(s, "separating/aggregation/maxroundsroot", 10) != SCIP_OKAY ||
+        SCIPsetRealParam(s, "heuristics/rens/minfixingrate", 0.3) != SCIP_OKAY ||
         SCIPsetIntParam(s, "heuristics/farkasdiving/freq", 20) != SCIP_OKAY ||
         SCIPsetIntParam(s, "heuristics/conflictdiving/freq", 20) != SCIP_OKAY)
+        goto done;
+    if ((m->rows >= 2000 || m->nnz >= 100000) &&
+        SCIPsetBoolParam(s, "constraints/knapsack/disaggregation", FALSE) != SCIP_OKAY)
         goto done;
     if (m->maximize && SCIPsetObjsense(s, SCIP_OBJSENSE_MAXIMIZE) != SCIP_OKAY)
         goto done;
