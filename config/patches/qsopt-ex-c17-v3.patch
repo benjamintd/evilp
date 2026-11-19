@@ -1,0 +1,256 @@
+--- a/qsopt_ex/trace.h
++++ b/qsopt_ex/trace.h
+@@ -34,7 +34,7 @@
+ #else
+ /* the optimizer will take care of this */
+ #define ILL_IFTRACE        if (0) QSlog
+-#define ILL_IFTRACE        if (0) QSlog
++#define ILL_IFTRACE2        if (0) QSlog
+ #define ILL_IFDOTRACE      if (0)
+ #endif
+ 
+--- a/qsopt_ex/zeit.c
++++ b/qsopt_ex/zeit.c
+@@ -89,6 +89,9 @@
+ /*                                                                          */
+ /****************************************************************************/
+ 
++#ifdef HAVE_CONFIG_H
++#include "config.h"
++#endif
+ #include <stdlib.h>
+ #include <stdio.h>
+ #include <string.h>
+--- a/qsopt_ex/simplex.c
++++ b/qsopt_ex/simplex.c
+@@ -927,11 +927,21 @@
+ 		CHECKRVALG (rval, CLEANUP);
+ 		EGLPNUM_TYPENAME_ILLprice_free_pricing_info (pinf);
+ 	}
++	if (ILLutil_zeit () - lp->starttime >= lp->maxtime)
++	{
++		it.solstatus = ILL_MAX_TIME;
++		goto TERMINATE;
++	}
+ 
+ 	if (lp->fbasisid != lp->basisid)
+ 	{
+ 		rval = EGLPNUM_TYPENAME_ILLbasis_factor (lp, &singular);
+ 		CHECKRVALG (rval, CLEANUP);
++		if (ILLutil_zeit () - lp->starttime >= lp->maxtime)
++		{
++			it.solstatus = ILL_MAX_TIME;
++			goto TERMINATE;
++		}
+ 		if (singular)
+ 		{
+ 			MESSAGE (__QS_SB_VERB, "Singular basis found!");
+@@ -950,6 +960,11 @@
+ 	else if (it.resumeid != -1)
+ 		QSlog("Resuming for other reason... %d", it.resumeid);
+ #endif
++	if (ILLutil_zeit () - lp->starttime >= lp->maxtime)
++	{
++		it.solstatus = ILL_MAX_TIME;
++		goto TERMINATE;
++	}
+ 	it.solstatus = ILL_LP_UNSOLVED;
+ 	init_lp_status_info (&(lp->basisstat));
+ 
+@@ -974,7 +989,8 @@
+ 		if (EGLPNUM_TYPENAME_EGlpNumIsLess (lp->objbound, lp->dobjval))
+ 		{
+ 			it.solstatus = ILL_BND_REACHED;
+-			QSlog("solstatus = ILL_BND_REACHED = 5 %lf %lf",
++			if (it.sdisplay)
++				QSlog("solstatus = ILL_BND_REACHED = 5 %lf %lf",
+ 									EGLPNUM_TYPENAME_EGlpNumToLf (lp->objbound),
+ 									EGLPNUM_TYPENAME_EGlpNumToLf (lp->dobjval));
+ 			goto TERMINATE;
+@@ -1429,7 +1445,7 @@
+ 				{
+ 					it->solstatus = ILL_BND_REACHED;
+ 					it->nextstep = SIMPLEX_TERMINATE;
+-					/*if (it->sdisplay) */
++					if (it->sdisplay)
+ 					{
+ 						QSlog("bound reached %lf %lf", EGLPNUM_TYPENAME_EGlpNumToLf (lp->objbound),
+ 										EGLPNUM_TYPENAME_EGlpNumToLf (lp->dobjval));
+--- a/qsopt_ex/qsopt.c
++++ b/qsopt_ex/qsopt.c
+@@ -296,6 +296,8 @@
+ 		p2 = EGLPNUM_TYPENAME_QScopy_prob (p, "scaled_lp");
+ 		if (p2 == 0)
+ 			goto CLEANUP;
++		p2->lp->maxtime = p->lp->maxtime;
++		p2->lp->maxiter = p->lp->maxiter;
+ 
+ 		rval = EGLPNUM_TYPENAME_ILLlp_scale (p2->qslp);
+ 		CHECKRVALG (rval, CLEANUP);
+@@ -303,16 +305,24 @@
+ 		if (primal_or_dual == 0)
+ 		{
+ 			rval = EGLPNUM_TYPENAME_ILLlib_optimize (p2->lp, p2->basis, p2->pricing,
+-															PRIMAL_SIMPLEX, 0, p2->simplex_display, 
++															PRIMAL_SIMPLEX, &rstatus, p2->simplex_display,
+ 															&(p->itcnt));
+ 		}
+ 		else
+ 		{
+ 			rval = EGLPNUM_TYPENAME_ILLlib_optimize (p2->lp, p2->basis, p2->pricing,
+-															DUAL_SIMPLEX, 0, p2->simplex_display,
++															DUAL_SIMPLEX, &rstatus, p2->simplex_display,
+ 															&(p->itcnt));
+ 		}
+ 		CHECKRVALG (rval, CLEANUP);
++		if (rstatus == QS_LP_TIME_LIMIT || rstatus == QS_LP_ITER_LIMIT)
++		{
++			EGLPNUM_TYPENAME_QSfree_prob (p2);
++			p2 = 0;
++			if (status)
++				*status = rstatus;
++			goto CLEANUP;
++		}
+ 
+ 		rval = grab_basis (p2);
+ 		CHECKRVALG (rval, CLEANUP);
+@@ -1769,6 +1779,14 @@
+ 		goto CLEANUP;
+ 	}
+ 
++	if (p->factorok && p->basis && p->basis->cstat && p->basis->rstat &&
++			p->basis->nstruct == qslp->nstruct && p->basis->nrows == qslp->nrows &&
++			memcmp (p->basis->cstat, cstat, (size_t) qslp->nstruct) == 0 &&
++			memcmp (p->basis->rstat, rstat, (size_t) qslp->nrows) == 0)
++	{
++		goto CLEANUP;
++	}
++
+ 	if (p->basis == 0)
+ 	{
+ 		ILL_SAFE_MALLOC (p->basis, 1, EGLPNUM_TYPENAME_ILLlp_basis);
+@@ -1817,8 +1835,17 @@
+ 
+ 	nrows = p->qslp->nrows;
+ 
++	if (p->factorok && p->basis && p->basis->cstat && p->basis->rstat &&
++			p->basis->nstruct == p->qslp->nstruct && p->basis->nrows == nrows &&
++			memcmp (p->basis->cstat, cstat, (size_t) p->qslp->nstruct) == 0 &&
++			memcmp (p->basis->rstat, rstat, (size_t) nrows) == 0)
++	{
++		goto CLEANUP;
++	}
++
+ 	rval = EGLPNUM_TYPENAME_QSload_basis_array (p, cstat, rstat);
+ 	CHECKRVALG (rval, CLEANUP);
++	EGLPNUM_TYPENAME_EGlpNumFreeArray (p->basis->rownorms);
+ 	p->basis->rownorms = EGLPNUM_TYPENAME_EGlpNumAllocArray (nrows);
+ 
+ 	for (i = 0; i < nrows; i++)
+--- a/qsopt_ex/price.c
++++ b/qsopt_ex/price.c
+@@ -766,6 +766,13 @@
+ 	CHECKRVALG(rval,CLEANUP);
+ 	psinfo->norms = EGLPNUM_TYPENAME_EGlpNumAllocArray (lp->nnbasic);
+ 
++	if (lp->nnbasic > 128)
++	{
++		for (j = 0; j < lp->nnbasic; j++)
++			EGLPNUM_TYPENAME_EGlpNumOne (psinfo->norms[j]);
++		goto CLEANUP;
++	}
++
+ 	for (j = 0; j < lp->nnbasic; j++)
+ 	{
+ 		rval = ILLstring_report (NULL, &lp->O->reporter);
+@@ -957,6 +964,13 @@
+ 	CHECKRVALG(rval,CLEANUP);
+ 	dsinfo->norms = EGLPNUM_TYPENAME_EGlpNumAllocArray (lp->nrows);
+ 
++	if (lp->nrows > 128)
++	{
++		for (i = 0; i < lp->nrows; i++)
++			EGLPNUM_TYPENAME_EGlpNumOne (dsinfo->norms[i]);
++		goto CLEANUP;
++	}
++
+ 	for (i = 0; i < lp->nrows; i++)
+ 	{
+ 		rval = ILLstring_report (NULL, &lp->O->reporter);
+@@ -990,6 +1004,13 @@
+ 	EGLPNUM_TYPENAME_ILLsvector_init (&z);
+ 	rval = EGLPNUM_TYPENAME_ILLsvector_alloc (&z, lp->nrows);
+ 	CHECKRVALG(rval,CLEANUP);
++
++	if (lp->nrows > 128 && count > 16)
++	{
++		for (i = 0; i < count; i++)
++			EGLPNUM_TYPENAME_EGlpNumOne (norms[i]);
++		goto CLEANUP;
++	}
+ 
+ 	for (i = 0; i < count; i++)
+ 	{
+@@ -1516,6 +1537,13 @@
+ 	rval = EGLPNUM_TYPENAME_ILLsvector_alloc (&y, lp->nrows);
+ 	CHECKRVALG(rval,CLEANUP);
+ 
++	if (lp->nrows > 128 && nelems > 16)
++	{
++		for (j = 0; j < nelems; j++)
++			EGLPNUM_TYPENAME_EGlpNumOne (norms[j]);
++		goto CLEANUP;
++	}
++
+ 	for (j = 0; j < nelems; j++)
+ 	{
+ 		a.nzcnt = matcnt[j];
+--- a/qsopt_ex/presolve.c
++++ b/qsopt_ex/presolve.c
+@@ -306,6 +306,11 @@
+ 			EGLPNUM_TYPENAME_EGlpNumOne (A->matval[aindex]);
+ 			EGLPNUM_TYPENAME_EGlpNumSign (A->matval[aindex]);
+ 			break;
++		case 'N':									/* Free row  */
++			EGLPNUM_TYPENAME_EGlpNumCopyNeg (lp->lower[ncols], EGLPNUM_TYPENAME_ILL_MAXDOUBLE);
++			EGLPNUM_TYPENAME_EGlpNumCopy (lp->upper[ncols], EGLPNUM_TYPENAME_ILL_MAXDOUBLE);
++			EGLPNUM_TYPENAME_EGlpNumOne (A->matval[aindex]);
++			break;
+ 		default:
+ 			QSlog("unknown sense %c in EGLPNUM_TYPENAME_ILLlp_add_logicals", sense[i]);
+ 			rval = 1;
+--- a/qsopt_ex/lib.c
++++ b/qsopt_ex/lib.c
+@@ -1276,6 +1276,11 @@
+ 	{
+ 		EGLPNUM_TYPENAME_EGlpNumCopy (qslp->upper[ncols], range);	/* Range      */
+ 	}
++	else if (sense == 'N')
++	{
++		EGLPNUM_TYPENAME_EGlpNumCopyNeg (qslp->lower[ncols], EGLPNUM_TYPENAME_ILL_MAXDOUBLE);
++		EGLPNUM_TYPENAME_EGlpNumCopy (qslp->upper[ncols], EGLPNUM_TYPENAME_ILL_MAXDOUBLE);
++	}
+ 	else
+ 	{
+ 		EGLPNUM_TYPENAME_EGlpNumCopy (qslp->upper[ncols], EGLPNUM_TYPENAME_ILL_MAXDOUBLE);	/* Slack      */
+@@ -1983,6 +1988,12 @@
+ 			EGLPNUM_TYPENAME_EGlpNumCopy (qslp->upper[j], EGLPNUM_TYPENAME_ILL_MAXDOUBLE);
+ 			EGLPNUM_TYPENAME_EGlpNumOne (A->matval[k]);
+ 			break;
++		case 'N':									/* Free row  */
++			qslp->sense[rowlist[i]] = 'N';
++			EGLPNUM_TYPENAME_EGlpNumCopyNeg (qslp->lower[j], EGLPNUM_TYPENAME_ILL_MAXDOUBLE);
++			EGLPNUM_TYPENAME_EGlpNumCopy (qslp->upper[j], EGLPNUM_TYPENAME_ILL_MAXDOUBLE);
++			EGLPNUM_TYPENAME_EGlpNumOne (A->matval[k]);
++			break;
+ 		default:
+ 			QSlog("illegal sense %c in EGLPNUM_TYPENAME_ILLlib_chgsense", sense[i]);
+ 			rval = 1;
+@@ -3682,6 +3693,7 @@
+ 				break;
+ 			case STAT_UPPER:
+ 			case STAT_LOWER:
++			case STAT_ZERO:
+ 				rstat[i] = QS_ROW_BSTAT_LOWER;
+ 				break;
+ 			default:

@@ -1,0 +1,488 @@
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -185,7 +185,7 @@
+     endif()
+ elseif(SYM STREQUAL "none")
+     message(STATUS "Support SYM: OFF")
+-    set(sym symmetry/compute_symmetry_none.cpp)
++    set(sym symmetry/compute_symmetry_none.c)
+ else()
+     message(FATAL_ERROR "option SYM has wrong value")
+ endif()
+@@ -312,10 +312,10 @@
+    file(STRINGS \${DST} GITHASH_OLD)
+    string(REGEX REPLACE \"#define SCIP_GITHASH \\\"(.*)\\\"\" \"\\\\1\" GITHASH_OLD \"\${GITHASH_OLD}\")
+ endif()
+-if((GIT) AND (EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/.git))
++if((GIT) AND (EXISTS \"${CMAKE_CURRENT_SOURCE_DIR}/.git\"))
+    execute_process(
+       COMMAND \${GIT} describe --always --dirty
+-      WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
++      WORKING_DIRECTORY \"${CMAKE_CURRENT_SOURCE_DIR}\"
+       OUTPUT_VARIABLE GITHASH OUTPUT_STRIP_TRAILING_WHITESPACE)
+    string(REGEX REPLACE \"^.*-g\" \"\" GITHASH \"\${GITHASH}\")
+    if(NOT \${GITHASH} STREQUAL \"\${GITHASH_OLD}\")
+--- a/cmake/Modules/FindGMP.cmake
++++ b/cmake/Modules/FindGMP.cmake
+@@ -36,7 +36,7 @@
+         PATH_SUFFIXES lib)
+ endif()
+ 
+-SET(GMP_LIBRARIES ${GMP_LIBRARY} ${GMPXX_LIBRARY})
++SET(GMP_LIBRARIES ${GMP_LIBRARY})
+ 
+ # look for mpir library and include files when gmp could not be found
+ if(NOT GMP_LIBRARIES)
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -8,7 +8,7 @@
+         OUTPUT_NAME ${outputname})
+ endfunction(setLibProperties)
+ 
+-set(CMAKE_C_STANDARD 99)
++set(CMAKE_C_STANDARD 17)
+ set(CMAKE_C_STANDARD_REQUIRED on)
+ set(CMAKE_C_EXTENSIONS OFF)
+ 
+@@ -183,7 +183,7 @@
+     scip/nodesel_hybridestim.c
+     scip/nodesel_restartdfs.c
+     scip/nodesel_uct.c
+-    scip/presol_milp.cpp
++    scip/presol_milp.c
+     scip/presol_boundshift.c
+     scip/presol_convertinttobin.c
+     scip/presol_domcol.c
+@@ -1019,7 +1019,7 @@
+ 
+ # all source files should be compiled with a c++ compiler
+ if(CXXONLY)
+-    set_source_files_properties(main.c ${scipsources} ${objscipsources} ${lpisources} ${tpisources} ${symsources} PROPERTIES LANGUAGE CXX)
++    set_source_files_properties(main.c ${scipsources}  ${lpisources} ${tpisources} ${symsources} PROPERTIES LANGUAGE CXX)
+ 
+     # for the clang compiler this suppresses the warnings about treating 'c' input as 'c++' when CXXONLY is enabled
+     if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+@@ -1037,7 +1037,7 @@
+     scip/message.c)
+ setLibProperties(liblpi "lpi")
+ 
+-add_library(libscip ${scipsources} ${objscipsources} ${lpisources} ${tpisources} ${symsources})
++add_library(libscip ${scipsources}  ${lpisources} ${tpisources} ${symsources})
+ 
+ if(MSVC)
+    # msvc otherwise is not smart enough and tries to link the scip.exe binary as a library
+@@ -1066,7 +1066,7 @@
+ set(ZIMPL_NEEDED 0)
+ if(SHARED)
+     target_link_libraries(libscip PRIVATE ${ZIMPL_PIC_LIBRARIES} ${LPS_PIC_LIBRARIES} ${SYM_PIC_LIBRARIES})
+-    add_executable(scip main.c ${scipsources} ${objscipsources} ${lpisources} ${tpisources} ${symsources})
++    add_executable(scip main.c ${scipsources}  ${lpisources} ${tpisources} ${symsources})
+ else()
+     if(SOPLEX_FOUND)
+         set(SOPLEX_NEEDED 1)
+--- a/src/lpi/lpi_qso.c
++++ b/src/lpi/lpi_qso.c
+@@ -73,6 +73,14 @@
+    char*                 ibas;               /**< array of length tbsz */
+    int                   pricing;            /**< SCIP pricing option */
+    SCIP_MESSAGEHDLR*     messagehdlr;        /**< messagehdlr handler to printing messages, or NULL */
++   char*                 sb_cstat;           /**< saved column basis during strong branching */
++   char*                 sb_rstat;           /**< saved row basis during strong branching */
++   int                   sb_ncols;           /**< saved ncols during strong branching */
++   int                   sb_nrows;           /**< saved nrows during strong branching */
++   int                   sb_solstat;         /**< saved solstat during strong branching */
++   LPI_QSOPT_ALGO        sb_algo;            /**< saved algorithm during strong branching */
++   double                sb_objval;          /**< saved objective value during strong branching */
++   SCIP_Bool             sb_active;          /**< whether strong branching session is active */
+ };
+ 
+ /** row norms */
+@@ -352,9 +360,10 @@
+          lpi->irng[i] = 0;
+          break;
+       default:
+-         SCIPerrorMessage("Error, constraint %d has no bounds!", i);
+-         SCIPABORT();
+-         return SCIP_INVALIDDATA; /*lint !e527*/
++         lpi->isen[i] = 'N';
++         lpi->irhs[i] = 0.0;
++         lpi->irng[i] = 0.0;
++         break;
+       }
+    }
+    return SCIP_OKAY;
+@@ -477,6 +486,7 @@
+    SCIP_ALLOC( BMSallocMemory(lpi) );
+    memset(*lpi, 0, sizeof(struct SCIP_LPi));
+ 
++   QSexactStart();
+    (*lpi)->prob = QScreate_prob(name, (int) objsen);
+    if ( (*lpi)->prob == NULL )
+    {
+@@ -526,6 +536,8 @@
+    BMSfreeMemoryArray( &((*lpi)->iccha) );
+    BMSfreeMemoryArray( &((*lpi)->itab) );
+    BMSfreeMemoryArray( &((*lpi)->ibas) );
++   BMSfreeMemoryArrayNull( &((*lpi)->sb_cstat) );
++   BMSfreeMemoryArrayNull( &((*lpi)->sb_rstat) );
+ 
+    /* free memory */
+    BMSfreeMemory(lpi);
+@@ -1900,6 +1912,10 @@
+          lhss[i] = lrhs[i];
+          rhss[i] = QS_MAXDOUBLE;
+          break;
++      case 'N':
++         lhss[i] = -QS_MAXDOUBLE;
++         rhss[i] = QS_MAXDOUBLE;
++         break;
+       default:
+          SCIPerrorMessage("Unknown sense %c from QSopt", lsense[i]);
+          SCIPABORT();
+@@ -2000,11 +2016,43 @@
+ SCIP_RETCODE SCIPlpiStartStrongbranch(
+    SCIP_LPI*             lpi                 /**< LP interface structure */
+    )
+-{  /*lint --e{715}*/
+-   assert(lpi != NULL);
+-   assert(lpi->prob != NULL);
+-
+-   /* currently do nothing */
++{
++   int ncols;
++   int nrows;
++
++   assert(lpi != NULL);
++   assert(lpi->prob != NULL);
++
++   BMSfreeMemoryArrayNull(&lpi->sb_cstat);
++   BMSfreeMemoryArrayNull(&lpi->sb_rstat);
++   lpi->sb_active = FALSE;
++
++   ncols = QSget_colcount(lpi->prob);
++   nrows = QSget_rowcount(lpi->prob);
++   if( ncols > 0 )
++   {
++      SCIP_ALLOC( BMSallocMemoryArray(&lpi->sb_cstat, ncols) );
++   }
++   if( nrows > 0 )
++   {
++      SCIP_ALLOC( BMSallocMemoryArray(&lpi->sb_rstat, nrows) );
++   }
++   if( QSget_basis_array(lpi->prob, lpi->sb_cstat, lpi->sb_rstat) == 0 )
++   {
++      lpi->sb_ncols = ncols;
++      lpi->sb_nrows = nrows;
++      lpi->sb_solstat = lpi->solstat;
++      lpi->sb_algo = lpi->algo;
++      lpi->sb_objval = 0.0;
++      (void)QSget_objval(lpi->prob, &lpi->sb_objval);
++      lpi->sb_active = TRUE;
++   }
++   else
++   {
++      BMSfreeMemoryArrayNull(&lpi->sb_cstat);
++      BMSfreeMemoryArrayNull(&lpi->sb_rstat);
++   }
++
+    return SCIP_OKAY;
+ }
+ 
+@@ -2012,11 +2060,190 @@
+ SCIP_RETCODE SCIPlpiEndStrongbranch(
+    SCIP_LPI*             lpi                 /**< LP interface structure */
+    )
+-{  /*lint --e{715}*/
+-   assert(lpi != NULL);
+-   assert(lpi->prob != NULL);
+-
+-   /* currently do nothing */
++{
++   assert(lpi != NULL);
++   assert(lpi->prob != NULL);
++
++   if( lpi->sb_active )
++   {
++      int ncols = QSget_colcount(lpi->prob);
++      int nrows = QSget_rowcount(lpi->prob);
++      if( ncols == lpi->sb_ncols && nrows == lpi->sb_nrows )
++      {
++         int olditlim = 500000;
++         int dummy = 0;
++         int nit = 0;
++         (void)QSload_basis_array(lpi->prob, lpi->sb_cstat, lpi->sb_rstat);
++         if( lpi->sb_solstat == QS_LP_OPTIMAL )
++         {
++            (void)QSget_param(lpi->prob, QS_PARAM_SIMPLEX_MAX_ITERATIONS, &olditlim);
++            (void)QSset_param(lpi->prob, QS_PARAM_SIMPLEX_MAX_ITERATIONS, 5);
++            (void)QSopt_dual(lpi->prob, &dummy);
++            (void)QSset_param(lpi->prob, QS_PARAM_SIMPLEX_MAX_ITERATIONS, olditlim);
++            if( QSget_itcnt(lpi->prob, 0, 0, 0, 0, &nit) == 0 )
++               lpi->previt = nit;
++         }
++      }
++      lpi->solstat = lpi->sb_solstat;
++      lpi->algo = lpi->sb_algo;
++      BMSfreeMemoryArrayNull(&lpi->sb_cstat);
++      BMSfreeMemoryArrayNull(&lpi->sb_rstat);
++      lpi->sb_active = FALSE;
++   }
++
++   return SCIP_OKAY;
++}
++
++/** helper to strong-branch one fractional candidate warm-started from current factorization */
++static
++SCIP_RETCODE lpiStrongbranchFracOne(
++   SCIP_LPI*             lpi,
++   int                   col,
++   SCIP_Real             psol,
++   int                   itlim,
++   SCIP_Real*            down,
++   SCIP_Real*            up,
++   SCIP_Bool*            downvalid,
++   SCIP_Bool*            upvalid,
++   int*                  iter
++   )
++{
++   double oldlb = 0.0;
++   double oldub = 0.0;
++   double objlim = QS_MAXDOUBLE;
++   double newub;
++   double newlb;
++   int objsen = QS_MIN;
++   int olditlim = 500000;
++   int sbstat = 0;
++   int nit = 0;
++   int rval;
++
++   *downvalid = FALSE;
++   *upvalid = FALSE;
++   if( down != NULL )
++      *down = lpi->sb_active ? lpi->sb_objval : 0.0;
++   if( up != NULL )
++      *up = lpi->sb_active ? lpi->sb_objval : 0.0;
++
++   QS_CONDRET( QSget_objsense(lpi->prob, &objsen) );
++   (void)QSget_param_double(lpi->prob, objsen == QS_MIN ? QS_PARAM_OBJULIM : QS_PARAM_OBJLLIM, &objlim);
++   QS_CONDRET( QSget_bounds_list(lpi->prob, 1, &col, &oldlb, &oldub) );
++   (void)QSget_param(lpi->prob, QS_PARAM_SIMPLEX_MAX_ITERATIONS, &olditlim);
++   (void)QSset_param(lpi->prob, QS_PARAM_SIMPLEX_MAX_ITERATIONS, itlim > 0 ? itlim : 1);
++
++   /* down branch: x_col <= floor(psol) */
++   newub = EPSCEIL(psol - 1.0, FEASTOL);
++   if( down != NULL )
++   {
++      if( newub < oldlb - FEASTOL )
++      {
++         *down = (objsen == QS_MIN ? QS_MAXDOUBLE : -QS_MAXDOUBLE);
++         *downvalid = TRUE;
++      }
++      else
++      {
++         if( newub < oldlb )
++            newub = oldlb;
++         rval = QSchange_bound(lpi->prob, col, 'U', newub);
++         if( rval == 0 )
++         {
++            sbstat = 0;
++            rval = QSopt_dual(lpi->prob, &sbstat);
++            if( rval == 0 )
++            {
++               if( sbstat == QS_LP_OPTIMAL )
++               {
++                  if( QSget_objval(lpi->prob, down) == 0 )
++                     *downvalid = TRUE;
++               }
++               else if( sbstat == QS_LP_INFEASIBLE )
++               {
++                  *down = (objsen == QS_MIN ? QS_MAXDOUBLE : -QS_MAXDOUBLE);
++                  *downvalid = TRUE;
++               }
++               else if( sbstat == QS_LP_OBJ_LIMIT )
++               {
++                  *down = objlim;
++                  *downvalid = TRUE;
++               }
++               else if( sbstat == QS_LP_ITER_LIMIT || sbstat == QS_LP_TIME_LIMIT )
++               {
++                  (void)QSget_objval(lpi->prob, down);
++               }
++               else if( lpi->sb_active )
++               {
++                  (void)QSload_basis_array(lpi->prob, lpi->sb_cstat, lpi->sb_rstat);
++               }
++            }
++            else if( lpi->sb_active )
++            {
++               (void)QSload_basis_array(lpi->prob, lpi->sb_cstat, lpi->sb_rstat);
++            }
++            (void)QSchange_bound(lpi->prob, col, 'U', oldub);
++         }
++      }
++   }
++
++   /* up branch: x_col >= ceil(psol) */
++   newlb = EPSFLOOR(psol + 1.0, FEASTOL);
++   if( up != NULL )
++   {
++      if( newlb > oldub + FEASTOL )
++      {
++         *up = (objsen == QS_MIN ? QS_MAXDOUBLE : -QS_MAXDOUBLE);
++         *upvalid = TRUE;
++      }
++      else
++      {
++         if( newlb > oldub )
++            newlb = oldub;
++         rval = QSchange_bound(lpi->prob, col, 'L', newlb);
++         if( rval == 0 )
++         {
++            sbstat = 0;
++            rval = QSopt_dual(lpi->prob, &sbstat);
++            if( rval == 0 )
++            {
++               if( sbstat == QS_LP_OPTIMAL )
++               {
++                  if( QSget_objval(lpi->prob, up) == 0 )
++                     *upvalid = TRUE;
++               }
++               else if( sbstat == QS_LP_INFEASIBLE )
++               {
++                  *up = (objsen == QS_MIN ? QS_MAXDOUBLE : -QS_MAXDOUBLE);
++                  *upvalid = TRUE;
++               }
++               else if( sbstat == QS_LP_OBJ_LIMIT )
++               {
++                  *up = objlim;
++                  *upvalid = TRUE;
++               }
++               else if( sbstat == QS_LP_ITER_LIMIT || sbstat == QS_LP_TIME_LIMIT )
++               {
++                  (void)QSget_objval(lpi->prob, up);
++               }
++               else if( lpi->sb_active )
++               {
++                  (void)QSload_basis_array(lpi->prob, lpi->sb_cstat, lpi->sb_rstat);
++               }
++            }
++            else if( lpi->sb_active )
++            {
++               (void)QSload_basis_array(lpi->prob, lpi->sb_cstat, lpi->sb_rstat);
++            }
++            (void)QSchange_bound(lpi->prob, col, 'L', oldlb);
++         }
++      }
++   }
++
++   (void)QSset_param(lpi->prob, QS_PARAM_SIMPLEX_MAX_ITERATIONS, olditlim);
++   QS_CONDRET( QSget_itcnt(lpi->prob, 0, 0, 0, 0, &nit) );
++   if( iter != NULL )
++      *iter = nit - lpi->previt;
++   lpi->previt = nit;
++
+    return SCIP_OKAY;
+ }
+ 
+@@ -2035,33 +2262,15 @@
+    int*                  iter                /**< stores total number of strong branching iterations, or -1; may be NULL */
+    )
+ {
+-   int nit;
+-
+    assert(lpi != NULL);
+    assert(lpi->prob != NULL);
+    assert(down != NULL);
+    assert(up != NULL);
+    assert(downvalid != NULL);
+    assert(upvalid != NULL);
+-
+-   SCIPdebugMessage("calling QSopt strong branching on variable %d with fractional value (%d it lim)\n", col, itlim);
+-
+-   /* results of QSopt are valid in any case */
+-   *downvalid = TRUE;
+-   *upvalid = TRUE;
+-
+    assert( ! EPSISINT(psol, FEASTOL) );
+ 
+-   /* call QSopt */
+-   QS_CONDRET( QSopt_strongbranch(lpi->prob, 1, &col, &psol, down, up, itlim, QS_MAXDOUBLE) );
+-
+-   QS_CONDRET( QSget_itcnt(lpi->prob, 0, 0, 0, 0, &nit) );
+-
+-   if( iter )
+-      *iter = nit - lpi->previt;
+-   lpi->previt = nit;
+-
+-   return SCIP_OKAY;
++   return lpiStrongbranchFracOne(lpi, col, psol, itlim, down, up, downvalid, upvalid, iter);
+ }
+ 
+ /** performs strong branching iterations on given @b fractional candidates */
+@@ -2073,15 +2282,15 @@
+    int                   itlim,              /**< iteration limit for strong branchings */
+    SCIP_Real*            down,               /**< stores dual bounds after branching columns down */
+    SCIP_Real*            up,                 /**< stores dual bounds after branching columns up */
+-   SCIP_Bool*            downvalid,          /**< stores whether the returned down values are valid dual bounds;
++   SCIP_Bool*            downvalid,          /**< stores whether the returned down values are a valid dual bound;
+                                               *   otherwise, they can only be used as an estimate values */
+-   SCIP_Bool*            upvalid,            /**< stores whether the returned up values are a valid dual bounds;
++   SCIP_Bool*            upvalid,            /**< stores whether the returned up values are a valid dual bound;
+                                               *   otherwise, they can only be used as an estimate values */
+    int*                  iter                /**< stores total number of strong branching iterations, or -1; may be NULL */
+    )
+ {
+-   int nit;
+    int j;
++   int totalit = 0;
+ 
+    assert(lpi != NULL);
+    assert(lpi->prob != NULL);
+@@ -2092,24 +2301,15 @@
+    assert(downvalid != NULL);
+    assert(upvalid != NULL);
+ 
+-   SCIPdebugMessage("calling QSopt strong branching on %d variables with fractional value (%d it lim)\n", ncols, itlim);
+-
+-   /* results of QSopt are valid in any case */
+    for( j = 0; j < ncols; ++j )
+    {
+-      downvalid[j] = TRUE;
+-      upvalid[j] = TRUE;
++      int subit = 0;
+       assert( ! EPSISINT(psols[j], FEASTOL) );
+-   }
+-
+-   /* call QSopt */
+-   QS_CONDRET( QSopt_strongbranch(lpi->prob, ncols, cols, psols, down, up, itlim, QS_MAXDOUBLE) );
+-
+-   QS_CONDRET( QSget_itcnt(lpi->prob, 0, 0, 0, 0, &nit) );
+-
+-   if( iter )
+-      *iter = nit - lpi->previt;
+-   lpi->previt = nit;
++      SCIP_CALL( lpiStrongbranchFracOne(lpi, cols[j], psols[j], itlim, &down[j], &up[j], &downvalid[j], &upvalid[j], &subit) );
++      totalit += subit;
++   }
++   if( iter != NULL )
++      *iter = totalit;
+ 
+    return SCIP_OKAY;
+ }
+@@ -2573,6 +2773,7 @@
+             activity[i] = lpi->irhs[i] + lpi->irng[i];
+             break;
+          case 'L':
++         case 'N':
+             activity[i] = lpi->irhs[i] - lpi->irng[i];
+             break;
+          default:
+@@ -2839,7 +3040,7 @@
+ 
+    SCIPdebugMessage("loading basis %p/%p into QSopt\n", (void*)cstat, (void*)rstat);
+ 
+-   SCIP_CALL( ensureTabMem(lpi, ncols) );
++   SCIP_CALL( ensureTabMem(lpi, ncols + nrows) );
+    SCIP_CALL( ensureRowMem(lpi, nrows) );
+ 
+    /* get senses */
