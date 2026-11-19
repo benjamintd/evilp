@@ -1,0 +1,602 @@
+--- a/qsopt_ex/fct.c
++++ b/qsopt_ex/fct.c
+@@ -2062,8 +2062,8 @@
+ 	int eindex,
+ 	EGLPNUM_TYPENAME_svector * srhs)
+ {
+-	int j, k;
+-	int col, indx, vs;
++	int i, j, k, r, nz = 0;
++	int col, indx, vs, mcnt, mbeg;
+ 	int *perm = lp->upd.perm;
+ 	int *ix = lp->upd.ix;
+ 	int tctr = lp->upd.tctr;
+@@ -2072,7 +2072,7 @@
+ 	EGLPNUM_TYPE *t_max = &(lp->upd.tz);
+ 	EGLPNUM_TYPE *t = lp->upd.t;
+ 	EGLPNUM_TYPE delta;
+-	EGLPNUM_TYPENAME_svector a;
++	EGLPNUM_TYPENAME_svector *w = &(lp->work);
+ 
+ 	EGLPNUM_TYPENAME_EGlpNumInitVar (delta);
+ 	EGLPNUM_TYPENAME_EGlpNumZero (delta);
+@@ -2098,12 +2098,30 @@
+ 			EGLPNUM_TYPENAME_EGlpNumAddInnProdTo (*dty, delta, *zAj);
+ 			lp->vstat[col] = (vs == STAT_UPPER) ? STAT_LOWER : STAT_UPPER;
+ 
+-			a.nzcnt = lp->matcnt[col];
+-			a.indx = &(lp->matind[lp->matbeg[col]]);
+-			a.coef = &(lp->matval[lp->matbeg[col]]);
+-			add_vectors (lp, srhs, &a, srhs, delta);
++			mcnt = lp->matcnt[col];
++			mbeg = lp->matbeg[col];
++			for (i = 0; i < mcnt; i++)
++			{
++				r = lp->matind[mbeg + i];
++				if (lp->iwork[r] == 0)
++				{
++					w->indx[nz++] = r;
++					lp->iwork[r] = 1;
++				}
++				EGLPNUM_TYPENAME_EGlpNumAddInnProdTo (w->coef[r], delta, lp->matval[mbeg + i]);
++			}
+ 		}
+ 	}
++	for (i = 0; i < nz; i++)
++	{
++		r = w->indx[i];
++		srhs->indx[i] = r;
++		EGLPNUM_TYPENAME_EGlpNumCopy (srhs->coef[i], w->coef[r]);
++		EGLPNUM_TYPENAME_EGlpNumZero (w->coef[r]);
++		lp->iwork[r] = 0;
++	}
++	w->nzcnt = 0;
++	srhs->nzcnt = nz;
+ 	EGLPNUM_TYPENAME_EGlpNumClearVar (delta);
+ }
+ 
+--- a/qsopt_ex/lib.c
++++ b/qsopt_ex/lib.c
+@@ -828,11 +828,25 @@
+ 		CHECKRVALG (rval, CLEANUP);
+ 
+ 		rval = EGLPNUM_TYPENAME_ILLlib_optimize (lp, &B, &lpinf, DUAL_SIMPLEX, &status, 0, itcnt);
++		EGLPNUM_TYPENAME_ILLlib_chgbnd (lp, k, 'U', oldbnd);
+ 		CHECKRVALG (rval, CLEANUP);
+ 
+-		EGLPNUM_TYPENAME_EGlpNumCopy (downpen[i], lp->dobjval);
+-		rval = EGLPNUM_TYPENAME_ILLlib_chgbnd (lp, k, 'U', oldbnd);
+-		CHECKRVALG (rval, CLEANUP);
++		if (status == QS_LP_INFEASIBLE)
++		{
++			if (lp->O->objsense == EGLPNUM_TYPENAME_ILL_MAX)
++				EGLPNUM_TYPENAME_EGlpNumCopyNeg (downpen[i], objbound);
++			else
++				EGLPNUM_TYPENAME_EGlpNumCopy (downpen[i], objbound);
++		}
++		else if (status == QS_LP_OPTIMAL || lp->basisstat.dual_feasible)
++			EGLPNUM_TYPENAME_EGlpNumCopy (downpen[i], lp->dobjval);
++		else
++		{
++			if (lp->O->objsense == EGLPNUM_TYPENAME_ILL_MAX)
++				EGLPNUM_TYPENAME_EGlpNumCopy (downpen[i], objbound);
++			else
++				EGLPNUM_TYPENAME_EGlpNumCopyNeg (downpen[i], objbound);
++		}
+ 
+ 		rval = EGLPNUM_TYPENAME_ILLlib_getbnd (lp, k, 'L', &oldbnd);
+ 		CHECKRVALG (rval, CLEANUP);
+@@ -843,11 +857,25 @@
+ 		CHECKRVALG (rval, CLEANUP);
+ 
+ 		rval = EGLPNUM_TYPENAME_ILLlib_optimize (lp, &B, &lpinf, DUAL_SIMPLEX, &status, 0, itcnt);
++		EGLPNUM_TYPENAME_ILLlib_chgbnd (lp, k, 'L', oldbnd);
+ 		CHECKRVALG (rval, CLEANUP);
+ 
+-		EGLPNUM_TYPENAME_EGlpNumCopy (uppen[i], lp->dobjval);
+-		rval = EGLPNUM_TYPENAME_ILLlib_chgbnd (lp, k, 'L', oldbnd);
+-		CHECKRVALG (rval, CLEANUP);
++		if (status == QS_LP_INFEASIBLE)
++		{
++			if (lp->O->objsense == EGLPNUM_TYPENAME_ILL_MAX)
++				EGLPNUM_TYPENAME_EGlpNumCopyNeg (uppen[i], objbound);
++			else
++				EGLPNUM_TYPENAME_EGlpNumCopy (uppen[i], objbound);
++		}
++		else if (status == QS_LP_OPTIMAL || lp->basisstat.dual_feasible)
++			EGLPNUM_TYPENAME_EGlpNumCopy (uppen[i], lp->dobjval);
++		else
++		{
++			if (lp->O->objsense == EGLPNUM_TYPENAME_ILL_MAX)
++				EGLPNUM_TYPENAME_EGlpNumCopy (uppen[i], objbound);
++			else
++				EGLPNUM_TYPENAME_EGlpNumCopyNeg (uppen[i], objbound);
++		}
+ 	}
+ 
+ 	if (lp->O->objsense == EGLPNUM_TYPENAME_ILL_MAX)
+@@ -886,6 +914,121 @@
+ 	EG_RETURN (rval);
+ }
+ 
++int EGLPNUM_TYPENAME_ILLlib_strongbranch_cached (
++	EGLPNUM_TYPENAME_lpinfo * lp,
++	EGLPNUM_TYPENAME_ILLlp_basis * B,
++	int *candidatelist,
++	int ncand,
++	EGLPNUM_TYPE * xlist,
++	EGLPNUM_TYPE * downpen,
++	EGLPNUM_TYPE * uppen,
++	int iterations,
++	EGLPNUM_TYPE objbound,
++	itcnt_t*itcnt)
++{
++	int rval = 0;
++	int i, k, status;
++	int olditer = lp->maxiter;
++	EGLPNUM_TYPE xi, t, oldbnd;
++	EGLPNUM_TYPENAME_price_info lpinf;
++
++	EGLPNUM_TYPENAME_EGlpNumInitVar (lpinf.htrigger);
++	EGLPNUM_TYPENAME_EGlpNumInitVar (xi);
++	EGLPNUM_TYPENAME_EGlpNumInitVar (t);
++	EGLPNUM_TYPENAME_EGlpNumInitVar (oldbnd);
++	EGLPNUM_TYPENAME_EGlpNumZero (oldbnd);
++	EGLPNUM_TYPENAME_ILLprice_init_pricing_info (&lpinf);
++	lpinf.dI_price = QS_PRICE_DSTEEP;
++	lpinf.dII_price = QS_PRICE_DSTEEP;
++
++	lp->maxiter = iterations;
++
++	for (i = 0; i < ncand; i++)
++	{
++		k = candidatelist[i];
++		rval = EGLPNUM_TYPENAME_ILLlib_getbnd (lp, k, 'U', &oldbnd);
++		CHECKRVALG (rval, CLEANUP);
++		EGLPNUM_TYPENAME_EGlpNumCopy (xi, xlist[i]);
++		EGLPNUM_TYPENAME_EGlpNumFloor (t, xi);
++		if (EGLPNUM_TYPENAME_EGlpNumIsLessDbl (t, 0.1) && EGLPNUM_TYPENAME_EGlpNumIsGreaDbl (t, -0.1))
++			EGLPNUM_TYPENAME_EGlpNumZero (t);
++
++		rval = EGLPNUM_TYPENAME_ILLlib_chgbnd (lp, k, 'U', t);
++		CHECKRVALG (rval, CLEANUP);
++
++		rval = EGLPNUM_TYPENAME_ILLlib_optimize (lp, B, &lpinf, DUAL_SIMPLEX, &status, 0, itcnt);
++		EGLPNUM_TYPENAME_ILLlib_chgbnd (lp, k, 'U', oldbnd);
++		CHECKRVALG (rval, CLEANUP);
++
++		if (status == QS_LP_INFEASIBLE)
++		{
++			if (lp->O->objsense == EGLPNUM_TYPENAME_ILL_MAX)
++				EGLPNUM_TYPENAME_EGlpNumCopyNeg (downpen[i], objbound);
++			else
++				EGLPNUM_TYPENAME_EGlpNumCopy (downpen[i], objbound);
++		}
++		else if (status == QS_LP_OPTIMAL || lp->basisstat.dual_feasible)
++			EGLPNUM_TYPENAME_EGlpNumCopy (downpen[i], lp->dobjval);
++		else
++		{
++			if (lp->O->objsense == EGLPNUM_TYPENAME_ILL_MAX)
++				EGLPNUM_TYPENAME_EGlpNumCopy (downpen[i], objbound);
++			else
++				EGLPNUM_TYPENAME_EGlpNumCopyNeg (downpen[i], objbound);
++		}
++
++		rval = EGLPNUM_TYPENAME_ILLlib_getbnd (lp, k, 'L', &oldbnd);
++		CHECKRVALG (rval, CLEANUP);
++		EGLPNUM_TYPENAME_EGlpNumCeil (t, xi);
++		if (EGLPNUM_TYPENAME_EGlpNumIsLessDbl (t, 1.1) && EGLPNUM_TYPENAME_EGlpNumIsGreaDbl (t, 0.9))
++			EGLPNUM_TYPENAME_EGlpNumOne (t);
++		rval = EGLPNUM_TYPENAME_ILLlib_chgbnd (lp, k, 'L', t);
++		CHECKRVALG (rval, CLEANUP);
++
++		rval = EGLPNUM_TYPENAME_ILLlib_optimize (lp, B, &lpinf, DUAL_SIMPLEX, &status, 0, itcnt);
++		EGLPNUM_TYPENAME_ILLlib_chgbnd (lp, k, 'L', oldbnd);
++		CHECKRVALG (rval, CLEANUP);
++
++		if (status == QS_LP_INFEASIBLE)
++		{
++			if (lp->O->objsense == EGLPNUM_TYPENAME_ILL_MAX)
++				EGLPNUM_TYPENAME_EGlpNumCopyNeg (uppen[i], objbound);
++			else
++				EGLPNUM_TYPENAME_EGlpNumCopy (uppen[i], objbound);
++		}
++		else if (status == QS_LP_OPTIMAL || lp->basisstat.dual_feasible)
++			EGLPNUM_TYPENAME_EGlpNumCopy (uppen[i], lp->dobjval);
++		else
++		{
++			if (lp->O->objsense == EGLPNUM_TYPENAME_ILL_MAX)
++				EGLPNUM_TYPENAME_EGlpNumCopy (uppen[i], objbound);
++			else
++				EGLPNUM_TYPENAME_EGlpNumCopyNeg (uppen[i], objbound);
++		}
++	}
++
++	if (lp->O->objsense != EGLPNUM_TYPENAME_ILL_MAX)
++	{
++		for (i = 0; i < ncand; i++)
++		{
++			if (EGLPNUM_TYPENAME_EGlpNumIsLess (objbound, downpen[i]))
++				EGLPNUM_TYPENAME_EGlpNumCopy (downpen[i], objbound);
++			if (EGLPNUM_TYPENAME_EGlpNumIsLess (objbound, uppen[i]))
++				EGLPNUM_TYPENAME_EGlpNumCopy (uppen[i], objbound);
++		}
++	}
++
++CLEANUP:
++
++	EGLPNUM_TYPENAME_EGlpNumClearVar (xi);
++	EGLPNUM_TYPENAME_EGlpNumClearVar (t);
++	EGLPNUM_TYPENAME_EGlpNumClearVar (oldbnd);
++	lp->maxiter = olditer;
++	EGLPNUM_TYPENAME_ILLprice_free_pricing_info (&lpinf);
++	EGLPNUM_TYPENAME_EGlpNumClearVar (lpinf.htrigger);
++	EG_RETURN (rval);
++}
++
+ #define EXTRA_ROWS (100)
+ #define EXTRA_COLS (100)
+ #define EXTRA_MAT  (1000)
+@@ -1276,6 +1419,11 @@
+ 	{
+ 		EGLPNUM_TYPENAME_EGlpNumCopy (qslp->upper[ncols], range);	/* Range      */
+ 	}
++	else if (sense == 'N')
++	{
++		EGLPNUM_TYPENAME_EGlpNumCopyNeg (qslp->lower[ncols], EGLPNUM_TYPENAME_ILL_MAXDOUBLE);
++		EGLPNUM_TYPENAME_EGlpNumCopy (qslp->upper[ncols], EGLPNUM_TYPENAME_ILL_MAXDOUBLE);
++	}
+ 	else
+ 	{
+ 		EGLPNUM_TYPENAME_EGlpNumCopy (qslp->upper[ncols], EGLPNUM_TYPENAME_ILL_MAXDOUBLE);	/* Slack      */
+@@ -1983,6 +2131,12 @@
+ 			EGLPNUM_TYPENAME_EGlpNumCopy (qslp->upper[j], EGLPNUM_TYPENAME_ILL_MAXDOUBLE);
+ 			EGLPNUM_TYPENAME_EGlpNumOne (A->matval[k]);
+ 			break;
++		case 'N':									/* Free row  */
++			qslp->sense[rowlist[i]] = 'N';
++			EGLPNUM_TYPENAME_EGlpNumCopyNeg (qslp->lower[j], EGLPNUM_TYPENAME_ILL_MAXDOUBLE);
++			EGLPNUM_TYPENAME_EGlpNumCopy (qslp->upper[j], EGLPNUM_TYPENAME_ILL_MAXDOUBLE);
++			EGLPNUM_TYPENAME_EGlpNumOne (A->matval[k]);
++			break;
+ 		default:
+ 			QSlog("illegal sense %c in EGLPNUM_TYPENAME_ILLlib_chgsense", sense[i]);
+ 			rval = 1;
+@@ -3682,6 +3836,7 @@
+ 				break;
+ 			case STAT_UPPER:
+ 			case STAT_LOWER:
++			case STAT_ZERO:
+ 				rstat[i] = QS_ROW_BSTAT_LOWER;
+ 				break;
+ 			default:
+--- a/qsopt_ex/lib.h
++++ b/qsopt_ex/lib.h
+@@ -107,6 +107,9 @@
+ 		EGLPNUM_TYPENAME_ILLlib_strongbranch ( EGLPNUM_TYPENAME_lpinfo * lp, EGLPNUM_TYPENAME_price_info * pinf, int *candidatelist,
+ 			int ncand, EGLPNUM_TYPE * xlist, EGLPNUM_TYPE * downpen, EGLPNUM_TYPE * uppen,
+ 			int iterations, EGLPNUM_TYPE objbound, struct itcnt_t*itcnt),
++		EGLPNUM_TYPENAME_ILLlib_strongbranch_cached ( EGLPNUM_TYPENAME_lpinfo * lp, EGLPNUM_TYPENAME_ILLlp_basis * B, int *candidatelist,
++			int ncand, EGLPNUM_TYPE * xlist, EGLPNUM_TYPE * downpen, EGLPNUM_TYPE * uppen,
++			int iterations, EGLPNUM_TYPE objbound, struct itcnt_t*itcnt),
+ 		EGLPNUM_TYPENAME_ILLlib_getbasis ( EGLPNUM_TYPENAME_lpinfo * lp, char *cstat, char *rstat),
+ 		EGLPNUM_TYPENAME_ILLlib_loadbasis ( EGLPNUM_TYPENAME_ILLlp_basis * B, int nstruct, int nrows, char *cstat,
+ 			char *rstat),
+--- a/qsopt_ex/presolve.c
++++ b/qsopt_ex/presolve.c
+@@ -306,6 +306,11 @@
+ 			EGLPNUM_TYPENAME_EGlpNumOne (A->matval[aindex]);
+ 			EGLPNUM_TYPENAME_EGlpNumSign (A->matval[aindex]);
+ 			break;
++		case 'N':									/* Free row  */
++			EGLPNUM_TYPENAME_EGlpNumCopyNeg (lp->lower[ncols], EGLPNUM_TYPENAME_ILL_MAXDOUBLE);
++			EGLPNUM_TYPENAME_EGlpNumCopy (lp->upper[ncols], EGLPNUM_TYPENAME_ILL_MAXDOUBLE);
++			EGLPNUM_TYPENAME_EGlpNumOne (A->matval[aindex]);
++			break;
+ 		default:
+ 			QSlog("unknown sense %c in EGLPNUM_TYPENAME_ILLlp_add_logicals", sense[i]);
+ 			rval = 1;
+--- a/qsopt_ex/price.c
++++ b/qsopt_ex/price.c
+@@ -766,14 +766,35 @@
+ 	CHECKRVALG(rval,CLEANUP);
+ 	psinfo->norms = EGLPNUM_TYPENAME_EGlpNumAllocArray (lp->nnbasic);
+ 
++	if (lp->nnbasic > 4096)
++	{
++		for (j = 0; j < lp->nnbasic; j++)
++			EGLPNUM_TYPENAME_EGlpNumOne (psinfo->norms[j]);
++		goto CLEANUP;
++	}
++
+ 	for (j = 0; j < lp->nnbasic; j++)
+ 	{
++		if ((j & 63) == 0 && ILLutil_zeit () - lp->starttime >= lp->maxtime * 0.25)
++		{
++			for (; j < lp->nnbasic; j++)
++				EGLPNUM_TYPENAME_EGlpNumOne (psinfo->norms[j]);
++			break;
++		}
+ 		rval = ILLstring_report (NULL, &lp->O->reporter);
+ 		CHECKRVALG(rval,CLEANUP);
+ 		EGLPNUM_TYPENAME_ILLfct_compute_yz (lp, &yz, 0, lp->nbaz[j]);
+ 		EGLPNUM_TYPENAME_EGlpNumInnProd (psinfo->norms[j], yz.coef, yz.coef, (size_t) yz.nzcnt);
+ 		EGLPNUM_TYPENAME_EGlpNumAddTo (psinfo->norms[j], EGLPNUM_TYPENAME_oneLpNum);
+ 	}
++	if (0) for (j = 0; j < lp->nnbasic; j++)
++	{
++		rval = ILLstring_report (NULL, &lp->O->reporter);
++		CHECKRVALG(rval,CLEANUP);
++		EGLPNUM_TYPENAME_ILLfct_compute_yz (lp, &yz, 0, lp->nbaz[j]);
++		EGLPNUM_TYPENAME_EGlpNumInnProd (psinfo->norms[j], yz.coef, yz.coef, (size_t) yz.nzcnt);
++		EGLPNUM_TYPENAME_EGlpNumAddTo (psinfo->norms[j], EGLPNUM_TYPENAME_oneLpNum);
++	}
+ 
+ CLEANUP:
+ 	EGLPNUM_TYPENAME_ILLsvector_free (&yz);
+@@ -957,7 +978,29 @@
+ 	CHECKRVALG(rval,CLEANUP);
+ 	dsinfo->norms = EGLPNUM_TYPENAME_EGlpNumAllocArray (lp->nrows);
+ 
++	if (lp->nrows > 4096)
++	{
++		for (i = 0; i < lp->nrows; i++)
++			EGLPNUM_TYPENAME_EGlpNumOne (dsinfo->norms[i]);
++		goto CLEANUP;
++	}
++
+ 	for (i = 0; i < lp->nrows; i++)
++	{
++		if ((i & 63) == 0 && ILLutil_zeit () - lp->starttime >= lp->maxtime * 0.25)
++		{
++			for (; i < lp->nrows; i++)
++				EGLPNUM_TYPENAME_EGlpNumOne (dsinfo->norms[i]);
++			break;
++		}
++		rval = ILLstring_report (NULL, &lp->O->reporter);
++		CHECKRVALG(rval,CLEANUP);
++		EGLPNUM_TYPENAME_ILLfct_compute_zz (lp, &z, i);
++		EGLPNUM_TYPENAME_EGlpNumInnProd (dsinfo->norms[i], z.coef, z.coef, (size_t) z.nzcnt);
++		if (EGLPNUM_TYPENAME_EGlpNumIsLess (dsinfo->norms[i], EGLPNUM_TYPENAME_PARAM_MIN_DNORM))
++			EGLPNUM_TYPENAME_EGlpNumCopy (dsinfo->norms[i], EGLPNUM_TYPENAME_PARAM_MIN_DNORM);
++	}
++	if (0) for (i = 0; i < lp->nrows; i++)
+ 	{
+ 		rval = ILLstring_report (NULL, &lp->O->reporter);
+ 		CHECKRVALG(rval,CLEANUP);
+--- a/qsopt_ex/qsopt.c
++++ b/qsopt_ex/qsopt.c
+@@ -296,6 +296,8 @@
+ 		p2 = EGLPNUM_TYPENAME_QScopy_prob (p, "scaled_lp");
+ 		if (p2 == 0)
+ 			goto CLEANUP;
++		p2->lp->maxtime = p->lp->maxtime;
++		p2->lp->maxiter = p->lp->maxiter;
+ 
+ 		rval = EGLPNUM_TYPENAME_ILLlp_scale (p2->qslp);
+ 		CHECKRVALG (rval, CLEANUP);
+@@ -303,13 +305,13 @@
+ 		if (primal_or_dual == 0)
+ 		{
+ 			rval = EGLPNUM_TYPENAME_ILLlib_optimize (p2->lp, p2->basis, p2->pricing,
+-															PRIMAL_SIMPLEX, 0, p2->simplex_display, 
++															PRIMAL_SIMPLEX, &rstatus, p2->simplex_display,
+ 															&(p->itcnt));
+ 		}
+ 		else
+ 		{
+ 			rval = EGLPNUM_TYPENAME_ILLlib_optimize (p2->lp, p2->basis, p2->pricing,
+-															DUAL_SIMPLEX, 0, p2->simplex_display,
++															DUAL_SIMPLEX, &rstatus, p2->simplex_display,
+ 															&(p->itcnt));
+ 		}
+ 		CHECKRVALG (rval, CLEANUP);
+@@ -326,6 +328,12 @@
+ 		p2->basis = 0;
+ 		EGLPNUM_TYPENAME_QSfree_prob (p2);
+ 		p2 = 0;
++		if (rstatus == QS_LP_TIME_LIMIT || rstatus == QS_LP_ITER_LIMIT)
++		{
++			if (status)
++				*status = rstatus;
++			goto CLEANUP;
++		}
+ 	}
+ 
+ 	if (primal_or_dual == 0)
+@@ -489,16 +497,36 @@
+ 	rval = check_qsdata_pointer (p);
+ 	CHECKRVALG (rval, CLEANUP);
+ 
++	if (ncand == 0)
++	{
++		if (p->lp->basisid != -1 && p->pricing != 0)
++		{
++			rval = grab_basis (p);
++			CHECKRVALG (rval, CLEANUP);
++		}
++		goto CLEANUP;
++	}
++
+ 	if (p->pricing == 0)
+ 	{
+ 		rval = 1;
+ 		CHECKRVALG (rval, CLEANUP);
+ 	}
+ 
+-	rval = EGLPNUM_TYPENAME_ILLlib_strongbranch (p->lp, p->pricing, candidatelist, ncand,
++	if (ncand < 0 && p->basis != 0 && xlist != 0)
++	{
++		rval = EGLPNUM_TYPENAME_ILLlib_strongbranch_cached (p->lp, p->basis, candidatelist, -ncand,
+ 															xlist, down_vals, up_vals, iterations, objbound,
+ 															&(p->itcnt));
+-	CHECKRVALG (rval, CLEANUP);
++		CHECKRVALG (rval, CLEANUP);
++	}
++	else
++	{
++		rval = EGLPNUM_TYPENAME_ILLlib_strongbranch (p->lp, p->pricing, candidatelist, ncand < 0 ? -ncand : ncand,
++															xlist, down_vals, up_vals, iterations, objbound,
++															&(p->itcnt));
++		CHECKRVALG (rval, CLEANUP);
++	}
+ 
+ 	p->factorok = 0;
+ 	free_cache (p);
+--- a/qsopt_ex/simplex.c
++++ b/qsopt_ex/simplex.c
+@@ -952,6 +952,11 @@
+ #endif
+ 	it.solstatus = ILL_LP_UNSOLVED;
+ 	init_lp_status_info (&(lp->basisstat));
++	if (ILLutil_zeit () - lp->starttime >= lp->maxtime)
++	{
++		it.solstatus = ILL_MAX_TIME;
++		goto TERMINATE;
++	}
+ 
+ 	EGLPNUM_TYPENAME_ILLfct_compute_piz (lp);
+ 	EGLPNUM_TYPENAME_ILLfct_compute_dz (lp);
+@@ -974,7 +979,8 @@
+ 		if (EGLPNUM_TYPENAME_EGlpNumIsLess (lp->objbound, lp->dobjval))
+ 		{
+ 			it.solstatus = ILL_BND_REACHED;
+-			QSlog("solstatus = ILL_BND_REACHED = 5 %lf %lf",
++			if (it.sdisplay)
++				QSlog("solstatus = ILL_BND_REACHED = 5 %lf %lf",
+ 									EGLPNUM_TYPENAME_EGlpNumToLf (lp->objbound),
+ 									EGLPNUM_TYPENAME_EGlpNumToLf (lp->dobjval));
+ 			goto TERMINATE;
+@@ -1345,7 +1351,7 @@
+ 	int phase)
+ {
+ 	EGLPNUM_TYPE print_val;
+-	double tottime = ILLutil_zeit () - lp->starttime;
++	double tottime = ((it->itercnt & 255) == 0) ? (ILLutil_zeit () - lp->starttime) : 0.0;
+ 	int curtime = ILLutil_our_floor (tottime);	/* MONIKA */
+ 	char print_str[20];
+ 	EGLPNUM_TYPENAME_feas_info fi;
+@@ -1429,7 +1435,7 @@
+ 				{
+ 					it->solstatus = ILL_BND_REACHED;
+ 					it->nextstep = SIMPLEX_TERMINATE;
+-					/*if (it->sdisplay) */
++					if (it->sdisplay)
+ 					{
+ 						QSlog("bound reached %lf %lf", EGLPNUM_TYPENAME_EGlpNumToLf (lp->objbound),
+ 										EGLPNUM_TYPENAME_EGlpNumToLf (lp->dobjval));
+--- a/qsopt_ex/sortrus.c
++++ b/qsopt_ex/sortrus.c
+@@ -118,36 +118,70 @@
+ 	EGLPNUM_TYPE * len,
+ 	int n)
+ {
+-	int i, j, temp;
++	int i, j, lt, gt, mid, temp;
+ 	EGLPNUM_TYPE t;
+ 
+ 	if (n <= 1)
+ 		return;
+ 
+ 	EGLPNUM_TYPENAME_EGlpNumInitVar (t);
+-	ILL_SWAP (perm[0], perm[(n - 1) / 2], temp);
++	while (n > 16)
++	{
++		mid = (n - 1) / 2;
++		if (EGLPNUM_TYPENAME_EGlpNumIsLess (len[perm[mid]], len[perm[0]]))
++			ILL_SWAP (perm[0], perm[mid], temp);
++		if (EGLPNUM_TYPENAME_EGlpNumIsLess (len[perm[n - 1]], len[perm[0]]))
++			ILL_SWAP (perm[0], perm[n - 1], temp);
++		if (EGLPNUM_TYPENAME_EGlpNumIsLess (len[perm[n - 1]], len[perm[mid]]))
++			ILL_SWAP (perm[mid], perm[n - 1], temp);
++		ILL_SWAP (perm[0], perm[mid], temp);
++		EGLPNUM_TYPENAME_EGlpNumCopy (t, len[perm[0]]);
+ 
+-	i = 0;
+-	j = n;
+-	EGLPNUM_TYPENAME_EGlpNumCopy (t, len[perm[0]]);
+-
+-	for (;;)
++		lt = 0;
++		i = 1;
++		gt = n - 1;
++		while (i <= gt)
++		{
++			if (EGLPNUM_TYPENAME_EGlpNumIsLess (len[perm[i]], t))
++			{
++				ILL_SWAP (perm[lt], perm[i], temp);
++				lt++;
++				i++;
++			}
++			else if (EGLPNUM_TYPENAME_EGlpNumIsLess (t, len[perm[i]]))
++			{
++				ILL_SWAP (perm[i], perm[gt], temp);
++				gt--;
++			}
++			else
++			{
++				i++;
++			}
++		}
++		if (lt < n - 1 - gt)
++		{
++			EGLPNUM_TYPENAME_ILLutil_EGlpNum_perm_quicksort (perm, len, lt);
++			perm += gt + 1;
++			n -= gt + 1;
++		}
++		else
++		{
++			EGLPNUM_TYPENAME_ILLutil_EGlpNum_perm_quicksort (perm + gt + 1, len, n - 1 - gt);
++			n = lt;
++		}
++	}
++	for (i = 1; i < n; i++)
+ 	{
+-		do
+-			i++;
+-		while (i < n && EGLPNUM_TYPENAME_EGlpNumIsLess (len[perm[i]], t));
+-		do
++		temp = perm[i];
++		j = i;
++		while (j > 0 && EGLPNUM_TYPENAME_EGlpNumIsLess (len[temp], len[perm[j - 1]]))
++		{
++			perm[j] = perm[j - 1];
+ 			j--;
+-		while (EGLPNUM_TYPENAME_EGlpNumIsLess (t, len[perm[j]]));
+-		if (j < i)
+-			break;
+-		ILL_SWAP (perm[i], perm[j], temp);
++		}
++		perm[j] = temp;
+ 	}
+-	ILL_SWAP (perm[0], perm[j], temp);
+-
+ 	EGLPNUM_TYPENAME_EGlpNumClearVar (t);
+-	EGLPNUM_TYPENAME_ILLutil_EGlpNum_perm_quicksort (perm, len, j);
+-	EGLPNUM_TYPENAME_ILLutil_EGlpNum_perm_quicksort (perm + i, len, n - i);
+ }
+ 
+ /**********  Median - Select Routines **********/
+--- a/qsopt_ex/trace.h
++++ b/qsopt_ex/trace.h
+@@ -34,7 +34,7 @@
+ #else
+ /* the optimizer will take care of this */
+ #define ILL_IFTRACE        if (0) QSlog
+-#define ILL_IFTRACE        if (0) QSlog
++#define ILL_IFTRACE2        if (0) QSlog
+ #define ILL_IFDOTRACE      if (0)
+ #endif
+ 
+--- a/qsopt_ex/zeit.c
++++ b/qsopt_ex/zeit.c
+@@ -89,6 +89,9 @@
+ /*                                                                          */
+ /****************************************************************************/
+ 
++#ifdef HAVE_CONFIG_H
++#include "config.h"
++#endif
+ #include <stdlib.h>
+ #include <stdio.h>
+ #include <string.h>

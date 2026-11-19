@@ -11,7 +11,7 @@ import tarfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_LOCK = ROOT / 'config/scip-integer-v4.lock.json'
+DEFAULT_LOCK = ROOT / 'config/scip-integer-v5.lock.json'
 
 
 def sha(path):
@@ -134,7 +134,7 @@ def main():
     for source, spec in [(scip,scip_spec), (qs,qs_spec)]:
         shutil.copy2(source/spec['license_file'], out/(spec['name']+'-LICENSE'))
     cache = out/'lab-cache.cmake'
-    cache.write_text('\n'.join(f'set({k} [=[{val}]=] CACHE {kind} "")'
+    cache.write_text('\n'.join(f'set({k} [=[{val}]=] CACHE {kind} "" FORCE)'
         for k,val,kind in [('LAB_SCIP_INTEGER','ON','BOOL'),('SCIP_INCLUDE_DIR',scip/'src','PATH'),
                            ('SCIP_CONFIG_INCLUDE_DIR',build,'PATH'),('SCIP_C17_LIBRARY',sciplib,'FILEPATH'),
                            ('QSOPT_C17_LIBRARY',qslib,'FILEPATH')])+'\n')

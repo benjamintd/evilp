@@ -1,5 +1,6 @@
 #include "scip_mip.h"
 #include "scip_feasjump.h"
+#include "scip_presol_parallel.h"
 #include "common.h"
 #include "exact.h"
 #include "scip/scip.h"
@@ -106,6 +107,7 @@ int lab_scip_mip(const LabModel *m, const double *lower, const double *upper,
     SCIPsetMessagehdlrQuiet(s, TRUE);
     if (SCIPincludeDefaultPlugins(s) != SCIP_OKAY ||
         lab_scip_include_feasjump(s) != SCIP_OKAY ||
+        lab_scip_include_presol_parallel(s) != SCIP_OKAY ||
         SCIPcreateProbBasic(s, "milp_lab") != SCIP_OKAY ||
         SCIPsetIntParam(s, "timing/clocktype", 2) != SCIP_OKAY ||
         SCIPsetIntParam(s, "parallel/maxnthreads", 1) != SCIP_OKAY ||

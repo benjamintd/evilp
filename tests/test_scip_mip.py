@@ -167,6 +167,39 @@ class ScipGeneralMip(unittest.TestCase):
                     planted_obj = sum(ci * xi for ci, xi in zip(costs, x_star))
                     self.assertLessEqual(F(c['objective']), F(planted_obj))
 
+    def test_parallel_row_presolver_merge_and_infeasibility(self):
+        # Mixed-integer model with scalar-multiple parallel rows (positive and negative ratios):
+        # Exercises scip_presol_parallel.c both for feasible merging and infeasible cutoff.
+        n = 36
+        costs = [1 + (j % 5) for j in range(n)]
+        bounds = [(0, 1)] * 24 + [(0, 4)] * 12
+        integer = [True] * 24 + [False] * 12
+        base_row = [2 if j % 3 == 0 else (-1 if j % 3 == 1 else 3) for j in range(n)]
+        # Feasible parallel pair: base_row >= 10, 3*base_row <= 36 (i.e. base_row <= 12), -2*base_row <= -22 (i.e. base_row >= 11)
+        rows_feas = [
+            (base_row, 10, None),
+            ([3 * a for a in base_row], None, 36),
+            ([-2 * a for a in base_row], None, -22),
+            ([1] * 24 + [0] * 12, 4, 16),
+        ]
+        m_feas = dict(cost=costs, bounds=bounds, integer=integer, rows=rows_feas, offset=0, maximize=False)
+        with tempfile.TemporaryDirectory() as tmp:
+            v, model, sol = self.run_model(Path(tmp), integer_mps(m_feas))
+            self.assertEqual(v['status'], 'optimal', v)
+            chk = subprocess.run([CHECKER, '--model', model, '--solution', sol],
+                                 capture_output=True, text=True, timeout=15)
+            self.assertEqual(chk.returncode, 0, (chk.stdout, chk.stderr))
+            self.assertTrue(json.loads(chk.stdout)['checked_feasible'])
+        # Infeasible parallel pair: base_row >= 15 and -2*base_row >= -24 (i.e. base_row <= 12)
+        rows_inf = [
+            (base_row, 15, None),
+            ([-2 * a for a in base_row], -24, None),
+        ]
+        m_inf = dict(cost=costs, bounds=bounds, integer=integer, rows=rows_inf, offset=0, maximize=False)
+        with tempfile.TemporaryDirectory() as tmp:
+            v, _, _ = self.run_model(Path(tmp), integer_mps(m_inf))
+            self.assertEqual(v['status'], 'infeasible', v)
+
 
 if __name__ == '__main__':
     unittest.main()

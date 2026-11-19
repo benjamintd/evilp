@@ -60,6 +60,7 @@ typedef struct {
     FILE *trace;
 #ifdef LAB_LP_SESSION_API
     LabLpSession *session;
+    int session_initialized;
 #endif
 } Search;
 
@@ -333,6 +334,10 @@ static int call_lp(Search *s, const double *lower, const double *upper, LabLpRes
     opt.basis_in = opt.basis_out = NULL;
     s->result->lp_solves++;
 #ifdef LAB_LP_SESSION_API
+    if (!s->session_initialized && (!s->options->cold || !s->options->no_root_cuts)) {
+        s->session_initialized = 1;
+        s->session = lab_lp_session_create(&s->lp_model, &opt);
+    }
     int warm = s->session != NULL;
     if (warm) {
         for (size_t j = 0; j < s->model->cols; j++)
@@ -1018,14 +1023,6 @@ void lab_bb_solve(const LabModel *model, const LabBbOptions *options, LabBbResul
     s.constant = source_constant;
     if (!options->first_fractional)
         (void)lab_search_init(&s.branching, n); /* allocation failure keeps deterministic fallback */
-#ifdef LAB_LP_SESSION_API
-    if (!options->cold || !options->no_root_cuts) {
-        LabLpOptions opt = options->lp;
-        opt.basis_in = opt.basis_out = NULL;
-        opt.time_limit = fmin(opt.time_limit, remaining(&s));
-        s.session = lab_lp_session_create(&s.lp_model, &opt);
-    }
-#endif
     push(&s, new_node(&s, NULL, SIZE_MAX, 0, 0, 0, 0));
     while (s.plunge || s.heap_size) {
         if (remaining(&s) <= 0) {
