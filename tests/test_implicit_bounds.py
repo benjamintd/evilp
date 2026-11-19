@@ -10,6 +10,16 @@ solver,checker,driver=(p.resolve() for p in [args.solver,args.checker,args.drive
 base={'cost':[3,2],'bounds':[(0,5),(0,5)],'rows':[([2,1],None,7)],'maximize':True}
 both=[[(0,5),(0,5)],[(2,5),(0,5)],[(2,2),(0,5)],[(0,5),(0,5)],[(0,5),(0,2)],[(0,5),(0,5)]]
 cases=[('both',base,both,True),('large',base,both,True)]
+packing={'cost':[3,2],'bounds':[(0,1),(0,1)],'rows':[([1,1],None,1)],'maximize':True}
+packing_steps=[[(0,1),(0,1)],[(0,F(1,2)),(0,1)],[(0,1),(0,1)],[(0,1),(1,1)],[(0,1),(0,1)]]
+cases.append(('packing',packing,packing_steps,False))
+for name,coefficient,rhs,lower in [('almost_one',F('0.99999999999999999'),1,0),
+                                    ('large_rhs',1,F('1.00000000000000001'),0),
+                                    ('negative',1,1,-1)]:
+    model=copy.deepcopy(packing)
+    model['rows']=[([1,coefficient],None,rhs)]
+    model['bounds'][1]=(lower,1)
+    cases.append((name,model,[model['bounds']],False))
 upper={'cost':[3,2],'bounds':[(None,5),(0,5)],'rows':[([-1,1],None,3),([1,1],None,7)],'maximize':True}
 cases.append(('upper',upper,[[(None,u),(0,5)] for u in [5,3,5,1,5]],True))
 lower=copy.deepcopy(base);lower['bounds'][0]=(0,None)
@@ -49,6 +59,7 @@ def verify(root,name,model,steps,keep,dense,noscale,forget=False,strict=False):
         if step==0:
             wanted=0 if keep else 1 if name=='uncertain' or forget else 2
             assert record['implicit']==wanted,(name,record,wanted)
+            assert record['packing']==(2 if name=='packing' and not keep else 0),(name,record)
     return len(records)
 
 count=0
@@ -61,6 +72,20 @@ with tempfile.TemporaryDirectory(prefix='implicit-bound-contract-') as temporary
         if name in ['both','large']:
             for dense in [0,1]:count+=verify(root/f'{name}-unscaled-d{dense}',name,model,steps,0,dense,1,strict=strict)
     for dense in [0,1]:count+=verify(root/f'unknown-d{dense}','unknown',base,[both[0]],0,dense,0,forget=True)
+    for label, delta, rows in [('same',0,1),('distinct',F('0.000000000000000001'),2)]:
+        model={'cost':[0,1], 'bounds':[(0,1),(0,1)],
+               'rows':[([1,1],1,1),([1,1+delta],1,1)]}
+        source=root/f'duplicate-{label}.mps'
+        source.write_text(mps(model))
+        sol=root/f'duplicate-{label}.sol'
+        command=[str(solver),str(source),'--relax','--packing-bounds','--solution',str(sol)]
+        solved=subprocess.run(command,capture_output=True,text=True,timeout=10)
+        data=json.loads(solved.stdout)
+        assert data['standard_rows']==rows,(label,data)
+        assert solved.returncode==0 and data['status']=='optimal' and data['objective']==0,(label,data)
+        checked=subprocess.run([str(checker),'--model',str(source),'--solution',str(sol),'--relax'],
+                               capture_output=True,text=True,timeout=10)
+        assert checked.returncode==0 and json.loads(checked.stdout)['checked_feasible']
     # The compact and explicit forms represent the same original LP, including
     # decimal bounds whose binary representatives are insufficient evidence.
     for name,model,steps,_ in cases:

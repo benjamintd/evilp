@@ -120,7 +120,44 @@ static void final_validated_event(void) {
     CHECK(lab_pricing_record_step(NULL, 0, 0) == -1);
     CHECK(lab_pricing_finish(NULL, &pending, 0, 0, NULL, NULL, 0, &events) == -1);
 }
+static void adaptive_guards(void) {
+    LabPricing state;
+    lab_pricing_begin_adaptive(&state, 0);
+    size_t basis[] = {1, 2, 3};
+    CHECK(lab_pricing_watch_basis(&state, 3, basis) == 0);
+    CHECK(lab_pricing_record_step(&state, 0, 1e-8) == LAB_PRICING_ZERO);
+    CHECK(!state.bland_active && state.zero_steps == 1);
+    basis[1] = 4;
+    CHECK(lab_pricing_watch_basis(&state, 3, basis) == 0);
+    basis[1] = 2;
+    CHECK(lab_pricing_watch_basis(&state, 3, basis) == 1);
+    CHECK(state.bland_active && state.fallback_transitions == 1);
+    CHECK(lab_pricing_watch_basis(&state, 3, basis) == 0);
+    lab_pricing_begin_adaptive(&state, 0);
+    for (size_t i = 0; i < 511; i++)
+        CHECK(lab_pricing_record_step(&state, 0, 1e-8) == LAB_PRICING_ZERO);
+    CHECK(!state.bland_active);
+    CHECK(lab_pricing_record_step(&state, 1, 1e-8) == 0);
+    CHECK(state.consecutive_short == 0);
+    for (size_t i = 0; i < 512; i++) {
+        int events = lab_pricing_record_step(&state, 1e-10, 1e-8);
+        CHECK(((events & LAB_PRICING_FALLBACK) != 0) == (i == 511));
+    }
+    CHECK(state.bland_active);
+    lab_pricing_begin_adaptive(&state, 1);
+    CHECK(state.bland_requested && state.bland_active && !state.history_count);
+    lab_pricing_begin_adaptive(&state, 0);
+    for (size_t i = 0; i < 130; i++) {
+        basis[0] = i;
+        CHECK(lab_pricing_watch_basis(&state, 3, basis) == 0);
+    }
+    CHECK(state.history_count == 64 && !state.bland_active);
+    CHECK(lab_pricing_watch_basis(&state, 3, basis) == 1);
+    CHECK(lab_pricing_watch_basis(NULL, 0, NULL) == -1);
+    CHECK(lab_pricing_watch_basis(&state, 1, NULL) == -1);
+}
 int main(void) {
+    adaptive_guards();
     ranking();
     accepted_steps();
     final_validated_event();

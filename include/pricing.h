@@ -1,6 +1,7 @@
 #ifndef LAB_PRICING_H
 #define LAB_PRICING_H
 #include <stddef.h>
+#include <stdint.h>
 
 #define LAB_PRICING_SHORT_STREAK 8
 
@@ -8,6 +9,9 @@
  * optimality, unboundedness, pruning, or whether a pivot is numerically safe. */
 typedef struct {
     int bland_requested, bland_active;
+    int adaptive;
+    uint64_t history[64];
+    size_t history_count, history_next;
     unsigned consecutive_short;
     size_t accepted_pivots, zero_steps, short_steps, fallback_transitions;
 } LabPricing;
@@ -27,6 +31,11 @@ enum {
 
 /* Begin each primal simplex phase afresh, including forced Bland mode. */
 void lab_pricing_begin(LabPricing *state, int bland_requested);
+/* Adaptive mode tolerates degeneracy until a repeated basis or 512
+ * consecutive nonprogress steps. Fingerprint collisions only select the
+ * conservative rule; fingerprints never establish a mathematical claim. */
+void lab_pricing_begin_adaptive(LabPricing *state, int bland_requested);
+int lab_pricing_watch_basis(LabPricing *state, size_t n, const size_t *basis);
 void lab_pricing_scan_begin(LabPricingChoice *choice);
 /* Caller supplies EXISTING eligibility after all unchanged finite/tolerance
  * checks. Entire pricing scan must still run. Return 1 changed best, 0 unchanged,

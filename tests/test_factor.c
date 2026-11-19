@@ -300,9 +300,42 @@ static int large_singleton_core_case(void) {
     free(start); free(row); free(value); free(truth); free(b); free(bt); free(x);
     return 0;
 }
+static int indexed_core_cases(void) {
+    enum { N = 137 };
+    double *a = calloc(N * N, sizeof *a);
+    CHECK(a);
+    /* Permute both axes of a diagonally dominant cyclic band. All vertices
+     * have degree at least two, and coalesced duplicates must preserve rank. */
+    for (size_t i = 0; i < N; i++) {
+        size_t r = (i * 37) % N;
+        a[r * N + (i * 29) % N] = 4;
+        a[r * N + ((i + 1) * 29) % N] = -1;
+        a[r * N + ((i + N - 1) * 29) % N] = 1;
+    }
+    CHECK(matrix_case(a, N, 1) == 0);
+    free(a);
+
+    /* Equal-magnitude pivot candidates cancel the other row of the block
+     * exactly, leaving it without an active entry partway through the LU. */
+    size_t start[129], row[256];
+    double v[256];
+    for (size_t j = 0; j < 128; j++) {
+        start[j] = 2 * j;
+        row[2 * j] = j & ~(size_t)1;
+        row[2 * j + 1] = row[2 * j] + 1;
+        v[2 * j] = 1;
+        v[2 * j + 1] = j == 35 ? 1 : (j % 2 ? -1 : 1);
+    }
+    start[128] = 256;
+    LabFactor f = {0};
+    CHECK(lab_factorize_sparse(&f, 128, start, row, v) != 0 && !f.valid);
+    lab_factor_free(&f);
+    return 0;
+}
 int main(void) {
-    if (randomized_permuted_cases() || cancellation_and_pivot_cases() || fill_case() ||
-        invalid_and_singular_cases() || large_banded_case() || large_singleton_core_case())
+    if (indexed_core_cases() || randomized_permuted_cases() || cancellation_and_pivot_cases() ||
+        fill_case() || invalid_and_singular_cases() || large_banded_case() ||
+        large_singleton_core_case())
         return 1;
     puts("Sparse/dense LU contracts passed: 200 random permuted matrices, transpose/in-place "
          "solves, "

@@ -1,5 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 #include "model.h"
+#include "augment.h"
 #include "exact.h"
 #include <fenv.h>
 #include <float.h>
@@ -350,6 +351,42 @@ static void source_envelopes(void) {
     encloses(m.envelope->value[0], "1", "lost nonzero source coefficient retained");
     lab_model_free(&m);
 }
+static void sparse_single_record_decimals(void) {
+    /* A long, unrelated bound disables the complete snapshots. Three
+     * different source values round to the same binary coefficient. */
+    const char *prefix = "NAME EXCEPTIONS\nROWS\n N O\n L A\n L B\nCOLUMNS\n"
+        " x A 1.1 B 1.10000000000000001\n y A 1.10000000000000002\n"
+        " z B .1\n z B .2\nRHS\n r A 100 B 100\nBOUNDS\n UP b z 2.";
+    char model[2048];
+    size_t n = strlen(prefix);
+    memcpy(model, prefix, n);
+    memset(model + n, '0', 1100);
+    strcpy(model + n + 1100, "\nENDATA\n");
+    LabModel original = {0}, copy = {0};
+    read_text(&original, model, 1);
+    require(!original.exact && !original.native_exact &&
+            original.envelope->exception_count == 3, "three bounded singleton tokens");
+    double coefficients[] = {1, 0, 0};
+    LabAddedRow added = {"extra", coefficients, 0, 1};
+    LabAugmentLimits limits = {3, 5, 1};
+    require(lab_model_append_rows(&original, 1, &added, &limits, &copy) == LAB_AUGMENT_OK,
+            "append row between sparse tokens");
+    lab_model_free(&original);
+    mpq_t q, wanted;
+    mpq_inits(q, wanted, NULL);
+    const char *expected[] = {"1.1", "1.10000000000000001", "1", "1.10000000000000002"};
+    for (size_t k = 0; k < 4; ++k)
+        require(!lab_exact_decimal(wanted, expected[k]) &&
+                !lab_source_exact_coefficient(&copy, k, q) && !mpq_cmp(wanted, q),
+                "owned remapped original token or exact added coefficient");
+    require(lab_source_exact_coefficient(&copy, 4, q) && !mpq_cmp(wanted, q),
+            "duplicate group cannot inherit a constituent token");
+    copy.value[3] = 2;
+    require(lab_source_exact_coefficient(&copy, 3, q) && !mpq_cmp(wanted, q),
+            "changed rounded value cannot reuse the source token");
+    mpq_clears(q, wanted, NULL);
+    lab_model_free(&copy);
+}
 int main(void) {
     decimal_parser();
     source_arithmetic();
@@ -360,6 +397,7 @@ int main(void) {
     compensated_binary_evaluation();
     original_objective_coalescing();
     source_envelopes();
+    sparse_single_record_decimals();
     puts("Original-decimal provenance, exact arithmetic, topology and resource contracts passed.");
     return 0;
 }

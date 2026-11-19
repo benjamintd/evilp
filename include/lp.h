@@ -12,15 +12,23 @@ typedef struct {
     int no_primal_repair;
     int no_updates;
     int bland_pricing;
+    int crash_basis; /* guarded singleton structural starting columns */
+    int fast_residual;
+    int adaptive_pricing; /* delayed fallback with repeated-basis/stall guard */
+    int glpk_basis; /* optional starting basis; requires LAB_GLPK_BASIS */
+    int verify_glpk_point; /* standalone solves may verify a proposal before lifting its basis */
+    int packing_bounds;
     int keep_bound_rows; /* retain explicit rows for transformed implicit bounds */
 } LabLpOptions;
 typedef struct {
     const char *status;
     char message[256];
     double *primal, *dual;
+    char **dual_rational; /* exact source closure, when available */
+    size_t dual_rows;
     double objective, primal_residual, dual_residual, elapsed;
     size_t iterations, refactorizations, standard_rows, standard_columns, redundant_rows;
-    size_t implicit_bound_rows;
+    size_t implicit_bound_rows, packing_bound_rows;
     int has_primal;
     int warm_start;
     size_t dual_iterations, cold_fallbacks, factor_nnz_peak, standard_nnz;
@@ -40,6 +48,8 @@ typedef struct {
     size_t primal_repairs, primal_repair_iterations;
     size_t exact_primal_attempts, exact_primal_recoveries;
     int primal_repair_required;
+    size_t glpk_basis_iterations, glpk_bases_accepted;
+    const char *glpk_basis_status;
     size_t basis_updates, basis_update_rejections;
     size_t factor_core_peak, singleton_eliminations_peak;
     size_t primal_accepted_pivots, primal_zero_steps, primal_short_steps, pricing_bland_fallbacks;

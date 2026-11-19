@@ -23,5 +23,5 @@ if __name__=='__main__':
   assert validation['certifies_cut_validity'] and not validation['certifies_original_lp_infeasibility'] and not validation['certifies_original_mip_infeasibility'] and not validation['certifies_full_tree']
   checked([args.zero.resolve(),source])
   limits=json.loads(checked([sys.executable,here/'native_reader_limits.py',args.reader.resolve(),root/'limits']))
-  assert limits['passed'] and limits['controls']==10
- print(json.dumps({'passed':True,'large_source_proofs':27,'owned_model_proofs':1,'source_limit_controls':10,'source_zero_support_scales':2,'global_exact_primal_attempts_on_native_only':0}))
+  assert limits['passed'] and limits['controls']==12
+ print(json.dumps({'passed':True,'large_source_proofs':27,'owned_model_proofs':1,'source_limit_controls':12,'source_zero_support_scales':2,'global_exact_primal_attempts_on_native_only':0}))

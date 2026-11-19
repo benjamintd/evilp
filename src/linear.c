@@ -290,8 +290,77 @@ static void magnitude_add(double *scale, double *sum, double value) {
         *sum += value / *scale;
     }
 }
+/* A sufficient, conservative backward-error bound using FMA accumulation.
+ * Let k be the number of products in a component and u=DBL_EPSILON/2.
+ * Positive rounded-product accumulation M bounds the exact denominator D:
+ * |M-D| <= delta*D, delta=(k+4)*2u. FMA residual error is <= gamma_k*D
+ * plus subnormal absolute error. k<=8,000,000 implies gamma_k<=(k+1)u.
+ * Four epsilons cover final arithmetic/subnormal absolute errors (D>=1).
+ * A separate 4*k*u denominator allowance covers the retained scaled
+ * magnitude calculation, including its divisions and renormalization.
+ * Only a bound <=1e-14 bypasses the full compensated residual. It is never
+ * used as a correction RHS: at that bound refinement is already finished.
+ * Nonfinite, product underflow/subnormal, or uncertain cases use the old path. */
+static int fast_residual_bound(const LabLinear *s, const double *rhs, const double *x,
+                               double *r, int transpose, double *error) {
+    size_t n = s->n;
+    if (n > LAB_LINEAR_DIMENSION_LIMIT || fegetround() != FE_TONEAREST)
+        return 0;
+    double *magnitude = lab_alloc(n, sizeof(double));
+    size_t *count = lab_alloc(n, sizeof(size_t));
+    int usable = 1;
+    for (size_t i = 0; i < n; i++) {
+        r[i] = rhs[i];
+        magnitude[i] = 1 + fabs(rhs[i]);
+        if (!isfinite(rhs[i]) || !isfinite(x[i]) || !isfinite(magnitude[i]))
+            usable = 0;
+    }
+    for (size_t j = 0; j < n && usable; j++) {
+        size_t entries;
+        const size_t *row;
+        const double *value;
+        current_column(s, j, &entries, &row, &value);
+        for (size_t k = 0; k < entries; k++) {
+            size_t i = row[k], at = transpose ? j : i;
+            double a = value[k], b = x[transpose ? i : j], product = a * b;
+            if (!isfinite(product) || (product != 0 && fabs(product) < DBL_MIN) ||
+                (a != 0 && b != 0 && product == 0)) {
+                usable = 0;
+                break;
+            }
+            r[at] = fma(-a, b, r[at]);
+            magnitude[at] += fabs(product);
+            count[at]++;
+        }
+    }
+    double worst = 0;
+    for (size_t i = 0; i < n && usable; i++) {
+        if (!isfinite(r[i]) || !isfinite(magnitude[i]) || count[i] > LAB_LINEAR_DIMENSION_LIMIT) {
+            usable = 0;
+            break;
+        }
+        double delta = ((double)count[i] + 4) * DBL_EPSILON;
+        double gamma = ((double)count[i] + 1) * (DBL_EPSILON / 2);
+        double denominator_delta = (2 * (double)count[i] + 8) * DBL_EPSILON;
+        double upper = nextafter((fabs(r[i]) / magnitude[i] * (1 + delta) + gamma +
+                                  4 * DBL_EPSILON) / (1 - denominator_delta), INFINITY);
+        if (!isfinite(upper) || upper > 1e-14) {
+            usable = 0;
+            break;
+        }
+        worst = fmax(worst, upper);
+    }
+    free(magnitude);
+    free(count);
+    if (usable)
+        *error = worst;
+    return usable;
+}
+
 static int residual(const LabLinear *s, const double *rhs, const double *x, double *r,
                     int transpose, double *error) {
+    if (s->fast_residual && fast_residual_bound(s, rhs, x, r, transpose, error))
+        return 0;
     size_t n = s->n;
     double *lo = lab_alloc(n, sizeof(double));
     double *scale = lab_alloc(n, sizeof(double));
@@ -337,6 +406,8 @@ static int residual(const LabLinear *s, const double *rhs, const double *x, doub
 }
 static int base_solve(LabLinear *s, const double *rhs, double *x, int transpose) {
     size_t n = s->n;
+    if (!s->scaling_changed)
+        return lab_factor_solve(&s->factor, rhs, x, transpose);
     double *scaled_rhs = lab_alloc(n, sizeof(double));
     double *y = lab_alloc(n, sizeof(double));
     int bad = 0;
@@ -421,6 +492,12 @@ static int eta_solve(const LabLinear *s, size_t update, double *x, int transpose
     double pivot_value = numerator / eta->pivot;
     if (!isfinite(pivot_value) || (numerator != 0 && pivot_value == 0))
         return -1;
+    /* A zero step leaves every off-diagonal component unchanged. Stored
+     * coefficients and input components have already passed finite checks. */
+    if (!transpose && pivot_value == 0) {
+        x[p] = pivot_value;
+        return 0;
+    }
     if (!transpose && eta->sparse) {
         for (size_t k = 0; k < eta->count; k++) {
             size_t i = eta->row_index[k];
@@ -473,20 +550,16 @@ int lab_linear_solve(LabLinear *s, const double *rhs, double *x, int transpose) 
     if (!s->valid || (s->n && (!rhs || !x)))
         return failure(s, "Invalid linear solve state or vectors");
     size_t n = s->n;
-    double *original_rhs = lab_alloc(n, sizeof(double));
     double *best = lab_alloc(n, sizeof(double));
     double *r = lab_alloc(n, sizeof(double));
-    double *correction = lab_alloc(n, sizeof(double));
-    double *candidate = lab_alloc(n, sizeof(double));
-    if (n)
-        memcpy(original_rhs, rhs, n * sizeof(double));
+    double *correction = NULL, *candidate = NULL;
     int failed = 0;
     for (size_t i = 0; i < n; i++)
-        if (!isfinite(original_rhs[i]))
+        if (!isfinite(rhs[i]))
             failed = 1;
     double best_error = INFINITY;
-    if (failed || raw_solve(s, original_rhs, best, transpose) ||
-        residual(s, original_rhs, best, r, transpose, &best_error)) {
+    if (failed || raw_solve(s, rhs, best, transpose) ||
+        residual(s, rhs, best, r, transpose, &best_error)) {
         failure(s, "Initial original-unit basis solve failed");
         failed = 1;
         goto done;
@@ -494,6 +567,10 @@ int lab_linear_solve(LabLinear *s, const double *rhs, double *x, int transpose) 
     s->initial_backward_error = best_error;
     for (int step = 0; s->refinement_enabled && step < REFINEMENT_LIMIT && best_error > 1e-14;
          step++) {
+        if (!correction) {
+            correction = lab_alloc(n, sizeof(double));
+            candidate = lab_alloc(n, sizeof(double));
+        }
         if (raw_solve(s, r, correction, transpose))
             break;
         int changed = 0, finite = 1;
@@ -506,7 +583,7 @@ int lab_linear_solve(LabLinear *s, const double *rhs, double *x, int transpose) 
             break;
         s->refinement_steps++;
         double next_error;
-        if (residual(s, original_rhs, candidate, r, transpose, &next_error) ||
+        if (residual(s, rhs, candidate, r, transpose, &next_error) ||
             next_error >= best_error)
             break;
         if (n)
@@ -521,7 +598,6 @@ int lab_linear_solve(LabLinear *s, const double *rhs, double *x, int transpose) 
         failed = 1;
     }
 done:
-    free(original_rhs);
     free(best);
     free(r);
     free(correction);

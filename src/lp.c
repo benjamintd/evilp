@@ -6,6 +6,7 @@
 #include "native_tableau.h"
 #include "pivot.h"
 #include "pricing.h"
+#include "dependency.h"
 #include "rational.h"
 #include <float.h>
 #include <math.h>
@@ -35,7 +36,8 @@ typedef struct {
     size_t *lower_row, *upper_row;
     unsigned char *transform;
     unsigned char *implicit_side; /* zero: explicit;1: shifted lower;2: reflected upper */
-    size_t implicit_bound_rows;
+    unsigned char *packing_upper, *duplicate_partition;
+    size_t implicit_bound_rows, packing_bound_rows;
     LabLinear linear;
     double *xb, *pi, *cb, *direction, *column;
     size_t scaled_rows, scaled_columns;
@@ -45,6 +47,10 @@ typedef struct {
     double started;
     size_t source_negative_position, source_negative_column;
     int source_negative_active;
+    int standalone;
+    size_t row_rows;
+    size_t *row_start, *row_col;
+    double *row_val;
 } Work;
 static int factor_basis(Work *w);
 static void clear_source_negative(Work *w) {
@@ -190,6 +196,7 @@ static int factor_basis(Work *w) {
         free(row);
         free(value);
     }
+    w->linear.fast_residual = w->options->fast_residual;
     if (w->linear.factor.peak_nnz > w->result->factor_nnz_peak)
         w->result->factor_nnz_peak = w->linear.factor.peak_nnz;
     if (w->linear.factor.core_dimension > w->result->factor_core_peak)
@@ -701,6 +708,12 @@ static int record_pricing_result(Work *w, LabPricing *pricing, LabPricingPending
         w->result->primal_zero_steps += (events & LAB_PRICING_ZERO) != 0;
         w->result->primal_short_steps += (events & LAB_PRICING_SHORT) != 0;
         w->result->pricing_bland_fallbacks += (events & LAB_PRICING_FALLBACK) != 0;
+        int cycle = lab_pricing_watch_basis(pricing, w->m, w->basis);
+        if (cycle < 0) {
+            message(w, "numerical_failure", "Invalid primal cycle guard state");
+            return -1;
+        }
+        w->result->pricing_bland_fallbacks += (size_t)cycle;
     }
     return 0;
 }
@@ -714,7 +727,12 @@ static int simplex(Work *w, int phase_one) {
     size_t rejected[MAX_REJECTED_CANDIDATES], rejected_count = 0;
     LabPricing pricing;
     LabPricingPending pending = {0};
-    lab_pricing_begin(&pricing, w->options->bland_pricing);
+    if (w->options->adaptive_pricing)
+        lab_pricing_begin_adaptive(&pricing, w->options->bland_pricing);
+    else
+        lab_pricing_begin(&pricing, w->options->bland_pricing);
+    if (lab_pricing_watch_basis(&pricing, w->m, w->basis) < 0)
+        return -1;
     int factor_ready = 0;
     int source_risk = -1;
     size_t source_pivots = 0;
@@ -856,10 +874,10 @@ static int simplex(Work *w, int phase_one) {
             }
             return 1;
         }
-        size_t alternative = SIZE_MAX;
-        if (!w->options->bland_ratio &&
-            lab_primal_ratio_scaled(w->m, w->xb, w->direction, w->basis, w->cb, 0, &alternative))
-            alternative = SIZE_MAX;
+        /* The trial overwrites xb. Reuse the now-disposable entering column
+         * to preserve the original ratio inputs for the rare rejected pivot. */
+        if (!w->options->bland_ratio)
+            memcpy(w->column, w->xb, w->m * sizeof(double));
         size_t old_column = w->basis[leaving];
         size_t accepted_position = leaving;
         const char *prior_status = w->result->status;
@@ -886,6 +904,10 @@ static int simplex(Work *w, int phase_one) {
                 memcpy(w->result->message, failed_message, sizeof failed_message);
                 if (budget(w))
                     return -1;
+                size_t alternative;
+                if (lab_primal_ratio_scaled(w->m, w->column, w->direction, w->basis, w->cb,
+                                            0, &alternative))
+                    alternative = SIZE_MAX;
                 if (alternative == SIZE_MAX || alternative == leaving) {
                     if (rejected_count == MAX_REJECTED_CANDIDATES)
                         return -1;
@@ -988,6 +1010,52 @@ static void remove_row(Work *w, size_t row, size_t basis_position) {
     w->m--;
     w->result->redundant_rows++;
 }
+/* Floating multipliers suggest a dependence; only original-source exact
+ * verification can authorize deletion. Restricted to equality-only support. */
+static int prove_redundant_equality(Work *w, size_t position) {
+    size_t removed = w->art_row[w->basis[position]];
+    if (w->options->no_exact || removed >= w->m || w->source_row[removed] == SIZE_MAX)
+        return 0;
+    double *y = lab_alloc(w->model->rows, sizeof(double));
+    const int exponents[] = {0, 4, 12, 20, 28};
+    double deadline = fmin(w->started + w->options->time_limit, lab_now() + .1);
+    int proved = 0;
+    for (size_t t = 0; t < sizeof exponents / sizeof exponents[0] && !proved; t++) {
+        memset(y, 0, w->model->rows * sizeof(double));
+        int usable = 1, nonzero_removed = 0;
+        for (size_t i = 0; i < w->m && usable; i++) {
+            double scaled = scalbn(w->pi[i], exponents[t]);
+            if (!isfinite(scaled)) {
+                usable = 0;
+                break;
+            }
+            double q = scalbn(round(scaled), -exponents[t]);
+            if (i == removed)
+                nonzero_removed = q != 0;
+            if (q == 0)
+                continue;
+            size_t row = w->source_row[i];
+            if (row == SIZE_MAX || w->model->row_lower[row] != w->model->row_upper[row]) {
+                usable = 0;
+                break;
+            }
+            /* Source equalities have one canonical row. Scaling is a signed
+             * power of two; require reversible finite multiplication. */
+            double value = q * w->row_scale[i];
+            if (!isfinite(value) || value / w->row_scale[i] != q || y[row] != 0) {
+                usable = 0;
+                break;
+            }
+            y[row] = value;
+        }
+        if (usable && nonzero_removed)
+            proved = lab_source_row_dependency(w->model, y, deadline);
+        if (lab_now() >= deadline)
+            break;
+    }
+    free(y);
+    return proved;
+}
 static int remove_artificials(Work *w) {
     for (size_t i = 0; i < w->m;) {
         if (!w->artificial[w->basis[i]]) {
@@ -1034,7 +1102,9 @@ static int remove_artificials(Work *w) {
             change_basis(w, i, entering);
             w->result->iterations++;
             i++;
-        } else if (ambiguous) {
+        } else if (ambiguous && !prove_redundant_equality(w, i)) {
+            if (budget(w))
+                return -1;
             message(w, "numerical_failure", "Cannot establish redundant row with stable pivots");
             return -1;
         } else {
@@ -1178,13 +1248,170 @@ static int implicit_bound(const LabModel *m, size_t j, int upper) {
     mpq_clears(source, binary, NULL);
     return equal;
 }
-static int build(Work *w, const LabModel *m) {
+/* Compare canonical column lists only for rows already verified to mean
+ * sum(x_j) = 1 in original source arithmetic. Hashes select candidates;
+ * byte-for-byte equality of the complete column lists authorizes removal. */
+static unsigned char *duplicate_partition_rows(const LabModel *m, const unsigned char *kind) {
+    if (m->rows > 16384 || m->nnz > 1000000)
+        return NULL;
+    size_t eligible = 0;
+    for (size_t i = 0; i < m->rows; i++)
+        eligible += kind[i] == 2;
+    if (eligible < 2)
+        return NULL;
+    size_t *start = lab_alloc(m->rows + 1, sizeof *start);
+    for (size_t k = 0; k < m->nnz; k++)
+        start[m->row_index[k] + 1] += kind[m->row_index[k]] == 2;
+    for (size_t i = 0; i < m->rows; i++)
+        start[i + 1] += start[i];
+    size_t *column = lab_alloc(start[m->rows], sizeof *column);
+    size_t *cursor = lab_alloc(m->rows, sizeof *cursor);
+    memcpy(cursor, start, m->rows * sizeof *cursor);
+    for (size_t j = 0; j < m->cols; j++)
+        for (size_t k = m->col_start[j]; k < m->col_start[j + 1]; k++) {
+            size_t i = m->row_index[k];
+            if (kind[i] == 2)
+                column[cursor[i]++] = j;
+        }
+    size_t capacity = 2;
+    while (capacity < 2 * eligible)
+        capacity *= 2;
+    size_t *slot = lab_alloc(capacity, sizeof *slot);
+    unsigned char *duplicate = lab_alloc(m->rows, 1);
+    for (size_t i = 0; i < m->rows; i++) {
+        if (kind[i] != 2)
+            continue;
+        size_t length = start[i + 1] - start[i];
+        uint64_t hash = UINT64_C(14695981039346656037);
+        for (size_t k = start[i]; k < start[i + 1]; k++)
+            hash = (hash ^ column[k]) * UINT64_C(1099511628211);
+        size_t bucket = hash & (capacity - 1);
+        while (slot[bucket]) {
+            size_t other = slot[bucket] - 1;
+            if (length == start[other + 1] - start[other] &&
+                !memcmp(column + start[i], column + start[other], length * sizeof *column)) {
+                duplicate[i] = 1;
+                break;
+            }
+            bucket = (bucket + 1) & (capacity - 1);
+        }
+        if (!duplicate[i])
+            slot[bucket] = i + 1;
+    }
+    free(slot);
+    free(cursor);
+    free(column);
+    free(start);
+    return duplicate;
+}
+/* In a row sum(a_j*x_j) <= 1 with nonnegative variables and all
+ * a_j >= 1, each x_j <= 1. Use the immutable session domain for the
+ * nonnegativity proof, so it survives sibling-node bound restorations. */
+static void packing_bounds(Work *w, const LabModel *m, const LabModel *domain) {
+    unsigned char *eligible = lab_alloc(m->rows, 1);
+    mpq_t q;
+    mpq_init(q);
+    size_t row_count = 0;
+    for (size_t i = 0; i < m->rows; i++) {
+        if (m->row_upper[i] != 1 || lab_source_exact_row_bound(m, i, 1, q) || mpq_cmp_ui(q, 1, 1))
+            continue;
+        if (m->row_lower[i] == 1 && (lab_source_exact_row_bound(m, i, 0, q) || mpq_cmp_ui(q, 1, 1)))
+            continue;
+        eligible[i] = m->row_lower[i] == 1 ? 2 : 1;
+        row_count++;
+    }
+    unsigned char *implied = NULL;
+    if (row_count) {
+        for (size_t j = 0; j < m->cols; j++) {
+            int nonnegative = -1;
+            for (size_t k = m->col_start[j]; k < m->col_start[j + 1]; k++) {
+                size_t i = m->row_index[k];
+                if (!eligible[i])
+                    continue;
+                if (nonnegative < 0)
+                    nonnegative = isfinite(domain->col_lower[j]) && domain->col_lower[j] >= 0 &&
+                                  !lab_source_exact_column_bound(domain, j, 0, q) &&
+                                  mpq_sgn(q) >= 0;
+                if (!nonnegative || m->value[k] < 1 || lab_source_exact_coefficient(m, k, q) ||
+                    mpq_cmp_ui(q, 1, 1) < 0)
+                    eligible[i] = 0;
+                else if (m->value[k] != 1 || mpq_cmp_ui(q, 1, 1) != 0)
+                    eligible[i] = 1;
+            }
+        }
+        w->duplicate_partition = duplicate_partition_rows(m, eligible);
+        implied = lab_alloc(m->cols, 1);
+        for (size_t j = 0; j < m->cols; j++) {
+            if (m->col_lower[j] == m->col_upper[j] || !isfinite(m->col_lower[j]) ||
+                m->col_upper[j] != 1)
+                continue;
+            for (size_t k = m->col_start[j]; k < m->col_start[j + 1]; k++)
+                if (eligible[m->row_index[k]]) {
+                    implied[j] =
+                        !lab_source_exact_column_bound(m, j, 1, q) && mpq_cmp_ui(q, 1, 1) == 0;
+                    break;
+                }
+        }
+    }
+    mpq_clear(q);
+    free(eligible);
+    w->packing_upper = implied;
+}
+/* A structural column in one source equation plus its own bound rows can
+ * replace that equation's unit artificial. Bound slacks retain diagonal
+ * pivots. Check its nonnegative value and every affected bound slack first;
+ * ordinary factor/residual/Phase I/source validation still follows. */
+static void crash_singletons(Work *w) {
+    if (!w->options->crash_basis || w->options->basis_in)
+        return;
+    for (size_t j = 0; j < w->structural; j++) {
+        const Column *c = &w->a[j];
+        size_t row = SIZE_MAX;
+        double pivot = 0;
+        int usable = 1;
+        for (size_t k = 0; k < c->count; k++) {
+            size_t i = c->row[k];
+            if (w->source_row[i] != SIZE_MAX) {
+                if (row != SIZE_MAX) {
+                    usable = 0;
+                    break;
+                }
+                row = i;
+                pivot = c->value[k];
+            }
+        }
+        if (!usable || row == SIZE_MAX || !w->artificial[w->basis[row]] || pivot == 0)
+            continue;
+        double value = w->b[row] / pivot;
+        if (!isfinite(value) || value < 0 || (w->b[row] != 0 && value == 0))
+            continue;
+        for (size_t k = 0; k < c->count && usable; k++) {
+            size_t i = c->row[k];
+            if (i == row)
+                continue;
+            const Column *basic = &w->a[w->basis[i]];
+            if (w->artificial[w->basis[i]] || basic->count != 1 || basic->row[0] != i ||
+                basic->value[0] <= 0) {
+                usable = 0;
+                break;
+            }
+            double remainder = fma(-c->value[k], value, w->b[i]);
+            if (!isfinite(remainder) || remainder < 0)
+                usable = 0;
+        }
+        if (usable)
+            w->basis[row] = j;
+    }
+}
+static int build(Work *w, const LabModel *m, const LabModel *domain) {
     size_t dim = w->options->max_dimension, nz = 0, nr = 0;
     if (dim > LAB_LP_SPARSE_DIMENSION_LIMIT ||
         (w->options->dense && dim > LAB_LP_DENSE_DIMENSION_LIMIT)) {
         message(w, "unsupported", "Backend dimension ceiling exceeded");
         return -1;
     }
+    if (w->options->packing_bounds && !w->options->keep_bound_rows)
+        packing_bounds(w, m, domain);
     w->implicit_side = lab_alloc(m->cols, 1);
     for (size_t j = 0; j < m->cols; j++) {
         if (m->col_lower[j] > m->col_upper[j]) {
@@ -1198,6 +1425,7 @@ static int build(Work *w, const LabModel *m) {
             w->implicit_side[j] = (unsigned char)(lower ? 1 : 2);
             w->implicit_bound_rows++;
         }
+        w->packing_bound_rows += w->packing_upper && w->packing_upper[j];
         nz += (!isfinite(m->col_lower[j]) && !isfinite(m->col_upper[j])) ? 2U : 1U;
         nr += (size_t)lower + (size_t)upper - (size_t)(w->implicit_side[j] != 0);
     }
@@ -1206,10 +1434,13 @@ static int build(Work *w, const LabModel *m) {
             message(w, "infeasible", "Conflicting row bounds");
             return -1;
         }
+        if (w->duplicate_partition && w->duplicate_partition[i])
+            continue;
         nr += m->row_lower[i] == m->row_upper[i]
                   ? 1U
                   : (size_t)isfinite(m->row_lower[i]) + (size_t)isfinite(m->row_upper[i]);
     }
+    nr -= w->packing_bound_rows;
     if (nr > dim || nz > dim || nr > (dim - nz) / 2) {
         message(w, "unsupported", "Standard-form dimension limit exceeded");
         return -1;
@@ -1279,6 +1510,8 @@ static int build(Work *w, const LabModel *m) {
     size_t r = 0;
     for (size_t i = 0; i < m->rows; i++) {
         lower[i] = upper[i] = SIZE_MAX;
+        if (w->duplicate_partition && w->duplicate_partition[i])
+            continue;
         int equality = m->row_lower[i] == m->row_upper[i];
         for (int side = 0; side < 2; side++) {
             double bound = side ? m->row_upper[i] : m->row_lower[i];
@@ -1349,7 +1582,8 @@ static int build(Work *w, const LabModel *m) {
             w->row_id[r] = r;
             r++;
         }
-        if (isfinite(m->col_upper[j]) && w->implicit_side[j] != 2) {
+        if (isfinite(m->col_upper[j]) && w->implicit_side[j] != 2 &&
+            !(w->packing_upper && w->packing_upper[j])) {
             w->upper_row[j] = r;
             w->b[r] = w->transform[j] == 'U' ? 0 : m->col_upper[j] - w->shift[j];
             if (precise_shift) {
@@ -1421,6 +1655,7 @@ static int build(Work *w, const LabModel *m) {
     w->cb = lab_alloc(cap, sizeof(double));
     w->direction = lab_alloc(cap, sizeof(double));
     w->column = lab_alloc(cap, sizeof(double));
+    crash_singletons(w);
     w->result->standard_rows = nr;
     w->result->standard_columns = n;
     return 0;
@@ -1503,6 +1738,14 @@ static int recover(Work *w, const LabModel *m, int require_support) {
         if (w->source_row[i] != SIZE_MAX)
             r->dual[w->source_row[i]] += w->row_scale[i] * w->pi[i];
     }
+    /* Project the numerical multiplier candidate onto the row-sign domain.
+     * A wrong-sign multiplier requests an infinite row side. Zero is always
+     * allowed; subsequent original-source support validation must still pass.
+     * This projection has no tolerance and establishes no bound by itself. */
+    for (size_t i = 0; i < m->rows; i++)
+        if ((r->dual[i] > 0 && !isfinite(m->row_lower[i])) ||
+            (r->dual[i] < 0 && !isfinite(m->row_upper[i])))
+            r->dual[i] = 0;
     if (exact_primal(w, r->primal) < 0) {
         r->primal_repair_required = 1;
         if (lab_exact_evaluate(m, r->primal, &r->objective, &r->primal_residual))
@@ -1624,6 +1867,9 @@ static int recover(Work *w, const LabModel *m, int require_support) {
 void lab_lp_result_free(LabLpResult *result) {
     free(result->primal);
     free(result->dual);
+    for (size_t i = 0; i < result->dual_rows; i++)
+        free(result->dual_rational[i]);
+    free(result->dual_rational);
     for (size_t i = 0; i < result->farkas_rows; i++)
         free(result->farkas[i]);
     free(result->farkas);
@@ -1657,11 +1903,16 @@ static void work_free(Work *w) {
     free(w->upper_row);
     free(w->transform);
     free(w->implicit_side);
+    free(w->packing_upper);
+    free(w->duplicate_partition);
     free(w->xb);
     free(w->pi);
     free(w->cb);
     free(w->direction);
     free(w->column);
+    free(w->row_start);
+    free(w->row_col);
+    free(w->row_val);
     memset(w, 0, sizeof *w);
 }
 static int dual_simplex(Work *w, int original_units);
@@ -1730,10 +1981,16 @@ static int restore_primal(Work *w, const LabModel *m, int require_support) {
         clear_source_negative(w);
     return outcome;
 }
-static int cold_solve(Work *w, const LabModel *m) {
+#include "glpk_basis.inc"
+static int cold_solve(Work *w, const LabModel *m, const LabModel *domain) {
     w->model = m;
-    if (build(w, m))
+    if (build(w, m, domain))
         return -1;
+#ifdef LAB_GLPK_BASIS
+    suggest_glpk_basis(w);
+    if (w->result->has_primal)
+        return 0;
+#endif
     if (simplex(w, 1))
         return -1;
     double violation = 0;
@@ -1785,61 +2042,151 @@ static int cold_solve(Work *w, const LabModel *m) {
     }
     return 0;
 }
+static void ensure_row_csr(Work *w) {
+    if (w->row_start && w->row_rows == w->m)
+        return;
+    free(w->row_start);
+    free(w->row_col);
+    free(w->row_val);
+    w->row_start = NULL;
+    w->row_col = NULL;
+    w->row_val = NULL;
+    w->row_rows = 0;
+    size_t m = w->m, nnz = 0;
+    if (!m)
+        return;
+    size_t *start = lab_alloc(m + 1, sizeof(size_t));
+    for (size_t j = 0; j < w->n; j++) {
+        if (w->artificial[j])
+            continue;
+        const Column *c = &w->a[j];
+        for (size_t k = 0; k < c->count; k++)
+            if (c->row[k] < m) {
+                start[c->row[k] + 1]++;
+                nnz++;
+            }
+    }
+    for (size_t i = 0; i < m; i++)
+        start[i + 1] += start[i];
+    size_t *col = lab_alloc(nnz ? nnz : 1, sizeof(size_t));
+    double *val = lab_alloc(nnz ? nnz : 1, sizeof(double));
+    size_t *cursor = lab_alloc(m, sizeof(size_t));
+    memcpy(cursor, start, m * sizeof(size_t));
+    for (size_t j = 0; j < w->n; j++) {
+        if (w->artificial[j])
+            continue;
+        const Column *c = &w->a[j];
+        for (size_t k = 0; k < c->count; k++) {
+            size_t i = c->row[k];
+            if (i < m) {
+                size_t p = cursor[i]++;
+                col[p] = j;
+                val[p] = c->value[k];
+            }
+        }
+    }
+    free(cursor);
+    w->row_start = start;
+    w->row_col = col;
+    w->row_val = val;
+    w->row_rows = m;
+}
 /* Dual revised simplex repairs primal infeasibility caused by RHS changes while
  * preserving a dual-feasible basis. No new matrix or Phase I is needed. */
 static int dual_simplex(Work *w, int original_units) {
+    ensure_row_csr(w);
     double *reduced = lab_alloc(w->n, sizeof(double));
+    long double *row_a = lab_alloc(w->n, sizeof(long double));
+    long double *row_mag = lab_alloc(w->n, sizeof(long double));
+    size_t *touched = lab_alloc(w->n, sizeof(size_t));
+    size_t *stamp = lab_alloc(w->n, sizeof(size_t));
+    size_t *nz_rows = lab_alloc(w->m ? w->m : 1, sizeof(size_t));
+    size_t iter_stamp = 0, stale_dual = 0, stall = 0;
+    int dual_valid = 0;
     int outcome = -1;
     int source_step = original_units && source_negative(w) != SIZE_MAX;
     int source_pivot_done = 0;
     int factor_ready =
         !w->options->no_updates && w->linear.valid && w->linear.n == w->m && !basis_values(w, 0);
     for (;;) {
-        if (budget(w) || (!factor_ready && refactor(w, 0)))
+        if (budget(w))
             break;
+        if (!factor_ready) {
+            if (refactor(w, 0))
+                break;
+            dual_valid = 0;
+        }
         factor_ready = 0;
-        for (size_t i = 0; i < w->m; i++)
-            w->cb[i] = w->cost[w->basis[i]];
-        if (transpose_solve(w, w->cb, w->pi)) {
-            message(w, "numerical_failure", "Warm transpose solve failed");
-            break;
-        }
-        double worst = 0;
-        int dual_bad = 0;
-        long double pi_norm = 0;
-        for (size_t i = 0; i < w->m; i++)
-            pi_norm += fabs(w->pi[i]);
-        for (size_t j = 0; j < w->n; j++) {
-            if (w->artificial[j] || is_basic(w, j)) {
-                reduced[j] = 0;
-                continue;
+        if (!dual_valid || stale_dual >= 16) {
+            for (size_t i = 0; i < w->m; i++)
+                w->cb[i] = w->cost[w->basis[i]];
+            if (transpose_solve(w, w->cb, w->pi)) {
+                message(w, "numerical_failure", "Warm transpose solve failed");
+                break;
             }
-            long double scale = fabs(w->cost[j]);
-            long double rc = w->cost[j] - dot(w, j, w->pi, &scale);
-            long double tolerance = fmaxl(1e-10L * fmaxl(scale, DBL_MIN),
-                                          64 * DBL_EPSILON * pi_norm * column_norm(w, j));
-            if (!isfinite(rc) || !isfinite(scale) || !isfinite(tolerance) || rc < -tolerance)
-                dual_bad = 1;
-            reduced[j] = (double)fmaxl(rc, 0);
-            worst = fmax(worst, (double)-rc);
-        }
-        w->result->dual_residual = worst;
-        if (dual_bad) {
-            message(w, "numerical_failure", "Warm basis lost dual feasibility");
-            break;
+            double worst = 0;
+            int dual_bad = 0;
+            long double pi_norm = 0;
+            for (size_t i = 0; i < w->m; i++)
+                pi_norm += fabs(w->pi[i]);
+            for (size_t j = 0; j < w->n; j++) {
+                if (w->artificial[j] || is_basic(w, j)) {
+                    reduced[j] = 0;
+                    continue;
+                }
+                long double scale = fabs(w->cost[j]);
+                long double rc = w->cost[j] - dot(w, j, w->pi, &scale);
+                long double tolerance = fmaxl(1e-10L * fmaxl(scale, DBL_MIN),
+                                              64 * DBL_EPSILON * pi_norm * column_norm(w, j));
+                if (!isfinite(rc) || !isfinite(scale) || !isfinite(tolerance) || rc < -tolerance)
+                    dual_bad = 1;
+                reduced[j] = (double)fmaxl(rc, 0);
+                worst = fmax(worst, (double)-rc);
+            }
+            w->result->dual_residual = worst;
+            if (dual_bad) {
+                message(w, "numerical_failure", "Warm basis lost dual feasibility");
+                break;
+            }
+            dual_valid = 1;
+            stale_dual = 0;
         }
         /* A source hint authorizes just one ordinary pivot. Recompute the new
          * factor/dual as usual, then reconstruct source signs before another. */
         if (source_step && source_pivot_done) {
+            if (stale_dual) {
+                dual_valid = 0;
+                factor_ready = 1;
+                continue;
+            }
             outcome = 0;
             break;
         }
         size_t leaving = original_units ? source_negative(w) : SIZE_MAX;
-        for (size_t i = 0; i < w->m; i++)
-            if (w->xb[i] < -(original_units ? original_basic_tolerance(w, i) : 1e-8) &&
-                (leaving == SIZE_MAX || w->basis[i] < w->basis[leaving]))
-                leaving = i;
         if (leaving == SIZE_MAX) {
+            int use_bland = original_units || stall >= 16;
+            double worst_infeas = 0;
+            for (size_t i = 0; i < w->m; i++) {
+                double tol = original_units ? original_basic_tolerance(w, i) : 1e-8;
+                if (w->xb[i] < -tol) {
+                    if (use_bland) {
+                        if (leaving == SIZE_MAX || w->basis[i] < w->basis[leaving])
+                            leaving = i;
+                    } else if (leaving == SIZE_MAX || w->xb[i] < worst_infeas ||
+                               (w->xb[i] == worst_infeas && w->basis[i] < w->basis[leaving])) {
+                        leaving = i;
+                        worst_infeas = w->xb[i];
+                    }
+                }
+            }
+        }
+        if (leaving == SIZE_MAX) {
+            if (stale_dual) {
+                /* Verify full dual feasibility before accepting optimality. */
+                dual_valid = 0;
+                factor_ready = 1;
+                continue;
+            }
             for (size_t i = 0; i < w->m; i++)
                 if (w->xb[i] < 0)
                     w->xb[i] = 0;
@@ -1853,8 +2200,14 @@ static int dual_simplex(Work *w, int original_units) {
             break;
         }
         long double inverse_norm = 0;
-        for (size_t i = 0; i < w->m; i++)
-            inverse_norm += fabs(w->column[i]);
+        size_t nz = 0;
+        for (size_t i = 0; i < w->m; i++) {
+            double v = w->column[i];
+            if (v != 0) {
+                inverse_norm += fabs(v);
+                nz_rows[nz++] = i;
+            }
+        }
         if (!isfinite(inverse_norm)) {
             message(w, "numerical_failure", "Dual inverse-row norm overflow");
             break;
@@ -1862,33 +2215,85 @@ static int dual_simplex(Work *w, int original_units) {
         size_t entering = SIZE_MAX;
         long double ratio = INFINITY;
         int ambiguous = 0, pivot_bad = 0;
-        for (size_t j = 0; j < w->n; j++) {
-            if (w->artificial[j] || is_basic(w, j))
-                continue;
-            long double magnitude = 0, norm = 0;
-            long double a = dot(w, j, w->column, &magnitude);
-            for (size_t k = 0; k < w->a[j].count; k++)
-                norm = fmaxl(norm, fabs(w->a[j].value[k]));
-            long double tol = 1e-12L * fmaxl(fmaxl(magnitude, norm * inverse_norm), DBL_MIN);
-            if (!isfinite(a) || !isfinite(magnitude) || !isfinite(norm) || !isfinite(tol)) {
-                pivot_bad = 1;
-                break;
+        size_t touched_count = 0;
+        int sparse_scan = w->row_start && nz < w->m / 4 + 1;
+        if (sparse_scan) {
+            iter_stamp++;
+            if (!iter_stamp) {
+                memset(stamp, 0, w->n * sizeof(size_t));
+                iter_stamp = 1;
             }
-            if (a >= -tol) {
-                if (a < 0)
-                    ambiguous = 1;
-                continue;
+            for (size_t t = 0; t < nz; t++) {
+                size_t r = nz_rows[t];
+                long double y = w->column[r];
+                for (size_t p = w->row_start[r]; p < w->row_start[r + 1]; p++) {
+                    size_t j = w->row_col[p];
+                    if (is_basic(w, j))
+                        continue;
+                    if (stamp[j] != iter_stamp) {
+                        stamp[j] = iter_stamp;
+                        row_a[j] = 0;
+                        row_mag[j] = 0;
+                        touched[touched_count++] = j;
+                    }
+                    long double term = (long double)w->row_val[p] * y;
+                    row_a[j] += term;
+                    row_mag[j] += fabsl(term);
+                }
             }
-            long double candidate = reduced[j] / -a;
-            if (!isfinite(candidate)) {
-                pivot_bad = 1;
-                break;
+            for (size_t t = 0; t < touched_count; t++) {
+                size_t j = touched[t];
+                long double a = row_a[j], magnitude = row_mag[j], norm = column_norm(w, j);
+                long double tol = 1e-12L * fmaxl(fmaxl(magnitude, norm * inverse_norm), DBL_MIN);
+                if (!isfinite(a) || !isfinite(magnitude) || !isfinite(norm) || !isfinite(tol)) {
+                    pivot_bad = 1;
+                    break;
+                }
+                if (a >= -tol) {
+                    if (a < 0)
+                        ambiguous = 1;
+                    continue;
+                }
+                long double candidate = reduced[j] / -a;
+                if (!isfinite(candidate)) {
+                    pivot_bad = 1;
+                    break;
+                }
+                long double tie = 1e-12L * (1 + fabsl(candidate));
+                if (entering == SIZE_MAX || candidate < ratio - tie ||
+                    (fabsl(candidate - ratio) <= tie && j < entering)) {
+                    ratio = candidate;
+                    entering = j;
+                }
             }
-            long double tie = 1e-12L * (1 + fabsl(candidate));
-            if (entering == SIZE_MAX || candidate < ratio - tie ||
-                (fabsl(candidate - ratio) <= tie && j < entering)) {
-                ratio = candidate;
-                entering = j;
+        } else {
+            for (size_t j = 0; j < w->n; j++) {
+                if (w->artificial[j] || is_basic(w, j))
+                    continue;
+                long double magnitude = 0, norm = column_norm(w, j);
+                long double a = dot(w, j, w->column, &magnitude);
+                long double tol = 1e-12L * fmaxl(fmaxl(magnitude, norm * inverse_norm), DBL_MIN);
+                if (!isfinite(a) || !isfinite(magnitude) || !isfinite(norm) || !isfinite(tol)) {
+                    pivot_bad = 1;
+                    break;
+                }
+                row_a[j] = a;
+                if (a >= -tol) {
+                    if (a < 0)
+                        ambiguous = 1;
+                    continue;
+                }
+                long double candidate = reduced[j] / -a;
+                if (!isfinite(candidate)) {
+                    pivot_bad = 1;
+                    break;
+                }
+                long double tie = 1e-12L * (1 + fabsl(candidate));
+                if (entering == SIZE_MAX || candidate < ratio - tie ||
+                    (fabsl(candidate - ratio) <= tie && j < entering)) {
+                    ratio = candidate;
+                    entering = j;
+                }
             }
         }
         if (pivot_bad) {
@@ -1896,6 +2301,11 @@ static int dual_simplex(Work *w, int original_units) {
             break;
         }
         if (entering == SIZE_MAX) {
+            if (stale_dual) {
+                dual_valid = 0;
+                factor_ready = 1;
+                continue;
+            }
             if (ambiguous || original_units)
                 message(w, "numerical_failure", "No stable dual ratio pivot");
             else {
@@ -1904,6 +2314,41 @@ static int dual_simplex(Work *w, int original_units) {
             }
             break;
         }
+        size_t leaving_col = w->basis[leaving];
+        if (ratio == 0)
+            stall++;
+        else
+            stall = 0;
+        if (ratio > 0) {
+            if (sparse_scan) {
+                for (size_t t = 0; t < touched_count; t++) {
+                    size_t j = touched[t];
+                    long double updated = (long double)reduced[j] + ratio * row_a[j];
+                    if (!isfinite(updated) || updated < -1e-9L * (1 + fabsl(reduced[j]))) {
+                        dual_valid = 0;
+                        break;
+                    }
+                    reduced[j] = (double)fmaxl(updated, 0);
+                }
+            } else {
+                for (size_t j = 0; j < w->n; j++) {
+                    if (w->artificial[j] || is_basic(w, j))
+                        continue;
+                    long double updated = (long double)reduced[j] + ratio * row_a[j];
+                    if (!isfinite(updated) || updated < -1e-9L * (1 + fabsl(reduced[j]))) {
+                        dual_valid = 0;
+                        break;
+                    }
+                    reduced[j] = (double)fmaxl(updated, 0);
+                }
+            }
+            reduced[leaving_col] = (double)ratio;
+            reduced[entering] = 0;
+        } else {
+            reduced[leaving_col] = 0;
+            reduced[entering] = 0;
+        }
+        stale_dual++;
         change_basis(w, leaving, entering);
         w->result->iterations++;
         w->result->dual_iterations++;
@@ -1914,6 +2359,11 @@ static int dual_simplex(Work *w, int original_units) {
             factor_ready = 1;
         }
     }
+    free(nz_rows);
+    free(stamp);
+    free(touched);
+    free(row_mag);
+    free(row_a);
     free(reduced);
     return outcome;
 }
@@ -1926,6 +2376,7 @@ struct LabLpSession {
     int ready;
     size_t bound_generation, solved_generation;
     int export_ready;
+    int standalone;
 };
 LabLpSession *lab_lp_session_create(const LabModel *m, const LabLpOptions *options) {
     if (!m || !options || !isfinite(options->time_limit) || !options->max_dimension ||
@@ -2015,7 +2466,8 @@ static int update_rhs(LabLpSession *s) {
             return -1;
         if (w->transform[j] == 'L' &&
             (!isfinite(lo) || (w->implicit_side[j] != 1 && lo < w->shift[j]) ||
-             (isfinite(hi) != (w->upper_row[j] != SIZE_MAX))))
+             (w->packing_upper && w->packing_upper[j] ? hi != 1 :
+              (isfinite(hi) != (w->upper_row[j] != SIZE_MAX)))))
             return -1;
         if (w->transform[j] == 'U' &&
             (!isfinite(hi) || (w->implicit_side[j] != 2 && hi > w->shift[j]) || isfinite(lo)))
@@ -2124,7 +2576,10 @@ void lab_lp_session_solve(LabLpSession *s, LabLpResult *result) {
         result->redundant_rows = w->total_rows - w->m;
         int status = dual_simplex(w, 0);
         if (status == 1) {
-            s->ready = 0;
+            /* Basis and factorization remain dual-feasible for the next node.
+             * Tiny exact models keep cold retry to preserve Farkas trace certs. */
+            if (s->model.cols <= 16 && exact_source(&s->model))
+                s->ready = 0;
             goto done;
         }
         if (status == 0) {
@@ -2162,10 +2617,25 @@ void lab_lp_session_solve(LabLpSession *s, LabLpResult *result) {
         message(w, "time_limit", "Cumulative LP deadline exhausted");
         goto done;
     }
-    (void)cold_solve(w, &s->model);
+    w->standalone = s->standalone;
+    (void)cold_solve(w, &s->model, s->original);
+    if (!strcmp(result->status, "infeasible") && !result->farkas &&
+        (w->scaled_rows || w->scaled_columns) && !s->running.no_scaling &&
+        s->deadline - lab_now() > 0) {
+        work_free(w);
+        s->running.no_scaling = 1;
+        s->running.time_limit = s->deadline - lab_now();
+        w->options = &s->running;
+        w->result = result;
+        w->started = lab_now();
+        w->standalone = s->standalone;
+        result->status = "numerical_failure";
+        (void)cold_solve(w, &s->model, s->original);
+    }
     s->ready = !strcmp(result->status, "optimal");
 done:
     result->implicit_bound_rows = w->implicit_bound_rows;
+    result->packing_bound_rows = w->packing_bound_rows;
     if (s->ready && result->has_primal && !strcmp(result->status, "optimal")) {
         s->solved_generation = s->bound_generation;
         s->export_ready = 1;
@@ -2191,6 +2661,30 @@ void lab_lp_session_free(LabLpSession *s) {
     free(s->model.col_upper);
     free(s);
 }
+/* In a standalone solve a disconnected, exactly costless column may take
+ * any source-feasible value. Fix it to its zero lower bound on the private
+ * session copy. This changes neither the original row support nor the dual
+ * contribution and avoids creating bound rows for the pricing basis. */
+static void fix_unused_columns(LabLpSession *s) {
+    const LabModel *m = s->original;
+    mpq_t q;
+    mpq_init(q);
+    for (size_t j = 0; j < m->cols; ++j) {
+        if ((j & 255U) == 0 && lab_now() >= s->deadline)
+            break;
+        if (m->col_start[j] != m->col_start[j + 1] || m->objective[j] != 0 ||
+            m->col_lower[j] != 0 || !(m->col_upper[j] > 0) ||
+            lab_source_exact_column_bound(m, j, 0, q) || mpq_sgn(q) ||
+            lab_source_exact_objective(m, j, q) || mpq_sgn(q))
+            continue;
+        if (isfinite(m->col_upper[j]) &&
+            (lab_source_exact_column_bound(m, j, 1, q) || mpq_sgn(q) < 0))
+            continue;
+        s->model.col_upper[j] = 0;
+    }
+    mpq_clear(q);
+}
+
 void lab_lp_solve(const LabModel *m, const LabLpOptions *options, LabLpResult *result) {
     LabLpSession *s = lab_lp_session_create(m, options);
     if (!s) {
@@ -2199,6 +2693,9 @@ void lab_lp_solve(const LabModel *m, const LabLpOptions *options, LabLpResult *r
         snprintf(result->message, sizeof result->message, "Invalid LP options or basis identity");
         return;
     }
+    s->standalone = options->verify_glpk_point && !options->basis_in && !options->basis_out;
+    if (s->standalone)
+        fix_unused_columns(s);
     lab_lp_session_solve(s, result);
     lab_lp_session_free(s);
 }

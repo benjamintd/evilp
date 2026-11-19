@@ -6,7 +6,7 @@ import json,itertools,subprocess,random,sys
 binary=Path(sys.argv[1]).resolve();rng=random.Random(20261106);rows=[]
 unit=subprocess.run([str(binary)],capture_output=True,text=True,timeout=30)
 assert unit.returncode==0,(unit.returncode,unit.stdout,unit.stderr)
-assert json.loads(unit.stdout)=={'passed':True,'checks':27}
+assert json.loads(unit.stdout)=={'passed':True,'checks':31}
 for i in range(240):
  x=rng.choice([0.,.25,.5,1.]);y=rng.choice([-2.,-1.,1.,2.]);a=1.;da=rng.choice([0.,2.**-50,2.**-45]);dc=2.**-48;db=rng.choice([0.,2.**-50]);bound=1. if i%3!=1 else 1e15
  lo,hi=-bound,bound;curlo,curhi=lo,hi

@@ -7,7 +7,15 @@
 typedef struct {
     double lower, upper;
 } LabInterval;
+typedef struct {
+    size_t entry;
+    double rounded;
+    mpq_t value;
+} LabDecimalCoefficient;
 typedef struct LabSourceEnvelope {
+    /* Sorted CSC positions with independently retained source tokens. */
+    LabDecimalCoefficient *exceptions;
+    size_t exception_count;
     size_t rows, cols, nnz;
     LabInterval *value, *row_lower, *row_upper, *col_lower, *col_upper;
     double *col_lower_source, *col_upper_source;
@@ -56,7 +64,7 @@ int lab_exact_nearest(const mpq_t value, double *result);
 int lab_exact_evaluate(const LabModel *model, const double *x, double *objective,
                        double *max_violation);
 /* Exact accessors preserve initialized out on unavailability. Parsed source
- * without an MPQ snapshot requires a complete matching point enclosure.
+ * without a snapshot requires a matching sparse token or a point enclosure.
  * Column values distinct from original source doubles are binary overlays. */
 int lab_source_exact_coefficient(const LabModel *, size_t entry, mpq_t out);
 int lab_source_exact_row_bound(const LabModel *, size_t row, int upper, mpq_t out);

@@ -169,7 +169,7 @@ class PricingIntegration(unittest.TestCase):
                 extra = (['--backend', 'dense'] if dense else []) + (['--no-scaling'] if unscaled else [])
                 for bland in (False, True):
                     with self.subTest(dense=dense, unscaled=unscaled, bland=bland):
-                        result = self.solve(beale(), F(1), bland, extra)
+                        result = self.solve(beale(), F(1), bland, [*extra, '--legacy-pricing'])
                         self.assertGreaterEqual(result['primal_zero_steps'], 1)
                         if not bland:
                             self.assertGreaterEqual(result['pricing_bland_fallbacks'], 1)
@@ -204,7 +204,7 @@ class PricingIntegration(unittest.TestCase):
                     extra += ['--bland-ratio', '--no-updates']
                 for bland in (False, True):
                     with self.subTest(dense=dense, deferred=deferred, bland=bland):
-                        result = self.solve(weighted(n, phase_one_zero=True), F(-n), bland, extra)
+                        result = self.solve(weighted(n, phase_one_zero=True), F(-n), bland, [*extra, '--legacy-pricing'])
                         self.assertEqual(result['primal_zero_steps'], 1)
                         self.assertEqual(result['primal_accepted_pivots'], n + 1 if bland else 2)
                         self.assertEqual(result['pricing_bland_fallbacks'], 0 if bland else 1)

@@ -499,6 +499,9 @@ LabSourceEnvelope *lab_source_envelope_new(size_t rows, size_t cols, size_t nnz)
 void lab_source_envelope_free(LabSourceEnvelope *s) {
     if (!s)
         return;
+    for (size_t k = 0; k < s->exception_count; ++k)
+        mpq_clear(s->exceptions[k].value);
+    free(s->exceptions);
     free(s->value);
     free(s->objective);
     free(s->row_lower);
@@ -533,6 +536,19 @@ int lab_source_exact_coefficient(const LabModel *m, size_t k, mpq_t out) {
     if (source_exact_valid(m)) mpq_set(out,native_source_snapshot(m)->value[k]);
     else if (!m->parsed_decimal || (source_envelope_valid(m) &&
              exact_point(m->envelope->value[k], m->value[k]))) mpq_set_d(out, m->value[k]);
+    else if (source_envelope_valid(m)) {
+        const LabSourceEnvelope *s = m->envelope;
+        size_t lo = 0, hi = s->exception_count;
+        while (lo < hi) {
+            size_t mid = lo + (hi - lo) / 2;
+            if (s->exceptions[mid].entry < k) lo = mid + 1;
+            else hi = mid;
+        }
+        if (lo == s->exception_count || s->exceptions[lo].entry != k ||
+            s->exceptions[lo].rounded != m->value[k])
+            return -1;
+        mpq_set(out, s->exceptions[lo].value);
+    }
     else return -1;
     return 0;
 }
@@ -652,11 +668,26 @@ static int source_scalar(const LabModel *m,const double *left,const double *righ
         if(bad)return -1;
         if(total.error==0){double value=total.high+total.low;if(!isfinite(value))return -1;*out=value==0?0:value;return 0;}
     }
-    if(m->cols>65536)return -1;
+    /* Charge the exact-work budget for nonzero products. When a complete
+     * finite source enclosure is available, multiplying any value in it by
+     * zero gives exactly zero, even for an unknown decimal coefficient. */
+    size_t exact_products = 0;
+    const LabSourceEnvelope *e = m->envelope;
+    int enclosed = e && e->complete && e->objective_complete &&
+                   e->cols == m->cols && e->objective;
     mpq_t total,c,x,y,term;mpq_inits(total,c,x,y,term,NULL);int bad=0;
     if(!right)bad=lab_source_exact_offset(m,total);
     for(size_t j=0;j<m->cols&&!bad;j++) {
         if(!isfinite(left[j])||(right&&!isfinite(right[j]))){bad=1;break;}
+        if (enclosed) {
+            LabInterval cost = e->objective[j];
+            int inactive = left[j] == (right ? right[j] : 0);
+            if ((inactive || (cost.lower == 0 && cost.upper == 0)) &&
+                isfinite(cost.lower) && isfinite(cost.upper) &&
+                cost.lower <= m->objective[j] && m->objective[j] <= cost.upper)
+                continue;
+        }
+        if (++exact_products > 65536) {bad=1;break;}
         bad=lab_source_exact_objective(m,j,c);if(bad)break;
         mpq_set_d(x,left[j]);if(right){mpq_set_d(y,right[j]);mpq_sub(x,x,y);}
         mpq_mul(term,c,x);mpq_add(total,total,term);

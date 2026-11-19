@@ -149,6 +149,113 @@ static int tighten(LabInterval *box, double candidate, int upper, int integer,
     r->tightenings++;
     return 1;
 }
+#include "clique_probing.inc"
+/* Reduce exact integer equalities modulo two. Only point source enclosures
+ * are eligible: a decimal that merely rounds to an integer has no parity.
+ * Limit packed storage and row-reduction work on large sparse LPs. */
+static int integer_point(LabInterval a) {
+    return a.lower == a.upper && isfinite(a.lower) && trunc(a.lower) == a.lower;
+}
+static int odd(double integer) {
+    return fmod(fabs(integer), 2.0) == 1.0;
+}
+static int propagate_parity(const LabModel *m, const LabInterval *a,
+                            const LabInterval *rl, const LabInterval *ru,
+                            const size_t *start, const size_t *entries, const size_t *column,
+                            LabInterval *box, LabPresolveResult *r, double deadline) {
+    size_t n = m->cols;
+    if (!m->integer || !n || n > 1024 || !m->rows || m->rows > 4096 || m->nnz > 262144)
+        return 0;
+    size_t words = (n + 63) / 64;
+    uint64_t *basis = lab_alloc(n * words, sizeof *basis);
+    uint64_t *row = lab_alloc(words, sizeof *row);
+    unsigned char *rhs = lab_alloc(n, 1);
+    int conflict = 0;
+    for (size_t i = 0; i < m->rows; i++) {
+        if (lab_now() >= deadline)
+            goto done;
+        if (!integer_point(rl[i]) || !integer_point(ru[i]) || rl[i].lower != ru[i].lower)
+            continue;
+        unsigned char bit = (unsigned char)odd(rl[i].lower);
+        int usable = 1;
+        memset(row, 0, words * sizeof *row);
+        for (size_t p = start[i]; p < start[i+1]; p++) {
+            size_t k = entries[p], j = column[k];
+            if (!integer_point(a[k]) || (a[k].lower != 0 && !m->integer[j])) {
+                usable = 0;
+                break;
+            }
+            if (odd(a[k].lower)) {
+                if (integer_point(box[j]))
+                    bit ^= (unsigned char)odd(box[j].lower);
+                else
+                    row[j/64] ^= UINT64_C(1) << (j%64);
+            }
+        }
+        if (!usable)
+            continue;
+        size_t j;
+        for (j = 0; j < n; j++) {
+            uint64_t mask = UINT64_C(1) << (j%64);
+            if (!(row[j/64] & mask))
+                continue;
+            uint64_t *pivot = basis + j * words;
+            if (!(pivot[j/64] & mask)) {
+                memcpy(pivot, row, words * sizeof *pivot);
+                rhs[j] = bit;
+                break;
+            }
+            for (size_t w = j/64; w < words; w++)
+                row[w] ^= pivot[w];
+            bit ^= rhs[j];
+        }
+        if (j == n && bit) {
+            conflict = 1;
+            goto done;
+        }
+    }
+    /* Substitute determined parities into earlier equations. A row still
+     * depending on another variable cannot justify an endpoint change. */
+    for (size_t j = n; j-- > 0;) {
+        if (lab_now() >= deadline)
+            goto done;
+        uint64_t mask = UINT64_C(1) << (j%64);
+        const uint64_t *pivot = basis + j * words;
+        if (pivot[j/64] != mask)
+            continue;
+        size_t w = j/64 + 1;
+        while (w < words && !pivot[w])
+            w++;
+        if (w != words)
+            continue;
+        double lo = box[j].lower, hi = box[j].upper;
+        if (fabs(lo) < 0x1p53 && odd(lo) != rhs[j]) {
+            box[j].lower = lo + 1;
+            r->tightenings++;
+        }
+        if (fabs(hi) < 0x1p53 && odd(hi) != rhs[j]) {
+            box[j].upper = hi - 1;
+            r->tightenings++;
+        }
+        if (box[j].lower > box[j].upper) {
+            conflict = 1;
+            goto done;
+        }
+        for (size_t i = 0; i < j; i++) {
+            uint64_t *word = &basis[i * words + j/64];
+            if (*word & mask) {
+                *word ^= mask;
+                rhs[i] ^= rhs[j];
+            }
+        }
+    }
+done:
+    free(row);
+    free(basis);
+    free(rhs);
+    return conflict;
+}
+
 void lab_presolve(const LabModel *m, const double *lower, const double *upper,
                   const LabPresolveOptions *options, LabPresolveResult *r) {
     memset(r, 0, sizeof *r);
@@ -229,7 +336,9 @@ void lab_presolve(const LabModel *m, const double *lower, const double *upper,
         entries[at[m->row_index[k]]++] = k;
     LabInterval *term = lab_alloc(longest, sizeof(LabInterval));
     double deadline = started + opt.time_limit;
-    int changed = 0, infeasible = 0;
+    int changed = 0;
+    int infeasible = !opt.relax && propagate_parity(m, a, rl, ru, start, entries, column,
+                                                    box, r, deadline);
     for (size_t pass = 0; pass < opt.max_passes && !infeasible; pass++) {
         changed = 0;
         int completed = 1;
@@ -290,6 +399,8 @@ void lab_presolve(const LabModel *m, const double *lower, const double *upper,
         if (r->limited || !changed)
             break;
     }
+    if (!infeasible && !opt.relax)
+        probe_cliques(m, a, rl, ru, start, entries, column, box, r, deadline);
     if (changed && r->passes == opt.max_passes)
         r->limited = 1;
     for (size_t j = 0; j < m->cols; j++) {
@@ -306,7 +417,7 @@ void lab_presolve(const LabModel *m, const double *lower, const double *upper,
             initial[j].upper = fmin(initial[j].upper, r->upper[j]);
     }
     if (infeasible)
-        diagnostic(r, "infeasible", "Source-envelope propagation proves an empty relaxation box");
+        diagnostic(r, "infeasible", "Source constraints and variable bounds imply infeasibility");
     else {
         diagnostic(r, "unresolved", r->limited ? "Safe propagation stopped at its resource limit"
                                                 : "Safe propagation reached a fixed point");

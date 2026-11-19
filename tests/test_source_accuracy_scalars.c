@@ -36,6 +36,12 @@ int main(int argc,char **argv) {
  m.col_lower[0]=.5;CHECK(!lab_exact_evaluate(&m,x,&objective,&violation)&&violation==0);lab_model_free(&m);free(x);
  CHECK(!lab_model_read(&m,argv[4]));CHECK(!m.exact&&!m.native_exact&&!m.objective_exact);x=calloc(m.cols,sizeof *x);CHECK(x);x[0]=1;
  mpq_set_ui(q,7,9);CHECK(lab_source_exact_objective(&m,0,q)&&mpq_cmp_ui(q,7,9)==0);
- CHECK(lab_exact_evaluate(&m,x,&objective,&violation));lab_model_free(&m);free(x);mpq_clears(q,sentinel,NULL);
+ CHECK(lab_exact_evaluate(&m,x,&objective,&violation));
+ x[0]=0;
+ CHECK(!lab_source_objective_value(&m,x,&objective)&&objective==m.offset);
+ x[0]=1;
+ CHECK(!lab_source_objective_difference(&m,x,x,&difference)&&difference==0);
+ x[0]=NAN;CHECK(lab_source_objective_difference(&m,x,x,&difference));
+ lab_model_free(&m);free(x);mpq_clears(q,sentinel,NULL);
  puts("source scalar, ambiguity, ownership and resource controls passed");return 0;
 }

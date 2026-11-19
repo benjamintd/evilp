@@ -91,7 +91,7 @@ class Diving(unittest.TestCase):
             root=pathlib.Path(td);model=root/'model.mps';model.write_text(integer_mps(BACKTRACK))
             results=[]
             for mode,args in [('enabled',[]),('disabled',['--no-root-diving'])]:
-                point=root/(mode+'.sol');run=subprocess.run([SOLVER,str(model),'--mip','--no-root-cuts','--no-presolve','--node-limit','1','--time-limit','10','--solution',str(point),*args],capture_output=True,text=True,timeout=15)
+                point=root/(mode+'.sol');run=subprocess.run([SOLVER,str(model),'--mip','--no-root-cuts','--no-presolve','--no-objective-lattice','--node-limit','1','--time-limit','10','--solution',str(point),*args],capture_output=True,text=True,timeout=15)
                 self.assertIn(run.returncode,[0,4],(run.stdout,run.stderr));j=json.loads(run.stdout);results.append(j)
                 if mode=='enabled':
                     self.assertTrue(j['has_primal'],j);self.assertEqual(j['root_dive_incumbents'],1);self.assertGreater(j['root_dive_lp_solves'],0)

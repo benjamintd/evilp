@@ -13,6 +13,34 @@ void lab_pricing_begin(LabPricing *state, int bland_requested) {
     memset(state, 0, sizeof *state);
     state->bland_requested = state->bland_active = bland_requested != 0;
 }
+void lab_pricing_begin_adaptive(LabPricing *state, int bland_requested) {
+    lab_pricing_begin(state, bland_requested);
+    if (state)
+        state->adaptive = 1;
+}
+int lab_pricing_watch_basis(LabPricing *state, size_t n, const size_t *basis) {
+    if (!state || (n && !basis))
+        return -1;
+    if (!state->adaptive || state->bland_active)
+        return 0;
+    uint64_t hash = UINT64_C(14695981039346656037) ^ (uint64_t)n;
+    for (size_t i = 0; i < n; i++) {
+        hash ^= (uint64_t)basis[i];
+        hash *= UINT64_C(1099511628211);
+    }
+    for (size_t i = 0; i < state->history_count; i++) {
+        if (state->history[i] == hash) {
+            state->bland_active = 1;
+            increment(&state->fallback_transitions);
+            return 1;
+        }
+    }
+    state->history[state->history_next] = hash;
+    state->history_next = (state->history_next + 1) % 64;
+    if (state->history_count < 64)
+        state->history_count++;
+    return 0;
+}
 void lab_pricing_scan_begin(LabPricingChoice *choice) {
     if (!choice)
         return;
@@ -46,14 +74,21 @@ int lab_pricing_record_step(LabPricing *state, double accepted_step, double shor
     int events = 0, trigger = 0;
     if (accepted_step == 0) {
         increment(&state->zero_steps);
-        state->consecutive_short = 0;
-        trigger = 1;
+        if (state->adaptive) {
+            if (state->consecutive_short < 512)
+                state->consecutive_short++;
+            trigger = state->consecutive_short == 512;
+        } else {
+            state->consecutive_short = 0;
+            trigger = 1;
+        }
         events |= LAB_PRICING_ZERO;
     } else if (accepted_step <= short_threshold) {
         increment(&state->short_steps);
-        if (state->consecutive_short < LAB_PRICING_SHORT_STREAK)
+        unsigned limit = state->adaptive ? 512 : LAB_PRICING_SHORT_STREAK;
+        if (state->consecutive_short < limit)
             state->consecutive_short++;
-        trigger = state->consecutive_short == LAB_PRICING_SHORT_STREAK;
+        trigger = state->consecutive_short == limit;
         events |= LAB_PRICING_SHORT;
     } else {
         state->consecutive_short = 0;

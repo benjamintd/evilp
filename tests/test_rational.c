@@ -115,6 +115,38 @@ static void singleton_rows_and_columns(void) {
     solve_known(4, 9, mixed_start, mixed_row, value);
     release(value, 9);
 }
+static void long_triangular_basis(void) {
+    const size_t n = 8191, nnz = 2 * n - 1;
+    size_t *start = calloc(n + 1, sizeof *start), *row = calloc(nnz, sizeof *row);
+    require(start && row, "triangular basis allocation");
+    mpq_t *value = vector(nnz), *rhs = vector(n), *answer = vector(n);
+    for (size_t j = 0; j < n; ++j) {
+        start[j] = 2 * j;
+        row[2 * j] = j;
+        mpq_set_ui(value[2 * j], 1, 1);
+        if (j + 1 < n) {
+            row[2 * j + 1] = j + 1;
+            mpq_set_si(value[2 * j + 1], -1, 1);
+        }
+        mpq_set_ui(rhs[j], 1, 1);
+    }
+    start[n] = nnz;
+    require(!lab_rational_sparse_solve(n, start, row, value, rhs, answer, lab_now() + 5),
+            "long singleton chain");
+    for (size_t j = 0; j < n; ++j)
+        require(mpq_cmp_ui(answer[j], j + 1, 1) == 0, "reconstructed chain values");
+    /* The two columns of the final row compete for the same pivot. */
+    mpq_set_ui(value[nnz - 3], 0, 1);
+    require(lab_rational_sparse_solve(n, start, row, value, rhs, answer, lab_now() + 5),
+            "singular chain rejected");
+    for (size_t j = 0; j < n; ++j)
+        require(mpq_cmp_ui(answer[j], j + 1, 1) == 0, "singular solve preserves output");
+    release(answer, n);
+    release(rhs, n);
+    release(value, nnz);
+    free(row);
+    free(start);
+}
 static void large_peeled_basis(void) {
     size_t n = LAB_RATIONAL_SPARSE_MAX_DIMENSION;
     size_t *start = calloc(n + 1, sizeof *start), *row = calloc(n, sizeof *row);
@@ -186,7 +218,7 @@ static void generated_sparse_cases(void) {
     }
 }
 static void sparse_rejections(void) {
-    size_t n = LAB_RATIONAL_MAX_DIMENSION + 1;
+    size_t n = LAB_RATIONAL_SPARSE_MAX_CORE + 1;
     size_t *start = calloc(n + 1, sizeof *start), *row = calloc(2 * n, sizeof *row);
     mpq_t *value = vector(2 * n), *rhs = vector(n), *answer = vector(n);
     require(start && row, "rejection test allocation");
@@ -203,6 +235,10 @@ static void sparse_rejections(void) {
             "large nonpeelable core rejected");
     for (size_t j = 0; j < n; j++)
         require(mpq_cmp_ui(answer[j], 42, 1) == 0, "failure preserves output");
+    /* The old boundary now reconstructs this coupled cycle exactly. */
+    size_t small = LAB_RATIONAL_MAX_DIMENSION + 1;
+    row[2 * small - 1] = 0;
+    solve_known(small, 2 * small, start, row, value);
     size_t one_start[] = {0, 1}, one_row[] = {0};
     require(lab_rational_sparse_solve(1, one_start, one_row, value, rhs, answer,
                                      lab_now() - 1), "expired sparse budget");
@@ -237,6 +273,7 @@ static void sparse_rejections(void) {
 int main(void) {
     dense_contract();
     singleton_rows_and_columns();
+    long_triangular_basis();
     large_peeled_basis();
     generated_sparse_cases();
     sparse_rejections();

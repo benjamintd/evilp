@@ -10,4 +10,6 @@ void lab_solution_decimal(FILE *file, double value);
  * A missing objective claim leaves scoring to the independent checker.
  * This performs serialization only, with no feasibility or optimality claim. */
 int lab_solution_write_point(FILE *file, const LabModel *model, const double *point);
+int lab_solution_write_decimals(FILE *file, const LabModel *model, const double *point,
+                                char *const *decimal);
 #endif

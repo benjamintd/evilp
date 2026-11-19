@@ -1,6 +1,17 @@
 # MILP Lab
 
 A C17 laboratory for building and evaluating a new MILP solver.
+
+The [source pricing and pooled assignment report](docs/SOURCE-PRICING-AND-POOLED-ASSIGNMENTS.md) records the latest combined build, the 240-model inventory and eleven matched wins against HiGHS. Earlier builds recorded [nine wins with integer search and sparse LP reconstruction](docs/INTEGER-SEARCH-AND-SPARSE-LP.md), [eight with production and covering methods](docs/PRODUCTION-AND-COVERING.md), and [six with assignment search](docs/ASSIGNMENT-SEARCH.md).
+
+The [binary MILP search](docs/BINARY-MILP-SEARCH.md) adds an optional exact Boolean translation and a bounded Kissat search before the root LP.
+
+The [LP and MILP performance report](docs/LP-INITIALIZATION-AND-PARTITIONING.md)
+covers the optional GLPK basis initializer, native set-partitioning search,
+the 240-instance inventory and matched comparisons with HiGHS. The
+[previous checkpoint](docs/SOLVER-PERFORMANCE-CHECKPOINT.md) completed two
+locked MILP instances at two seconds per model.
+
 Milestone 1 implements the dataset import, independent primal checker,
 native benchmark runner and HiGHS / SCIP / Cbc baseline adapters.
 The current prototype adds sparse LP storage and LU factorization, saved-basis

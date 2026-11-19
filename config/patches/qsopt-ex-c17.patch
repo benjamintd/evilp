@@ -1,0 +1,32 @@
+--- a/qsopt_ex/trace.h
++++ b/qsopt_ex/trace.h
+@@ -34,7 +34,7 @@
+ #else
+ /* the optimizer will take care of this */
+ #define ILL_IFTRACE        if (0) QSlog
+-#define ILL_IFTRACE        if (0) QSlog
++#define ILL_IFTRACE2        if (0) QSlog
+ #define ILL_IFDOTRACE      if (0)
+ #endif
+ 
+--- a/qsopt_ex/simplex.c
++++ b/qsopt_ex/simplex.c
+@@ -974,7 +974,8 @@
+ 		if (EGLPNUM_TYPENAME_EGlpNumIsLess (lp->objbound, lp->dobjval))
+ 		{
+ 			it.solstatus = ILL_BND_REACHED;
+-			QSlog("solstatus = ILL_BND_REACHED = 5 %lf %lf",
++			if (it.sdisplay)
++				QSlog("solstatus = ILL_BND_REACHED = 5 %lf %lf",
+ 									EGLPNUM_TYPENAME_EGlpNumToLf (lp->objbound),
+ 									EGLPNUM_TYPENAME_EGlpNumToLf (lp->dobjval));
+ 			goto TERMINATE;
+@@ -1429,7 +1430,7 @@
+ 				{
+ 					it->solstatus = ILL_BND_REACHED;
+ 					it->nextstep = SIMPLEX_TERMINATE;
+-					/*if (it->sdisplay) */
++					if (it->sdisplay)
+ 					{
+ 						QSlog("bound reached %lf %lf", EGLPNUM_TYPENAME_EGlpNumToLf (lp->objbound),
+ 										EGLPNUM_TYPENAME_EGlpNumToLf (lp->dobjval));

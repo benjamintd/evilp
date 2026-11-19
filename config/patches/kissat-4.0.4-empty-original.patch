@@ -1,0 +1,13 @@
+--- a/src/internal.c
++++ b/src/internal.c
+@@ -319,7 +319,9 @@
+ #if !defined(NDEBUG) || !defined(NPROOFS) || defined(LOGGING)
+     const size_t offset = solver->offset_of_last_original_clause;
+     size_t esize = SIZE_STACK (solver->original) - offset;
+-    int *elits = BEGIN_STACK (solver->original) + offset;
++    int *elits = BEGIN_STACK (solver->original);
++    if (offset)
++      elits += offset;
+     assert (esize <= UINT_MAX);
+ #endif
+     ADD_UNCHECKED_EXTERNAL (esize, elits);

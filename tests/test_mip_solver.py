@@ -119,6 +119,42 @@ def generated_models(count=300):
 
 
 class MilpSolver(unittest.TestCase):
+    def test_fractional_lp_bound_between_discrete_objective_values(self):
+        # The LP buys 11.5 units. Every integer solution needs at least 12.
+        # Both senses exercise the normalized incumbent, including offsets.
+        n = 24
+        for maximize in (False, True):
+            sign = -1 if maximize else 1
+            model = {'cost': [sign * F(1, 4)] * n, 'integer': [True] * n,
+                     'bounds': [(0, 1)] * n, 'rows': [([2] * n, 23, None)],
+                     'maximize': maximize, 'offset': 123}
+            code, result, values = self.invoke(
+                model, ['--no-presolve', '--no-root-cuts', '--node-limit', '3'])
+            self.assertEqual((code, result['status']), (0, 'optimal'), result)
+            self.assertEqual(self.assert_point(model, result, values), 123 + sign * 3)
+            self.assertGreater(result['objective_lattice_prunes'], 0)
+            _, ablated, _ = self.invoke(model, ['--no-presolve', '--no-root-cuts',
+                                                '--no-objective-lattice', '--node-limit', '3'])
+            self.assertEqual(ablated['status'], 'node_limit')
+
+    def test_continuous_cost_can_improve_by_less_than_integer_step(self):
+        model = {'cost': [4, 4, F(1, 8)], 'integer': [True, True, False],
+                 'bounds': [(0, 1)] * 2 + [(0, 9)],
+                 'rows': [([2, 3, 1], 4, None), ([1, 1, 0], 1, None)]}
+        self.compare(model, ['--no-presolve', '--no-root-cuts'])
+
+    def test_rounded_decimal_cost_cannot_enlarge_objective_step(self):
+        n = 24
+        model = {'cost': [F(1, 4)] * n, 'integer': [True] * n,
+                 'bounds': [(0, 1)] * n, 'rows': [([2] * n, 23, None)]}
+        # This decimal and 0.25 have the same binary double. The true
+        # objective step is 1e-18, which cannot close this root LP gap.
+        text = integer_mps(model).replace('x0 OBJ 0.25\n', 'x0 OBJ 0.250000000000000001\n')
+        self.assertIn('0.250000000000000001', text)
+        _, result, _ = self.invoke(text, ['--no-presolve', '--no-root-cuts', '--node-limit', '3'])
+        self.assertEqual(result['status'], 'node_limit', result)
+        self.assertEqual(result['objective_lattice_prunes'], 0)
+
     def invoke(self, model, extra=(), *, mode='--mip', checker=True):
         with tempfile.TemporaryDirectory(prefix='milp oracle ') as td:
             root = pathlib.Path(td)
@@ -155,6 +191,41 @@ class MilpSolver(unittest.TestCase):
                     self.assertTrue(json.loads(q.stdout)['checked_feasible'])
             self.assertEqual(bool(result.get('has_primal')), bool(values), result)
             return p.returncode, result, values
+
+    def test_binary_search_against_full_enumeration(self):
+        rng = random.Random(7085)
+        for sign, maximize in ((1, False), (-1, True)):
+            n = 16
+            weights = [rng.randrange(-9, 10) for _ in range(n)]
+            cover = [rng.randrange(-6, 7) for _ in range(n)]
+            costs = [rng.randrange(-12, 13) for _ in range(n)]
+            model = {'integer': [True]*n + [False], 'maximize': maximize,
+                     'bounds': [(0, 1)]*n + [(-4, 3)], 'offset': 7,
+                     'cost': costs + [-5],
+                     'rows': [(weights + [sign], 2, 2), (cover + [0], -3, 5)]}
+            scores = []
+            for bits in itertools.product((0, 1), repeat=n):
+                slack = sign * (2 - sum(a*x for a,x in zip(weights,bits)))
+                if -4 <= slack <= 3 and -3 <= sum(a*x for a,x in zip(cover,bits)) <= 5:
+                    scores.append(7 - 5*slack + sum(c*x for c,x in zip(costs,bits)))
+            code, result, _ = self.invoke(model)
+            self.assertEqual(code, 0, result)
+            self.assertEqual(result['binary_search_queries'], 256)
+            self.assertEqual(result['status'], 'optimal')
+            self.assertEqual(result['objective'], (max if maximize else min)(scores))
+
+        # Decimal coefficients and bounds rounded to a binary integer must
+        # force the usual solver path. Keep the root relaxation trivial.
+        model = {'integer': [True]*16, 'bounds': [(0,1)]*16, 'cost': [1]*16,
+                 'rows': [([1]*16, None, 5)]}
+        source = integer_mps(model)
+        for old, new in [('x0 r0 1', 'x0 r0 1.000000000000000001'),
+                         ('x0 OBJ 1', 'x0 OBJ 0.999999999999999999'),
+                         ('rhs r0 5', 'rhs r0 5.000000000000000001')]:
+            self.assertIn(old, source)
+            code, result, _ = self.invoke(source.replace(old, new))
+            self.assertEqual(result['binary_search_queries'], 0)
+            self.assertEqual((code, result['objective']), (0, 0))
 
     def assert_point(self, model, result, values):
         self.assertEqual(set(values), {f'x{j}' for j in range(len(model['cost']))}, result)
@@ -255,7 +326,7 @@ class MilpSolver(unittest.TestCase):
         for extra, status in [(['--node-limit', '1'], 'node_limit'),
                               (['--time-limit', '0.000000000001'], 'time_limit')]:
             with self.subTest(extra=extra):
-                code, result, _ = self.invoke(model, extra)
+                code, result, _ = self.invoke(model, [*extra, '--no-objective-lattice'])
                 self.assertEqual(code, 4, result)
                 self.assertEqual(result['status'], status, result)
                 self.assertFalse(result.get('certifies_optimality', False))
@@ -314,7 +385,7 @@ class MilpSolver(unittest.TestCase):
                     # Preserve the branching-policy experiment: root cuts can
                     # close these independent rounding gaps before branching.
                     result = self.compare(model, ['--no-presolve', '--no-root-cuts',
-                                                   '--trace', trace, *flags])
+                                                   '--no-objective-lattice', '--trace', trace, *flags])
                     events = [json.loads(line) for line in trace.read_text().splitlines()]
                     branches = [(event['variable'], event['value']) for event in events
                                 if event['event'] == 'branch']
@@ -329,7 +400,7 @@ class MilpSolver(unittest.TestCase):
         # with LP bound1.5 remains. Hitting a limit must keep that witness.
         model = {'cost': [1, 1], 'bounds': [(0, 1), (0, 1)], 'integer': [True, True],
                  'rows': [([2, 2], None, 3)], 'maximize': True}
-        code, result, values = self.invoke(model, ['--node-limit', '2'])
+        code, result, values = self.invoke(model, ['--node-limit', '2', '--no-objective-lattice'])
         self.assertEqual(code, 4, result)
         self.assertEqual(result['status'], 'node_limit', result)
         self.assertTrue(result['has_primal'], result)
@@ -384,7 +455,7 @@ class MilpSolver(unittest.TestCase):
             traces = []
             for version in (1, 2):
                 trace = root / f'trace-{version}.jsonl'
-                p = subprocess.run([SOLVER, str(path), '--mip', '--trace', str(trace)],
+                p = subprocess.run([SOLVER, str(path), '--mip', '--no-objective-lattice', '--trace', str(trace)],
                                    text=True, capture_output=True, timeout=30)
                 result = json.loads(p.stdout)
                 self.assertEqual(p.returncode, 0, result)

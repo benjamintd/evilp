@@ -7,8 +7,9 @@
 typedef struct {
     LabLpOptions lp;
     double time_limit;
-    size_t node_limit;
-    int cold, no_presolve, first_fractional, no_root_cuts, no_root_diving;
+    size_t node_limit, sat_decision_limit;
+    int binary_sat; /* -1 off, 0 automatic, 1 force eligibility check */
+    int cold, no_presolve, first_fractional, no_root_cuts, no_root_diving, no_objective_lattice;
     const char *trace_path;
 } LabBbOptions;
 
@@ -16,10 +17,12 @@ typedef struct {
     const char *status;
     char message[256];
     double *primal;
+    char **primal_decimal;
+    size_t primal_columns;
     double objective, best_bound, elapsed;
     int has_primal, has_bound, bound_certified;
     size_t nodes, lp_solves, lp_iterations, refactorizations;
-    size_t warm_starts, cold_starts, pruned_nodes;
+    size_t warm_starts, cold_starts, pruned_nodes, objective_lattice_prunes;
     size_t dual_iterations, cold_fallbacks, factor_nnz_peak, standard_nnz_peak;
     size_t refinement_steps, scaled_rows, scaled_columns;
     double initial_backward_error, max_backward_error;
@@ -33,7 +36,8 @@ typedef struct {
     size_t basis_updates, basis_update_rejections;
     size_t factor_core_peak, singleton_eliminations_peak;
     size_t presolve_passes, presolve_tightenings, presolve_fixed, presolve_rows;
-    size_t branch_observations;
+    size_t flow_eliminations, flow_terminal_states, packing_attempts, sat_calls, branch_observations, binary_search_queries, partition_nodes;
+    size_t glpk_basis_iterations, glpk_bases_accepted;
     size_t primal_accepted_pivots, primal_zero_steps, primal_short_steps, pricing_bland_fallbacks;
     size_t primal_candidate_rejections;
     size_t source_pricing_attempts, source_pricing_pivots, source_pricing_completions;

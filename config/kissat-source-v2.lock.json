@@ -1,0 +1,16 @@
+{
+  "component": "Kissat",
+  "version": "4.0.4",
+  "role": "Optional C SAT backend for bounded binary MILPs",
+  "source_url": "https://github.com/arminbiere/kissat/archive/refs/tags/rel-4.0.4.tar.gz",
+  "archive_sha256": "bfe93eaa6323b48011e4b1fcf74b3f2e20f9de544767e728009e5b2018296193",
+  "license": "MIT",
+  "license_file_in_archive": "kissat-rel-4.0.4/LICENSE",
+  "upstream_changes": [
+    {
+      "path": "config/patches/kissat-4.0.4-empty-original.patch",
+      "sha256": "2e5a6521d0e269c7c36b10da23e4cbfee4af24df7a67f64a9e40695a2ff7560f",
+      "reason": "Avoid pointer arithmetic on an unallocated original-clause stack."
+    }
+  ]
+}

@@ -77,12 +77,14 @@ class RootCutSearch(unittest.TestCase):
 
     def test_packing_reduces_nodes_across_backends_and_cold_search(self):
         text = model_text([2, 2], [1, 1], 3)
-        control, _ = self.solve(text, ['--no-presolve', '--no-root-cuts'])
+        # Isolate the cut's node savings. On its own the objective lattice
+        # also closes this particular packing gap at the root.
+        control, _ = self.solve(text, ['--no-presolve', '--no-objective-lattice', '--no-root-cuts'])
         self.assertEqual(control['root_cut_status'], 'disabled')
         for flags in [[], ['--cold'], ['--backend', 'dense'], ['--no-scaling'],
                       ['--no-updates']]:
             with self.subTest(flags=flags):
-                result, _ = self.solve(text, ['--no-presolve', *flags])
+                result, _ = self.solve(text, ['--no-presolve', '--no-objective-lattice', *flags])
                 self.assertEqual(result['objective'], 1)
                 self.assertGreater(result['root_cuts'], 0)
                 self.assertEqual(result['root_cut_lp_solves'], 1)

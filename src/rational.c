@@ -9,8 +9,118 @@ static size_t bits(const mpq_t q) {
     size_t d = mpz_sizeinbase(mpq_denref(q), 2);
     return p > d ? p : d;
 }
-int lab_rational_solve(size_t n, mpq_t *a, mpq_t *rhs, double deadline) {
-    if (n > LAB_RATIONAL_MAX_DIMENSION || !isfinite(deadline) || lab_now() >= deadline ||
+/* Fraction-free elimination. Rational row denominators are cleared once;
+ * exact integer divisions replace repeated rational GCD reduction. A failed
+ * cap or divisibility check falls back to the original bounded solver. */
+static int rational_fraction_free(size_t n, mpq_t *a, mpq_t *rhs, double deadline) {
+    size_t width = n + 1;
+    mpz_t *z = lab_alloc(n * width, sizeof(mpz_t));
+    for (size_t i = 0; i < n * width; i++)
+        mpz_init(z[i]);
+    mpz_t lcm, factor, previous, pivot_value, term, numerator;
+    mpz_inits(lcm, factor, previous, pivot_value, term, numerator, NULL);
+    mpz_set_ui(previous, 1);
+    int bad = 0;
+    for (size_t i = 0; i < n && !bad; i++) {
+        mpz_set_ui(lcm, 1);
+        for (size_t j = 0; j <= n; j++) {
+            mpq_srcptr q = j == n ? rhs[i] : a[i * n + j];
+            mpz_lcm(lcm, lcm, mpq_denref(q));
+            if (mpz_sizeinbase(lcm, 2) > LAB_RATIONAL_MAX_BITS || lab_now() >= deadline) {
+                bad = 1;
+                break;
+            }
+        }
+        for (size_t j = 0; j <= n && !bad; j++) {
+            mpq_srcptr q = j == n ? rhs[i] : a[i * n + j];
+            mpz_divexact(factor, lcm, mpq_denref(q));
+            mpz_mul(z[i * width + j], factor, mpq_numref(q));
+            if (mpz_sizeinbase(z[i * width + j], 2) > LAB_RATIONAL_MAX_BITS)
+                bad = 1;
+        }
+    }
+    for (size_t k = 0; k < n && !bad; k++) {
+        size_t pivot = SIZE_MAX, cost = SIZE_MAX;
+        for (size_t i = k; i < n; i++)
+            if (mpz_sgn(z[i * width + k]) && mpz_sizeinbase(z[i * width + k], 2) < cost) {
+                pivot = i;
+                cost = mpz_sizeinbase(z[i * width + k], 2);
+            }
+        if (pivot == SIZE_MAX || lab_now() >= deadline) {
+            bad = 1;
+            break;
+        }
+        if (pivot != k)
+            for (size_t j = k; j <= n; j++)
+                mpz_swap(z[k * width + j], z[pivot * width + j]);
+        mpz_set(pivot_value, z[k * width + k]);
+        for (size_t i = k + 1; i < n && !bad; i++) {
+            for (size_t j = k + 1; j <= n; j++) {
+                mpz_mul(numerator, pivot_value, z[i * width + j]);
+                mpz_mul(term, z[i * width + k], z[k * width + j]);
+                mpz_sub(numerator, numerator, term);
+                if (!mpz_divisible_p(numerator, previous)) {
+                    bad = 1;
+                    break;
+                }
+                mpz_divexact(z[i * width + j], numerator, previous);
+                if (mpz_sizeinbase(z[i * width + j], 2) > LAB_RATIONAL_MAX_BITS ||
+                    lab_now() >= deadline) {
+                    bad = 1;
+                    break;
+                }
+            }
+            mpz_set_ui(z[i * width + k], 0);
+        }
+        mpz_set(previous, pivot_value);
+    }
+    mpq_t *answer = lab_alloc(n, sizeof(mpq_t));
+    for (size_t i = 0; i < n; i++)
+        mpq_init(answer[i]);
+    mpq_t coefficient, product, total;
+    mpq_inits(coefficient, product, total, NULL);
+    for (size_t i = n; i-- > 0 && !bad;) {
+        mpq_set_z(answer[i], z[i * width + n]);
+        for (size_t j = i + 1; j < n; j++) {
+            mpq_set_z(coefficient, z[i * width + j]);
+            mpq_mul(product, coefficient, answer[j]);
+            mpq_sub(answer[i], answer[i], product);
+        }
+        mpq_set_z(coefficient, z[i * width + i]);
+        mpq_div(answer[i], answer[i], coefficient);
+        if (bits(answer[i]) > LAB_RATIONAL_MAX_BITS || lab_now() >= deadline)
+            bad = 1;
+    }
+    /* Verify against the untouched rational input, including RHS. */
+    for (size_t i = 0; i < n && !bad; i++) {
+        mpq_set_ui(total, 0, 1);
+        for (size_t j = 0; j < n; j++) {
+            mpq_mul(product, a[i * n + j], answer[j]);
+            mpq_add(total, total, product);
+            if (bits(total) > LAB_RATIONAL_MAX_BITS || lab_now() >= deadline) {
+                bad = 1;
+                break;
+            }
+        }
+        if (mpq_cmp(total, rhs[i]))
+            bad = 1;
+    }
+    if (!bad)
+        for (size_t i = 0; i < n; i++)
+            mpq_set(rhs[i], answer[i]);
+    for (size_t i = 0; i < n; i++)
+        mpq_clear(answer[i]);
+    free(answer);
+    mpq_clears(coefficient, product, total, NULL);
+    mpz_clears(lcm, factor, previous, pivot_value, term, numerator, NULL);
+    for (size_t i = 0; i < n * width; i++)
+        mpz_clear(z[i]);
+    free(z);
+    return bad ? -1 : 0;
+}
+
+static int solve_dense(size_t n, mpq_t *a, mpq_t *rhs, double deadline) {
+    if (!isfinite(deadline) || lab_now() >= deadline ||
         (n && (!a || !rhs)))
         return -1;
     for (size_t i = 0; i < n * n; i++)
@@ -19,6 +129,8 @@ int lab_rational_solve(size_t n, mpq_t *a, mpq_t *rhs, double deadline) {
     for (size_t i = 0; i < n; i++)
         if (bits(rhs[i]) > LAB_RATIONAL_MAX_BITS)
             return -1;
+    if (!rational_fraction_free(n, a, rhs, deadline))
+        return 0;
     mpq_t factor, term;
     mpq_inits(factor, term, NULL);
     int bad = 0;
@@ -72,6 +184,10 @@ int lab_rational_solve(size_t n, mpq_t *a, mpq_t *rhs, double deadline) {
     }
     mpq_clears(factor, term, NULL);
     return bad ? -1 : 0;
+}
+
+int lab_rational_solve(size_t n, mpq_t *a, mpq_t *rhs, double deadline) {
+    return n <= LAB_RATIONAL_MAX_DIMENSION ? solve_dense(n, a, rhs, deadline) : -1;
 }
 
 static int acceptable(const mpq_t q) {
@@ -149,6 +265,20 @@ int lab_rational_sparse_solve(size_t n, const size_t *start, const size_t *row,
     }
     mpq_t term, total;
     mpq_inits(term, total, NULL);
+    /* Degrees only decrease. A row or column enters its queue at most
+     * once, when it becomes a singleton. Rows consumed by column pivots
+     * (and conversely) are discarded lazily. */
+    size_t *row_queue = lab_alloc(n, sizeof *row_queue);
+    size_t *col_queue = lab_alloc(n, sizeof *col_queue);
+    size_t row_head = 0, row_tail = 0, col_head = 0, col_tail = 0;
+    for (size_t i = 0; i < n; ++i) {
+        if (!row_degree[i] || !col_degree[i])
+            bad = 1;
+        if (row_degree[i] == 1)
+            row_queue[row_tail++] = i;
+        if (col_degree[i] == 1)
+            col_queue[col_tail++] = i;
+    }
     size_t remaining = n, step = 0, deferred = 0;
     while (remaining && !bad) {
         if (lab_now() >= deadline) {
@@ -156,18 +286,17 @@ int lab_rational_sparse_solve(size_t n, const size_t *start, const size_t *row,
             break;
         }
         size_t column = SIZE_MAX, equation = SIZE_MAX;
-        for (size_t i = 0; i < n; i++) {
-            if ((active_row[i] && !row_degree[i]) || (active_col[i] && !col_degree[i])) {
-                bad = 1;
+        while (col_head < col_tail && !active_col[col_queue[col_head]])
+            ++col_head;
+        if (col_head < col_tail) {
+            column = col_queue[col_head++];
+        } else {
+            while (row_head < row_tail && !active_row[row_queue[row_head]])
+                ++row_head;
+            if (row_head == row_tail)
                 break;
-            }
-            if (active_col[i] && col_degree[i] == 1 && column == SIZE_MAX)
-                column = i;
-            if (active_row[i] && row_degree[i] == 1 && equation == SIZE_MAX)
-                equation = i;
+            equation = row_queue[row_head++];
         }
-        if (bad || (column == SIZE_MAX && equation == SIZE_MAX))
-            break;
         if (column != SIZE_MAX) {
             /* This variable appears only in the removed equation. Its value
              * is deferred until all variables still in that equation are known. */
@@ -189,8 +318,12 @@ int lab_rational_sparse_solve(size_t n, const size_t *start, const size_t *row,
             removed_at[column] = step++;
             for (size_t p = row_start[equation]; p < row_start[equation + 1]; p++) {
                 size_t j = entry_col[row_entry[p]];
-                if (active_col[j])
-                    col_degree[j]--;
+                if (active_col[j]) {
+                    if (--col_degree[j] == 1)
+                        col_queue[col_tail++] = j;
+                    else if (!col_degree[j])
+                        bad = 1;
+                }
             }
         } else {
             /* A singleton equation gives this variable directly. Substitute
@@ -221,7 +354,10 @@ int lab_rational_sparse_solve(size_t n, const size_t *start, const size_t *row,
                     continue;
                 mpq_mul(term, value[k], answer[column]);
                 mpq_sub(b[i], b[i], term);
-                row_degree[i]--;
+                if (--row_degree[i] == 1)
+                    row_queue[row_tail++] = i;
+                else if (!row_degree[i])
+                    bad = 1;
                 if (!acceptable(term) || !acceptable(b[i])) {
                     bad = 1;
                     break;
@@ -230,7 +366,7 @@ int lab_rational_sparse_solve(size_t n, const size_t *start, const size_t *row,
         }
         remaining--;
     }
-    if (remaining > LAB_RATIONAL_MAX_DIMENSION)
+    if (remaining > LAB_RATIONAL_SPARSE_MAX_CORE)
         bad = 1;
     if (!bad && remaining) {
         mpq_t *a = new_vector(remaining * remaining), *core_rhs = new_vector(remaining);
@@ -250,7 +386,7 @@ int lab_rational_sparse_solve(size_t n, const size_t *start, const size_t *row,
                 c++;
             }
         if (r != remaining || c != remaining ||
-            lab_rational_solve(remaining, a, core_rhs, deadline))
+            solve_dense(remaining, a, core_rhs, deadline))
             bad = 1;
         if (!bad)
             for (size_t j = 0; j < remaining; j++)
@@ -317,6 +453,8 @@ int lab_rational_sparse_solve(size_t n, const size_t *start, const size_t *row,
     free(removed_at);
     free(deferred_col);
     free(deferred_row);
+    free(col_queue);
+    free(row_queue);
     free(deferred_pivot);
     return bad ? -1 : 0;
 }

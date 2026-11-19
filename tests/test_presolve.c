@@ -296,6 +296,52 @@ static void cancellation_and_source_boxes(const char *checker) {
             "new finite overlay does not mistake an infinite-source placeholder for zero");
     unlink(path); lab_model_free(&m); lab_presolve_result_free(&r);
 }
+static void parity_equalities(void) {
+    /* Free integer columns absorb even residuals. Neither equality alone
+     * fixes y, and replacing v by a continuous variable removes the parity
+     * condition on x entirely. */
+    size_t start[] = {0,2,3,4,5}, row[] = {0,1,0,0,1};
+    double a[] = {1,1,1,2,-2}, lo[] = {0,0,-INFINITY,-INFINITY};
+    double hi[] = {1,1,INFINITY,INFINITY}, b[] = {-1,0};
+    unsigned char integer[] = {1,1,1,1};
+    LabModel m = {.rows=2, .cols=4, .nnz=5, .col_start=start, .row_index=row,
+                  .value=a, .integer=integer, .col_lower=lo, .col_upper=hi,
+                  .row_lower=b, .row_upper=b};
+    LabPresolveOptions opt = options();
+    LabPresolveResult r;
+    lab_presolve(&m, NULL, NULL, &opt, &r);
+    require(!strcmp(r.status, "unresolved") && r.upper[0] == 0 && r.lower[1] == 1,
+            "combined integer equalities determine both binary variables");
+    lab_presolve_result_free(&r);
+    opt.relax = 1;
+    lab_presolve(&m, NULL, NULL, &opt, &r);
+    require(r.lower[1] == 0 && r.upper[0] == 1, "parity does not constrain the LP");
+    lab_presolve_result_free(&r);
+    integer[3] = 0;
+    opt.relax = 0;
+    lab_presolve(&m, NULL, NULL, &opt, &r);
+    require(r.lower[1] == 0 && r.upper[0] == 1, "continuous even coefficient prevents inference");
+    lab_presolve_result_free(&r);
+    integer[3] = 1;
+    a[1] = 2;
+    b[1] = -1;
+    lab_presolve(&m, NULL, NULL, &opt, &r);
+    require(!strcmp(r.status, "infeasible"), "odd RHS contradicts an all-even integer row");
+    lab_presolve_result_free(&r);
+    /* Rounding this source coefficient to 2 would incorrectly reject the
+     * exact feasible point x=10^17, v=-10^17. */
+    char path[64];
+    LabModel decimal = {0};
+    read_text(&decimal, "NAME DECIMAL\nROWS\n N O\n E R\nCOLUMNS\n"
+        " x R 2.00000000000000001\n v R 2\nRHS\n b R 1\nBOUNDS\n"
+        " LI b x 0\n LI b v -1e18\nENDATA\n", path);
+    lab_presolve(&decimal, NULL, NULL, &opt, &r);
+    require(strcmp(r.status, "infeasible"), "rounded decimal coefficient has no parity");
+    unlink(path);
+    lab_model_free(&decimal);
+    lab_presolve_result_free(&r);
+}
+
 static void ranges_relaxation_and_limits(void) {
     const char *kinds[] = {"L", "G", "E", "E"};
     const long ranges[] = {2, -2, 2, -2}, expected_lo[] = {3, 5, 5, 3};
@@ -355,8 +401,27 @@ static void ranges_relaxation_and_limits(void) {
     require(!strcmp(r.status, "input_error"), "numerical overlay cannot widen original domain");
     lab_presolve_result_free(&r);
 }
+static void duplicate_clique_column(void) {
+    /* x + y <= 1 and x + x + y >= 2 admit exactly (x,y) = (1,0). */
+    size_t start[] = {0, 3, 5}, row[] = {0, 1, 1, 0, 1};
+    double a[] = {1, 1, 1, 1, 1}, lo[] = {0, 0}, hi[] = {1, 1};
+    double rl[] = {-INFINITY, 2}, ru[] = {1, INFINITY};
+    unsigned char integer[] = {1, 1};
+    LabModel m = {.rows = 2, .cols = 2, .nnz = 5, .col_start = start,
+                  .row_index = row, .value = a, .col_lower = lo, .col_upper = hi,
+                  .row_lower = rl, .row_upper = ru, .integer = integer};
+    LabPresolveOptions opt = options();
+    LabPresolveResult r;
+    lab_presolve(&m, NULL, NULL, &opt, &r);
+    require(!strcmp(r.status, "unresolved") && r.upper[0] == 1 && r.upper[1] == 0,
+            "clique probing keeps every coefficient of the column fixed to one");
+    lab_presolve_result_free(&r);
+}
+
 int main(int argc, char **argv) {
+    duplicate_clique_column();
     generated_integer_oracles();
+    parity_equalities();
     one_sided_bounds_and_constants();
     large_sparse_chain();
     generated_decimal_oracles();

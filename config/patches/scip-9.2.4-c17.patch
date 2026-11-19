@@ -1,0 +1,92 @@
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -185,7 +185,7 @@
+     endif()
+ elseif(SYM STREQUAL "none")
+     message(STATUS "Support SYM: OFF")
+-    set(sym symmetry/compute_symmetry_none.cpp)
++    set(sym symmetry/compute_symmetry_none.c)
+ else()
+     message(FATAL_ERROR "option SYM has wrong value")
+ endif()
+@@ -312,10 +312,10 @@
+    file(STRINGS \${DST} GITHASH_OLD)
+    string(REGEX REPLACE \"#define SCIP_GITHASH \\\"(.*)\\\"\" \"\\\\1\" GITHASH_OLD \"\${GITHASH_OLD}\")
+ endif()
+-if((GIT) AND (EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/.git))
++if((GIT) AND (EXISTS \"${CMAKE_CURRENT_SOURCE_DIR}/.git\"))
+    execute_process(
+       COMMAND \${GIT} describe --always --dirty
+-      WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
++      WORKING_DIRECTORY \"${CMAKE_CURRENT_SOURCE_DIR}\"
+       OUTPUT_VARIABLE GITHASH OUTPUT_STRIP_TRAILING_WHITESPACE)
+    string(REGEX REPLACE \"^.*-g\" \"\" GITHASH \"\${GITHASH}\")
+    if(NOT \${GITHASH} STREQUAL \"\${GITHASH_OLD}\")
+--- a/cmake/Modules/FindGMP.cmake
++++ b/cmake/Modules/FindGMP.cmake
+@@ -36,7 +36,7 @@
+         PATH_SUFFIXES lib)
+ endif()
+ 
+-SET(GMP_LIBRARIES ${GMP_LIBRARY} ${GMPXX_LIBRARY})
++SET(GMP_LIBRARIES ${GMP_LIBRARY})
+ 
+ # look for mpir library and include files when gmp could not be found
+ if(NOT GMP_LIBRARIES)
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -8,7 +8,7 @@
+         OUTPUT_NAME ${outputname})
+ endfunction(setLibProperties)
+ 
+-set(CMAKE_C_STANDARD 99)
++set(CMAKE_C_STANDARD 17)
+ set(CMAKE_C_STANDARD_REQUIRED on)
+ set(CMAKE_C_EXTENSIONS OFF)
+ 
+@@ -183,7 +183,7 @@
+     scip/nodesel_hybridestim.c
+     scip/nodesel_restartdfs.c
+     scip/nodesel_uct.c
+-    scip/presol_milp.cpp
++    scip/presol_milp.c
+     scip/presol_boundshift.c
+     scip/presol_convertinttobin.c
+     scip/presol_domcol.c
+@@ -1019,7 +1019,7 @@
+ 
+ # all source files should be compiled with a c++ compiler
+ if(CXXONLY)
+-    set_source_files_properties(main.c ${scipsources} ${objscipsources} ${lpisources} ${tpisources} ${symsources} PROPERTIES LANGUAGE CXX)
++    set_source_files_properties(main.c ${scipsources}  ${lpisources} ${tpisources} ${symsources} PROPERTIES LANGUAGE CXX)
+ 
+     # for the clang compiler this suppresses the warnings about treating 'c' input as 'c++' when CXXONLY is enabled
+     if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+@@ -1037,7 +1037,7 @@
+     scip/message.c)
+ setLibProperties(liblpi "lpi")
+ 
+-add_library(libscip ${scipsources} ${objscipsources} ${lpisources} ${tpisources} ${symsources})
++add_library(libscip ${scipsources}  ${lpisources} ${tpisources} ${symsources})
+ 
+ if(MSVC)
+    # msvc otherwise is not smart enough and tries to link the scip.exe binary as a library
+@@ -1066,7 +1066,7 @@
+ set(ZIMPL_NEEDED 0)
+ if(SHARED)
+     target_link_libraries(libscip PRIVATE ${ZIMPL_PIC_LIBRARIES} ${LPS_PIC_LIBRARIES} ${SYM_PIC_LIBRARIES})
+-    add_executable(scip main.c ${scipsources} ${objscipsources} ${lpisources} ${tpisources} ${symsources})
++    add_executable(scip main.c ${scipsources}  ${lpisources} ${tpisources} ${symsources})
+ else()
+     if(SOPLEX_FOUND)
+         set(SOPLEX_NEEDED 1)
+--- a/src/lpi/lpi_qso.c
++++ b/src/lpi/lpi_qso.c
+@@ -477,6 +477,7 @@
+    SCIP_ALLOC( BMSallocMemory(lpi) );
+    memset(*lpi, 0, sizeof(struct SCIP_LPi));
+ 
++   QSexactStart();
+    (*lpi)->prob = QScreate_prob(name, (int) objsen);
+    if ( (*lpi)->prob == NULL )
+    {

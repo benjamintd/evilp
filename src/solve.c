@@ -28,7 +28,7 @@ static int positive_size(const char *s, size_t *n, size_t cap) {
     *n = (size_t)v;
     return 0;
 }
-static int write_vector(const char *path, const LabModel *m, const LabLpResult *r, int dual) {
+static int write_vector(const char *path, const LabModel *m, const LabLpResult *r, int dual, char *const *decimal) {
     if (!path)
         return 0;
     FILE *f = fopen(path, "wx");
@@ -37,11 +37,14 @@ static int write_vector(const char *path, const LabModel *m, const LabLpResult *
     if (dual) {
         for (size_t i = 0; i < m->rows; i++) {
             fprintf(f, "%s ", m->row_name[i]);
-            lab_solution_decimal(f, r->dual[i]);
+            if (r->dual_rational && i < r->dual_rows)
+                fputs(r->dual_rational[i], f);
+            else
+                lab_solution_decimal(f, r->dual[i]);
             fputc('\n', f);
         }
     } else {
-        if (lab_solution_write_point(f, m, r->primal)) {
+        if (lab_solution_write_decimals(f, m, r->primal, decimal)) {
             fclose(f);
             return -1;
         }
@@ -80,10 +83,13 @@ int main(int argc, char **argv) {
              "          [--time-limit SECONDS] [--iteration-limit N] [--max-dimension N]\n"
              "          [--backend sparse|dense]\n"
              "          [--no-scaling] [--no-refinement] [--no-exact] [--bland-ratio]\n"
-             "          [--no-primal-repair] [--no-updates] [--bland-pricing] [--keep-bound-rows]\n"
+             "          [--no-primal-repair] [--no-updates] [--bland-pricing] [--adaptive-pricing|--legacy-pricing] [--fast-residual|--full-residual] [--crash-basis] [--glpk-basis|--no-glpk-basis] [--packing-bounds|--no-packing-bounds] [--keep-bound-rows]\n"
              "          LP: [--dual NEW_FILE] [--farkas NEW_FILE] [--basis NEW_FILE] [--read-basis FILE]\n"
              "          MILP: [--node-limit N] [--cold] [--trace NEW_FILE]\n"
-             "                [--no-presolve] [--first-fractional] [--no-root-cuts] [--no-root-diving]\n"
+             "                [--no-presolve] [--first-fractional] [--no-root-cuts] [--no-root-diving] [--no-objective-lattice]\n"
+#ifdef LAB_KISSAT
+             "                [--binary-sat|--no-binary-sat]\n"
+#endif
              "C17 LP and numerical branch-and-bound prototype. Select problem mode explicitly.\n"
              "JSON statuses are numerical solver claims; use milpcheck for validation.\n"
              "Sparse standard-form limit16000000; dense hard cap4096. Sparse basis limit8000000.");
@@ -91,8 +97,10 @@ int main(int argc, char **argv) {
     }
     const char *path = NULL, *solution = NULL, *dual = NULL, *trace_path = NULL, *farkas = NULL;
     int relax = 0, mip = 0, cold = 0, node_limit_set = 0, dimension_limit_set = 0;
+    int binary_sat = 0, no_objective_lattice = 0;
     int no_presolve = 0, first_fractional = 0, no_root_cuts = 0, no_root_diving = 0;
-    size_t node_limit = 100000;
+    int basis_initializer_set = 0, pricing_set = 0, residual_set = 0, packing_set = 0;
+    size_t node_limit = 10000000;
     LabLpOptions options = {.time_limit = 60, .iteration_limit = 100000,
                             .max_dimension = LAB_LP_SPARSE_DIMENSION_LIMIT};
     for (int i = 1; i < argc; i++) {
@@ -111,20 +119,51 @@ int main(int argc, char **argv) {
             options.no_exact = 1;
         } else if (!strcmp(a, "--bland-ratio")) {
             options.bland_ratio = 1;
+        } else if (!strcmp(a, "--glpk-basis") || !strcmp(a, "--no-glpk-basis")) {
+            basis_initializer_set = 1;
+#ifdef LAB_GLPK_BASIS
+            options.glpk_basis = !strcmp(a, "--glpk-basis");
+#else
+            if (!strcmp(a, "--glpk-basis"))
+                return error("unsupported", "GLPK basis initializer is unavailable in this build", 3);
+#endif
+        } else if (!strcmp(a, "--crash-basis")) {
+            options.crash_basis = 1;
+        } else if (!strcmp(a, "--fast-residual")) {
+            options.fast_residual = 1;
+            residual_set = 1;
+        } else if (!strcmp(a, "--full-residual")) {
+            options.fast_residual = 0;
+            residual_set = 1;
+        } else if (!strcmp(a, "--adaptive-pricing")) {
+            options.adaptive_pricing = 1;
+            pricing_set = 1;
+        } else if (!strcmp(a, "--legacy-pricing")) {
+            options.adaptive_pricing = 0;
+            pricing_set = 1;
         } else if (!strcmp(a, "--bland-pricing")) {
             options.bland_pricing = 1;
         } else if (!strcmp(a, "--no-primal-repair")) {
             options.no_primal_repair = 1;
         } else if (!strcmp(a, "--no-updates")) {
             options.no_updates = 1;
+        } else if (!strcmp(a, "--packing-bounds") || !strcmp(a, "--no-packing-bounds")) {
+            options.packing_bounds = !strcmp(a, "--packing-bounds");
+            packing_set = 1;
         } else if (!strcmp(a, "--keep-bound-rows")) {
             options.keep_bound_rows = 1;
+#ifdef LAB_KISSAT
+        } else if (!strcmp(a, "--binary-sat") || !strcmp(a, "--no-binary-sat")) {
+            binary_sat = !strcmp(a, "--binary-sat") ? 1 : -1;
+#endif
         } else if (!strcmp(a, "--no-presolve")) {
             no_presolve = 1;
         } else if (!strcmp(a, "--first-fractional")) {
             first_fractional = 1;
         } else if (!strcmp(a, "--no-root-cuts")) {
             no_root_cuts = 1;
+        } else if (!strcmp(a, "--no-objective-lattice")) {
+            no_objective_lattice = 1;
         } else if (!strcmp(a, "--no-root-diving")) {
             no_root_diving = 1;
         } else if (!strcmp(a, "--solution") || !strcmp(a, "--dual") || !strcmp(a, "--basis") ||
@@ -185,33 +224,53 @@ int main(int argc, char **argv) {
     if (mip && (dual || farkas || options.basis_in || options.basis_out))
         return error("input_error",
                      "Dual/basis files are LP-only; MILP tree proofs are not implemented", 2);
-    if (!mip && (cold || node_limit_set || trace_path || no_presolve || first_fractional ||
-                 no_root_cuts))
+    if (!mip && (binary_sat || cold || node_limit_set || trace_path || no_presolve || first_fractional ||
+                 no_root_cuts || no_objective_lattice))
         return error("input_error", "Cold search, node limits and traces require --mip", 2);
     if (options.dense && !dimension_limit_set)
         options.max_dimension = LAB_LP_DENSE_DIMENSION_LIMIT;
     if (options.dense && options.max_dimension > LAB_LP_DENSE_DIMENSION_LIMIT)
         return error("input_error", "Dense backend hard dimension limit is4096", 2);
+    if (!pricing_set)
+        options.adaptive_pricing = 1;
+    if (relax && !residual_set)
+        options.fast_residual = 1;
     double started = lab_now();
     char hash[65];
     if (lab_sha256(path, hash))
         return error("input_error", "Cannot hash model", 2);
     options.model_sha256 = hash;
     LabModel model = {0};
-    if (lab_model_read(&model, path)) {
+    if (mip ? lab_model_read_mip(&model, path) : lab_model_read(&model, path)) {
         int code = error(model.unsupported ? "unsupported" : "input_error", model.error,
                          model.unsupported ? 3 : 2);
         lab_model_free(&model);
         return code;
     }
+    /* Scanning for implied bounds pays off on large formulations. Keep the
+     * previous format for basis-file users unless they select it explicitly. */
+    if (!packing_set && !options.basis_in && !options.basis_out && model.cols >= 1024)
+        options.packing_bounds = 1;
+#ifdef LAB_GLPK_BASIS
+    int large_lp = (model.rows >= 100 && model.cols >= 100) || (model.rows && model.cols >= 1024);
+    if (!basis_initializer_set && large_lp &&
+        !options.basis_in && !options.basis_out && !options.bland_pricing && !pricing_set)
+        options.glpk_basis = 1;
+    options.verify_glpk_point = !mip && options.glpk_basis && !basis_initializer_set;
+#else
+    (void)basis_initializer_set;
+#endif
     /* Reading counts toward the CLI budget; each simplex iteration checks it. */
     options.time_limit -= lab_now() - started;
     if (mip) {
         LabBbOptions bb_options = {.lp = options,
                                    .time_limit = options.time_limit,
                                    .node_limit = node_limit,
+                                   .sat_decision_limit = node_limit_set ? node_limit : 2000000,
                                    .cold = cold,
                                    .no_presolve = no_presolve,
+                                   .binary_sat = binary_sat,
+                                   .no_objective_lattice = no_objective_lattice,
                                    .first_fractional = first_fractional,
                                    .no_root_cuts = no_root_cuts,
                                    .no_root_diving = no_root_diving,
@@ -220,7 +279,7 @@ int main(int argc, char **argv) {
         lab_bb_solve(&model, &bb_options, &r);
         if (r.has_primal) {
             LabLpResult exported = {.objective = r.objective, .primal = r.primal};
-            if (write_vector(solution, &model, &exported, 0)) {
+            if (write_vector(solution, &model, &exported, 0, r.primal_decimal)) {
                 r.status = "input_error";
                 snprintf(r.message, sizeof r.message, "Cannot create fresh solution file");
             }
@@ -245,7 +304,7 @@ int main(int argc, char **argv) {
             fputs("null", stdout);
         printf(",\"rows\":%zu,\"columns\":%zu,\"nonzeros\":%zu,\"nodes\":%zu,"
                "\"lp_solves\":%zu,\"lp_iterations\":%zu,\"refactorizations\":%zu,"
-               "\"warm_starts\":%zu,\"cold_starts\":%zu,\"pruned_nodes\":%zu,"
+               "\"warm_starts\":%zu,\"cold_starts\":%zu,\"pruned_nodes\":%zu,\"objective_lattice_prunes\":%zu,"
                "\"dual_iterations\":%zu,\"cold_fallbacks\":%zu,\"factor_nnz_peak\":%zu,"
                "\"standard_nnz_peak\":%zu,"
                "\"solve_wall_s\":%.9g,\"total_wall_s\":%.9g,\"backend\":\"%s\",\"cold\":%s,"
@@ -259,11 +318,11 @@ int main(int argc, char **argv) {
                "\"updates_enabled\":%s,\"basis_updates\":%zu,\"basis_update_rejections\":%zu,"
                "\"factor_core_peak\":%zu,\"singleton_eliminations_peak\":%zu,"
                "\"presolve_enabled\":%s,\"presolve_passes\":%zu,\"presolve_tightenings\":%zu,"
-               "\"presolve_fixed\":%zu,\"presolve_rows\":%zu,\"branch_observations\":%zu,"
+               "\"presolve_fixed\":%zu,\"presolve_rows\":%zu,\"branch_observations\":%zu,\"binary_search_queries\":%zu,\"flow_eliminations\":%zu,\"flow_terminal_states\":%zu,\"packing_attempts\":%zu,\"sat_calls\":%zu,\"partition_nodes\":%zu,"
                "\"source_infeasibility_attempts\":%zu,\"source_infeasibilities\":%zu,"
                "\"source_projected_rows\":%zu,\"source_removed_terms\":%zu,\"source_reconstructed_terms\":%zu,"
                "\"primal_accepted_pivots\":%zu,"
-               "\"primal_zero_steps\":%zu,\"primal_short_steps\":%zu,"
+               "\"glpk_basis_iterations\":%zu,\"glpk_bases_accepted\":%zu,\"primal_zero_steps\":%zu,\"primal_short_steps\":%zu,"
                "\"pricing_bland_fallbacks\":%zu,\"primal_candidate_rejections\":%zu,"
                "\"pricing_requested\":\"%s\",\"source_pricing_attempts\":%zu,\"source_pricing_pivots\":%zu,\"source_pricing_completions\":%zu,\"source_dual_closures\":%zu,\"source_support_scans\":%zu,\"source_support_binary_paths\":%zu,"
                "\"root_cuts_enabled\":%s,\"root_cut_attempts\":%zu,\"root_cuts\":%zu,"
@@ -274,7 +333,7 @@ int main(int argc, char **argv) {
                "\"root_dive_backtracks\":%zu,\"root_dive_candidates\":%zu,"
                "\"root_dive_incumbents\":%zu,\"root_dive_elapsed\":%.17g}\n",
                model.rows, model.cols, model.nnz, r.nodes, r.lp_solves, r.lp_iterations,
-               r.refactorizations, r.warm_starts, r.cold_starts, r.pruned_nodes, r.dual_iterations,
+               r.refactorizations, r.warm_starts, r.cold_starts, r.pruned_nodes, r.objective_lattice_prunes, r.dual_iterations,
                r.cold_fallbacks, r.factor_nnz_peak, r.standard_nnz_peak, r.elapsed,
                lab_now() - started, options.dense ? "dense_lu_reference" : "sparse_lu",
                cold ? "true" : "false", options.no_scaling ? "false" : "true",
@@ -287,13 +346,13 @@ int main(int argc, char **argv) {
                r.exact_primal_recoveries, options.no_updates ? "false" : "true", r.basis_updates,
                r.basis_update_rejections, r.factor_core_peak, r.singleton_eliminations_peak,
                no_presolve ? "false" : "true", r.presolve_passes, r.presolve_tightenings,
-               r.presolve_fixed, r.presolve_rows, r.branch_observations,
+               r.presolve_fixed, r.presolve_rows, r.branch_observations, r.binary_search_queries, r.flow_eliminations, r.flow_terminal_states, r.packing_attempts, r.sat_calls, r.partition_nodes,
                r.source_infeasibility_attempts, r.source_infeasibilities, r.source_projected_rows,
                r.source_removed_terms,
                r.source_reconstructed_terms,
-               r.primal_accepted_pivots, r.primal_zero_steps, r.primal_short_steps,
+               r.primal_accepted_pivots, r.glpk_basis_iterations, r.glpk_bases_accepted, r.primal_zero_steps, r.primal_short_steps,
                r.pricing_bland_fallbacks, r.primal_candidate_rejections,
-               options.bland_pricing ? "bland" : "most_negative", r.source_pricing_attempts,
+               options.bland_pricing ? "bland" : options.adaptive_pricing ? "adaptive_most_negative" : "most_negative", r.source_pricing_attempts,
                r.source_pricing_pivots, r.source_pricing_completions, r.source_dual_closures,
                r.source_support_scans, r.source_support_binary_paths,
                no_root_cuts ? "false" : "true", r.root_cut_attempts, r.root_cuts,
@@ -314,7 +373,7 @@ int main(int argc, char **argv) {
         snprintf(r.message, sizeof r.message, "Cannot create fresh Farkas file");
     }
     if (r.has_primal &&
-        (write_vector(solution, &model, &r, 0) || write_vector(dual, &model, &r, 1))) {
+        (write_vector(solution, &model, &r, 0, NULL) || write_vector(dual, &model, &r, 1, NULL))) {
         r.status = "input_error";
         snprintf(r.message, sizeof r.message, "Cannot create fresh solution/dual file");
     }
@@ -333,7 +392,7 @@ int main(int argc, char **argv) {
         printf("null");
     printf(
         ",\"rows\":%zu,\"columns\":%zu,\"nonzeros\":%zu,\"standard_rows\":%zu,"
-        "\"standard_columns\":%zu,\"implicit_bound_rows\":%zu,\"redundant_rows\":%zu,\"iterations\":%zu,"
+        "\"standard_columns\":%zu,\"implicit_bound_rows\":%zu,\"packing_bound_rows\":%zu,\"redundant_rows\":%zu,\"iterations\":%zu,"
         "\"refactorizations\":%zu,\"primal_residual\":%.17g,\"dual_residual\":%.17g,"
         "\"solve_wall_s\":%.9g,\"total_wall_s\":%.9g,\"backend\":\"%s\","
         "\"warm_start\":%s,\"dual_iterations\":%zu,\"cold_fallbacks\":%zu,"
@@ -350,14 +409,14 @@ int main(int argc, char **argv) {
         "\"factor_core_peak\":%zu,\"singleton_eliminations_peak\":%zu,"
         "\"source_infeasibility_attempts\":%zu,\"source_infeasibilities\":%zu,"
         "\"source_projected_rows\":%zu,\"source_removed_terms\":%zu,\"source_reconstructed_terms\":%zu,"
-        "\"farkas_margin_kind\":\"%s\",\"primal_accepted_pivots\":%zu,"
-        "\"primal_zero_steps\":%zu,\"primal_short_steps\":%zu,"
+        "\"glpk_basis_status\":\"%s\",\"farkas_margin_kind\":\"%s\",\"primal_accepted_pivots\":%zu,"
+        "\"glpk_basis_iterations\":%zu,\"glpk_bases_accepted\":%zu,\"primal_zero_steps\":%zu,\"primal_short_steps\":%zu,"
         "\"pricing_bland_fallbacks\":%zu,\"primal_candidate_rejections\":%zu,"
         "\"pricing_requested\":\"%s\",\"source_pricing_attempts\":%zu,"
         "\"source_pricing_pivots\":%zu,\"source_pricing_completions\":%zu,"
         "\"source_dual_closures\":%zu,\"source_support_scans\":%zu,"
         "\"source_support_binary_paths\":%zu}\n",
-        model.rows, model.cols, model.nnz, r.standard_rows, r.standard_columns, r.implicit_bound_rows, r.redundant_rows,
+        model.rows, model.cols, model.nnz, r.standard_rows, r.standard_columns, r.implicit_bound_rows, r.packing_bound_rows, r.redundant_rows,
         r.iterations, r.refactorizations, r.primal_residual, r.dual_residual, r.elapsed,
         lab_now() - started, options.dense ? "dense_lu_reference" : "sparse_lu",
         r.warm_start ? "true" : "false", r.dual_iterations, r.cold_fallbacks, r.factor_nnz_peak,
@@ -373,10 +432,11 @@ int main(int argc, char **argv) {
         r.source_infeasibility_attempts, r.source_infeasibilities, r.source_projected_rows,
         r.source_removed_terms,
         r.source_reconstructed_terms,
+        r.glpk_basis_status ? r.glpk_basis_status : "unused",
         !r.farkas ? "absent" : r.farkas_margin_is_lower_bound ? "source_enclosure" : "exact",
-        r.primal_accepted_pivots, r.primal_zero_steps, r.primal_short_steps,
+        r.primal_accepted_pivots, r.glpk_basis_iterations, r.glpk_bases_accepted, r.primal_zero_steps, r.primal_short_steps,
         r.pricing_bland_fallbacks, r.primal_candidate_rejections,
-        options.bland_pricing ? "bland" : "most_negative", r.source_pricing_attempts,
+        options.bland_pricing ? "bland" : options.adaptive_pricing ? "adaptive_most_negative" : "most_negative", r.source_pricing_attempts,
                r.source_pricing_pivots, r.source_pricing_completions, r.source_dual_closures,
                r.source_support_scans, r.source_support_binary_paths);
     int code = status_code(r.status);

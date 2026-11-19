@@ -25,9 +25,9 @@ static void emit(const LabModel *m, const LabLpResult *r, const char *directory,
     CHECK(!lab_solution_write_point(f, m, r->primal));
     CHECK(!fclose(f));
     printf("{\"step\":%zu,\"cold\":%d,\"warm\":%d,\"objective\":%.17g,\"rows\":%zu,\"columns\":%zu,"
-           "\"implicit\":%zu,\"dual_iterations\":%zu}\n",
+           "\"implicit\":%zu,\"packing\":%zu,\"dual_iterations\":%zu}\n",
            step, cold, r->warm_start, r->objective, r->standard_rows, r->standard_columns,
-           r->implicit_bound_rows, r->dual_iterations);
+           r->implicit_bound_rows, r->packing_bound_rows, r->dual_iterations);
 }
 int main(int argc, char **argv) {
     CHECK(argc == 8);
@@ -52,6 +52,7 @@ int main(int argc, char **argv) {
     LabLpOptions options = {.time_limit = 60,
                             .iteration_limit = 100000,
                             .max_dimension = 8192,
+                            .packing_bounds = 1,
                             .keep_bound_rows = atoi(argv[4]),
                             .dense = atoi(argv[5]),
                             .no_scaling = atoi(argv[6])};

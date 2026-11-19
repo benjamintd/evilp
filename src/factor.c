@@ -402,6 +402,132 @@ static int peel_factor(LabFactor *f, size_t total, double norm) {
     free(active_r); free(active_c);
     return outcome;
 }
+static int scanned_elimination(LabFactor *f, size_t *total, double norm) {
+    SparseFactor *s = f->sparse_data;
+    size_t n = f->n;
+    for (size_t k = 0; k < n; k++) {
+        size_t p = k;
+        double largest = fabs(sparse_get(&s->row[k], k));
+        for (size_t i = k + 1; i < n; i++) {
+            double candidate = fabs(sparse_get(&s->row[i], k));
+            if (candidate > largest) {
+                largest = candidate;
+                p = i;
+            }
+        }
+        if (largest <= fmax(DBL_MIN, 16 * DBL_EPSILON * norm))
+            return -1;
+        f->pivot[k] = p;
+        if (p != k) {
+            SparseRow tmp = s->row[k];
+            s->row[k] = s->row[p];
+            s->row[p] = tmp;
+        }
+        double diagonal = sparse_get(&s->row[k], k);
+        for (size_t i = k + 1; i < n; i++) {
+            double entry = sparse_get(&s->row[i], k);
+            if (entry == 0)
+                continue;
+            double multiplier = entry / diagonal;
+            if (!isfinite(multiplier) || multiplier == 0 ||
+                sparse_eliminate(&s->row[i], &s->row[k], k, multiplier, total, &f->peak_nnz))
+                return -1;
+        }
+    }
+    return 0;
+}
+
+/* At column k, each remaining row with a nonzero in k has k as its
+ * first uneliminated entry. Bucket rows by that entry; fill and exact
+ * cancellation affect only the rows eliminated in this step. Stable IDs
+ * keep the lists valid across physical pivot-row swaps. */
+typedef struct {
+    uint32_t position, entry, next;
+} ActiveRow;
+static int compare_position(const void *a, const void *b) {
+    uint32_t x = *(const uint32_t *)a, y = *(const uint32_t *)b;
+    return (x > y) - (x < y);
+}
+static int indexed_elimination(LabFactor *f, size_t *total, double norm) {
+    SparseFactor *s = f->sparse_data;
+    size_t n = f->n;
+    ActiveRow *active = calloc(n, sizeof *active);
+    uint32_t *head = calloc(n, sizeof *head);
+    uint32_t *id_at = malloc(n * sizeof *id_at);
+    uint32_t *positions = malloc(n * sizeof *positions);
+    int status = -1;
+    if (!active || !head || !id_at || !positions)
+        goto done;
+    for (uint32_t i = 0; i < n; i++) {
+        id_at[i] = active[i].position = i;
+        if (!s->row[i].count)
+            goto done;
+        size_t first = s->row[i].entry[0].column;
+        active[i].next = head[first];
+        head[first] = i + 1;
+    }
+    double threshold = fmax(DBL_MIN, 16 * DBL_EPSILON * norm);
+    for (uint32_t k = 0; k < n; k++) {
+        double largest = 0;
+        uint32_t p = k;
+        for (uint32_t link = head[k]; link; link = active[link - 1].next) {
+            const ActiveRow *a = &active[link - 1];
+            double v = fabs(s->row[a->position].entry[a->entry].value);
+            if (v > largest || (v == largest && a->position < p)) {
+                largest = v;
+                p = a->position;
+            }
+        }
+        if (largest <= threshold)
+            goto done;
+        f->pivot[k] = p;
+        if (p != k) {
+            SparseRow tmp = s->row[k];
+            s->row[k] = s->row[p];
+            s->row[p] = tmp;
+            uint32_t old = id_at[k];
+            id_at[k] = id_at[p];
+            id_at[p] = old;
+            active[id_at[k]].position = k;
+            active[id_at[p]].position = p;
+        }
+        double diagonal = s->row[k].entry[active[id_at[k]].entry].value;
+        size_t count = 0;
+        for (uint32_t link = head[k]; link; link = active[link - 1].next) {
+            uint32_t i = active[link - 1].position;
+            if (i != k)
+                positions[count++] = i;
+        }
+        /* Preserve the original row visitation order, including peak fill
+         * and partial failure at the fixed live-entry budget. */
+        if (count > 1)
+            qsort(positions, count, sizeof *positions, compare_position);
+        for (size_t at = 0; at < count; at++) {
+            uint32_t i = positions[at], id = id_at[i];
+            ActiveRow *a = &active[id];
+            SparseRow *row = &s->row[i];
+            double multiplier = row->entry[a->entry].value / diagonal;
+            if (!isfinite(multiplier) || multiplier == 0 ||
+                sparse_eliminate(row, &s->row[k], k, multiplier, total, &f->peak_nnz))
+                goto done;
+            /* sparse_eliminate preserves the L prefix and stores the new
+             * multiplier at precisely the old leading entry's position. */
+            if (++a->entry == row->count)
+                goto done;
+            size_t next_column = row->entry[a->entry].column;
+            a->next = head[next_column];
+            head[next_column] = id + 1;
+        }
+    }
+    status = 0;
+done:
+    free(positions);
+    free(id_at);
+    free(head);
+    free(active);
+    return status;
+}
+
 int lab_factorize_sparse(LabFactor *f, size_t n, const size_t *col_start, const size_t *row_index,
                          const double *value) {
     lab_factor_free(f);
@@ -453,34 +579,11 @@ int lab_factorize_sparse(LabFactor *f, size_t n, const size_t *col_start, const 
     int peeled = peel_factor(f, total, norm);
     if (peeled)
         return peeled > 0 ? 0 : -1;
-    for (size_t k = 0; k < n; k++) {
-        size_t p = k;
-        double largest = fabs(sparse_get(&s->row[k], k));
-        for (size_t i = k + 1; i < n; i++) {
-            double candidate = fabs(sparse_get(&s->row[i], k));
-            if (candidate > largest) {
-                largest = candidate;
-                p = i;
-            }
-        }
-        if (largest <= fmax(DBL_MIN, 16 * DBL_EPSILON * norm))
+    if (n >= 128) {
+        if (indexed_elimination(f, &total, norm))
             return -1;
-        f->pivot[k] = p;
-        if (p != k) {
-            SparseRow tmp = s->row[k];
-            s->row[k] = s->row[p];
-            s->row[p] = tmp;
-        }
-        double diagonal = sparse_get(&s->row[k], k);
-        for (size_t i = k + 1; i < n; i++) {
-            double entry = sparse_get(&s->row[i], k);
-            if (entry == 0)
-                continue;
-            double multiplier = entry / diagonal;
-            if (!isfinite(multiplier) || multiplier == 0 ||
-                sparse_eliminate(&s->row[i], &s->row[k], k, multiplier, &total, &f->peak_nnz))
-                return -1;
-        }
+    } else if (scanned_elimination(f, &total, norm)) {
+        return -1;
     }
     f->factor_nnz = total;
     if (sparse_transpose(s, n, total))

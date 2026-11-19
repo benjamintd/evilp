@@ -2,7 +2,10 @@
  * safeguard, not an independent feasibility, bound or optimality certificate.
  * Only available==1 and a zero return may accept this fallback. */
 #include <fenv.h>
-enum { SOURCE_SUPPORT_ROWS = 4096, SOURCE_SUPPORT_COLS = 16384, SOURCE_SUPPORT_NNZ = 100000 };
+/* The enclosure scan uses one interval per row and linear work. It does
+ * not allocate a rational basis or a dense tableau. Limit row scratch to
+ * 16 MB and bound both the sparse scan and its elapsed time independently. */
+enum { SOURCE_SUPPORT_ROWS = 1000000, SOURCE_SUPPORT_COLS = 2000000, SOURCE_SUPPORT_NNZ = 4000000 };
 static int source_support_finite(LabInterval q) {
     return isfinite(q.lower) && isfinite(q.upper) && q.lower <= q.upper;
 }
@@ -58,7 +61,7 @@ static int source_support_interval_gap(Work *w, const double *point, const doubl
     for (size_t i = 0; i < m->rows; i++) {
         if (!isfinite(row_dual[i]) || isnan(m->row_lower[i]) || isnan(m->row_upper[i]) ||
             m->row_lower[i] == INFINITY || m->row_upper[i] == -INFINITY ||
-            m->row_lower[i] > m->row_upper[i] || lab_now() >= deadline)
+            m->row_lower[i] > m->row_upper[i] || ((i & 255U) == 0 && lab_now() >= deadline))
             return 0;
         /* Finite row overlays have no source identity API. Only original
          * finite sides (or a mask to infinity) are admitted here. */
@@ -78,24 +81,28 @@ static int source_support_interval_gap(Work *w, const double *point, const doubl
             m->col_lower[j] > m->col_upper[j] || isnan(e->col_lower_source[j]) ||
             isnan(e->col_upper_source[j]) || e->col_lower_source[j] == INFINITY ||
             e->col_upper_source[j] == -INFINITY || m->col_start[j] > m->col_start[j + 1] ||
-            m->col_start[j + 1] > m->nnz || lab_now() >= deadline)
+            m->col_start[j + 1] > m->nnz || ((j & 255U) == 0 && lab_now() >= deadline))
             return 0;
         for (size_t k = m->col_start[j]; k < m->col_start[j + 1]; k++)
             if (m->row_index[k] >= m->rows || !source_support_finite(e->value[k]) ||
-                lab_now() >= deadline)
+                ((k & 255U) == 0 && lab_now() >= deadline))
                 return 0;
     }
     LabInterval *activity = lab_alloc(m->rows, sizeof *activity);
     LabInterval gap = {0, 0};
     int valid = 1;
     for (size_t j = 0; j < m->cols && valid; j++) {
+        if (point[j] == 0)
+            continue; /* finite source coefficient times zero is exactly zero */
         LabInterval x = {point[j], point[j]};
         for (size_t k = m->col_start[j]; k < m->col_start[j + 1]; k++) {
             size_t i = m->row_index[k];
+            if (row_dual[i] == 0)
+                continue; /* this row contributes zero to the support gap */
             LabInterval term = lab_interval_multiply(e->value[k], x);
             activity[i] = lab_interval_add(activity[i], term);
             if (!source_support_finite(term) || !source_support_finite(activity[i]) ||
-                lab_now() >= deadline) {
+                ((k & 255U) == 0 && lab_now() >= deadline)) {
                 valid = 0;
                 break;
             }
@@ -122,10 +129,12 @@ static int source_support_interval_gap(Work *w, const double *point, const doubl
             reduced = (LabInterval){-reduced.upper, -reduced.lower};
         for (size_t k = m->col_start[j]; k < m->col_start[j + 1]; k++) {
             double y = row_dual[m->row_index[k]];
+            if (y == 0)
+                continue;
             LabInterval term = lab_interval_multiply(e->value[k], (LabInterval){y, y});
             reduced = lab_interval_subtract(reduced, term);
             if (!source_support_finite(term) || !source_support_finite(reduced) ||
-                lab_now() >= deadline) {
+                ((k & 255U) == 0 && lab_now() >= deadline)) {
                 valid = 0;
                 break;
             }

@@ -10,8 +10,10 @@ def model(rows=200,cols=300,entries=None,bounds=None):
  return '\n'.join(text+['ENDATA',''])
 cases=[]
 cases.append(('allowed',model(),True,True,False))
-cases.append(('rowcap',model(rows=2049),True,False,False))
-cases.append(('colcap',model(cols=4097),True,False,False))
+cases.append(('expanded_rows',model(rows=2049),True,True,False))
+cases.append(('rowcap',model(rows=8193),True,False,False))
+cases.append(('expanded_cols',model(cols=4097),True,True,False))
+cases.append(('colcap',model(cols=16385),True,False,False))
 entries=[' X0 OBJ -1']+[' X0 R0 0.1']*100001+[f' X{j} OBJ 0' for j in range(1,300)]
 cases.append(('recordcap',model(entries=entries),True,False,False))
 long='1.'+'0'*1023+'1';cases.append(('tokencap',model(entries=[' X0 OBJ -1 R0 '+long]+[f' X{j} OBJ 0' for j in range(1,300)]),True,False,False))

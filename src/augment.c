@@ -145,6 +145,9 @@ LabAugmentStatus lab_model_append_rows(const LabModel *base, size_t count,
         m.envelope->complete = base->envelope->complete;
         m.envelope->objective_complete=base->envelope->objective_complete;
         m.envelope->offset=base->envelope->offset;
+        if (base->envelope->exception_count)
+            m.envelope->exceptions = lab_alloc(base->envelope->exception_count,
+                                               sizeof *m.envelope->exceptions);
     }
     copy_column_metadata(base, &m);
     for (size_t i = 0; i < m.rows; i++) {
@@ -190,8 +193,19 @@ LabAugmentStatus lab_model_append_rows(const LabModel *base, size_t count,
                 mpq_set(m.exact->value[next], base->exact->value[k]);
             if(m.native_exact)
                 mpq_set(m.native_exact->value[next],base->native_exact->value[k]);
-            if (m.envelope)
+            if (m.envelope) {
                 m.envelope->value[next] = base->envelope->value[k];
+                size_t t = m.envelope->exception_count;
+                if (t < base->envelope->exception_count && base->envelope->exceptions[t].entry == k) {
+                    const LabDecimalCoefficient *src = &base->envelope->exceptions[t];
+                    LabDecimalCoefficient *dest = &m.envelope->exceptions[t];
+                    dest->entry = next;
+                    dest->rounded = src->rounded;
+                    mpq_init(dest->value);
+                    mpq_set(dest->value, src->value);
+                    ++m.envelope->exception_count;
+                }
+            }
         }
         for (size_t r = 0; r < count; r++) {
             double value = rows[r].coefficient[j];

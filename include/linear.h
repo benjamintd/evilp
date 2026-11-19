@@ -41,6 +41,7 @@ typedef struct {
     LabLinearColumn *overlay;
     int *row_exponent, *col_exponent;
     int valid, scaling_enabled, refinement_enabled, scaling_changed;
+    int fast_residual; /* sufficient error bound; full compensated fallback */
     size_t scaled_rows, scaled_columns;
     /* Cumulative solve/correction counts; errors describe the latest call. */
     size_t solve_calls, refinement_steps;

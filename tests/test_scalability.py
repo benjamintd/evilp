@@ -101,24 +101,40 @@ class Scalability(unittest.TestCase):
         self.assertGreater(result['factor_core_peak'], 0)
         self.assertGreaterEqual(result['singleton_eliminations_peak'], result['standard_rows'] - 3)
 
+    def check_default_and_factor(self, root, model, columns, active=0, extra=()):
+        root.mkdir(parents=True, exist_ok=True)
+        result = self.invoke(root / 'default', model, columns, active, list(extra))
+        if result.get('glpk_basis_status') == 'source_verified_point_and_bound':
+            # The default point has already been checked on every original
+            # variable. A separate basis-only solve must exercise all the
+            # original sparse-factor structure assertions on the same input.
+            self.assertEqual(result['refactorizations'], 0)
+            self.assertGreater(result['source_support_scans'], 0)
+            result = self.invoke(root / 'basis', model, columns, active, [*extra, '--glpk-basis'])
+        self.assert_sparse_core(result, columns)
+
     def test_thousands_of_bounds_and_small_coupled_root(self):
         # Preserve a basis larger than the dense ceiling after implicit lower
         # rows disappear, and retain the original 2,500-column case separately.
         columns = 5000
         with tempfile.TemporaryDirectory(prefix='sparse capacity ') as td:
-            result = self.invoke(pathlib.Path(td) / 'default', instance(columns), columns)
-            self.assert_sparse_core(result, columns)
-            old = self.invoke(pathlib.Path(td) / 'original-explicit', instance(2500), 2500,
-                              extra=['--keep-bound-rows'])
-            self.assert_sparse_core(old, 2500)
+            self.check_default_and_factor(pathlib.Path(td) / 'implicit', instance(columns), columns)
+            self.check_default_and_factor(pathlib.Path(td) / 'explicit', instance(2500), 2500,
+                                          extra=['--keep-bound-rows'])
 
     def test_updates_reduce_refactors_without_changing_original_optimum(self):
         columns, active = 5000, 64
         model = instance(columns, active)
         with tempfile.TemporaryDirectory(prefix='basis update work ') as td:
             root = pathlib.Path(td)
-            updated = self.invoke(root / 'updated', model, columns, active)
-            rebuilt = self.invoke(root / 'rebuilt', model, columns, active, ['--no-updates'])
+            # Exercise the default starting policy on the same 64-active
+            # problem. An imported optimal basis can already encode the
+            # active upper bounds, leaving few simplex updates to measure.
+            self.check_default_and_factor(root, model, columns, active)
+            # Compare the two native update policies from the same cold basis.
+            updated = self.invoke(root / 'updated', model, columns, active, ['--no-glpk-basis'])
+            rebuilt = self.invoke(root / 'rebuilt', model, columns, active,
+                                  ['--no-glpk-basis', '--no-updates'])
             self.assert_sparse_core(updated, columns)
             self.assert_sparse_core(rebuilt, columns)
             self.assertGreaterEqual(updated['iterations'], active)

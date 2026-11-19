@@ -30,7 +30,7 @@ static int solution_scalar_fits(const mpq_t q) {
  * objective before emitting its optional claim. A rounded double can lose a
  * material improvement next to a large constant. On unavailable provenance or
  * resource limits, omit the optional claim and let the checker score the point. */
-static void write_source_objective(FILE *f, const LabModel *m, const double *point) {
+static void write_source_objective(FILE *f, const LabModel *m, const double *point, char *const *decimal) {
     if (m->cols > 65536)
         return;
     mpq_t total, cost, coordinate, term;
@@ -39,7 +39,7 @@ static void write_source_objective(FILE *f, const LabModel *m, const double *poi
     for (size_t j = 0; j < m->cols && !bad; j++) {
         char text[64];
         decimal_text(text, point[j]);
-        bad = lab_source_exact_objective(m, j, cost) || lab_exact_decimal(coordinate, text) ||
+        bad = lab_source_exact_objective(m, j, cost) || lab_exact_decimal(coordinate, decimal && decimal[j] ? decimal[j] : text) ||
               !solution_scalar_fits(cost);
         if (bad)
             break;
@@ -84,17 +84,24 @@ static void write_source_objective(FILE *f, const LabModel *m, const double *poi
     mpz_clears(denominator, numerator, NULL);
     mpq_clears(total, cost, coordinate, term, NULL);
 }
-int lab_solution_write_point(FILE *f, const LabModel *model, const double *point) {
+int lab_solution_write_decimals(FILE *f, const LabModel *model, const double *point, char *const *decimal) {
     if (!f || !model || (model->cols && !point))
         return -1;
     for (size_t j = 0; j < model->cols; j++)
         if (!isfinite(point[j]))
             return -1;
-    write_source_objective(f, model, point);
+    write_source_objective(f, model, point, decimal);
     for (size_t j = 0; j < model->cols; j++) {
         fprintf(f, "%s ", model->col_name[j]);
-        lab_solution_decimal(f, point[j]);
+        if (decimal && decimal[j])
+            fputs(decimal[j], f);
+        else
+            lab_solution_decimal(f, point[j]);
         fputc('\n', f);
     }
     return ferror(f) ? -1 : 0;
+}
+
+int lab_solution_write_point(FILE *f, const LabModel *model, const double *point) {
+    return lab_solution_write_decimals(f, model, point, NULL);
 }

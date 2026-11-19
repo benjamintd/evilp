@@ -24,6 +24,53 @@ static int verdict(Work *w, double x, double y, double deadline) {
     int bad = source_support_interval_gap(w, &x, &y, deadline, &av);
     return av == 1 ? (bad ? 1 : 0) : 2;
 }
+/* Cross the old row, column and nonzero limits at once. The last column
+ * controls the gap, so a truncated scan would accept the second point. */
+static int large_sparse_support(void) {
+    const size_t rows = 5000, cols = 17000, per_column = 8, nnz = cols * per_column;
+    LabModel m = {.rows = rows, .cols = cols, .nnz = nnz, .parsed_decimal = 1};
+    m.envelope = lab_source_envelope_new(rows, cols, nnz);
+    LabSourceEnvelope *e = m.envelope;
+    e->objective_complete = 1;
+    m.col_start = lab_alloc(cols + 1, sizeof *m.col_start);
+    m.row_index = lab_alloc(nnz, sizeof *m.row_index);
+    m.row_lower = lab_alloc(rows, sizeof(double));
+    m.row_upper = lab_alloc(rows, sizeof(double));
+    m.col_lower = lab_alloc(cols, sizeof(double));
+    m.col_upper = lab_alloc(cols, sizeof(double));
+    m.objective = lab_alloc(cols, sizeof(double));
+    double *x = lab_alloc(cols, sizeof(double)), *y = lab_alloc(rows, sizeof(double));
+    for (size_t i = 0; i < rows; i++) {
+        m.row_lower[i] = -INFINITY;
+        m.row_upper[i] = 2;
+        e->row_lower[i] = (LabInterval){-INFINITY, -INFINITY};
+        e->row_upper[i] = (LabInterval){2, 2};
+    }
+    for (size_t j = 0; j < cols; j++) {
+        m.col_start[j] = j * per_column;
+        m.col_upper[j] = e->col_upper_source[j] = 1;
+        e->col_upper[j] = (LabInterval){1, 1};
+        for (size_t k = j * per_column; k < (j + 1) * per_column; k++) {
+            m.row_index[k] = k % rows;
+            e->value[k] = (LabInterval){1, 1};
+        }
+    }
+    m.col_start[cols] = nnz;
+    m.objective[cols - 1] = 1;
+    e->objective[cols - 1] = (LabInterval){1, 1};
+    Work w = {&m};
+    int available = 0;
+    CHECK(!source_support_interval_gap(&w, x, y, lab_now() + 1, &available) && available == 1);
+    x[cols - 1] = 1;
+    CHECK(source_support_interval_gap(&w, x, y, lab_now() + 1, &available) && available == 1);
+    x[cols - 1] = 0;
+    e->value[nnz - 1] = (LabInterval){2, 1};
+    CHECK(!source_support_interval_gap(&w, x, y, lab_now() + 1, &available) && !available);
+    free(y);
+    free(x);
+    lab_model_free(&m);
+    return 0;
+}
 int main(int argc, char **argv) {
     double rl = -INFINITY, ru = 1, cl = 0, cu = 2, cost = -1;
     size_t start[] = {0, 1}, row[] = {0};
@@ -79,6 +126,7 @@ int main(int argc, char **argv) {
         lab_source_envelope_free(e);
         return 0;
     }
+    CHECK(!large_sparse_support());
     CHECK(verdict(&w, 1, -1, lab_now() + 1) == 0);
     e->value[0] = (LabInterval){nextafter(1, -INFINITY), nextafter(1, INFINITY)};
     CHECK(verdict(&w, 1, -1, lab_now() + 1) == 0);

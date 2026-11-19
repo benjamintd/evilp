@@ -14,7 +14,7 @@
 /* This reader belongs to the optimizer. It deliberately does not call or link
  * the independent checker's model reader or arithmetic implementation. */
 enum { MODEL_ITEMS = 5000000, MODEL_ENTRIES = 50000000, LINE_SIZE = 16384,
-       NATIVE_ROWS = 2048, NATIVE_COLUMNS = 4096, NATIVE_RECORDS = 100000,
+       NATIVE_ROWS = 8192, NATIVE_COLUMNS = 16384, NATIVE_RECORDS = 100000,
        NATIVE_TEXT_BYTES = 16 * 1024 * 1024, NATIVE_VALUE_BITS = 8192,
        NATIVE_TOTAL_BITS = 16000000, OBJECTIVE_COLUMNS=65536,
        OBJECTIVE_RECORDS=100000, OBJECTIVE_TEXT_BYTES=8*1024*1024 };
@@ -47,7 +47,8 @@ typedef struct {
     double value;
     char *text;
     LabInterval envelope;
-    char *objective_text;
+    /* Independent bounded source token for this objective or matrix entry. */
+    char *scalar_text;
 } Entry;
 typedef struct {
     LabModel *output;
@@ -60,6 +61,7 @@ typedef struct {
     size_t line;
     int exact_enabled, native_enabled;
     size_t native_text_bytes, native_bits;
+    size_t exception_tokens;
     int objective_enabled;
     size_t objective_row, objective_text_bytes, objective_records, objective_bits;
 } Reader;
@@ -90,7 +92,7 @@ static void disable_native(Reader *p) {
 static void disable_objective(Reader *p) {
     if(!p->objective_enabled)return;p->objective_enabled=0;
     for(size_t i=0;i<p->nr;i++){free(p->rows[i].objective_rhs_text);p->rows[i].objective_rhs_text=NULL;}
-    for(size_t k=0;k<p->ne;k++){free(p->entries[k].objective_text);p->entries[k].objective_text=NULL;}
+    for(size_t k=0;k<p->ne;k++)if(p->entries[k].row==p->objective_row){free(p->entries[k].scalar_text);p->entries[k].scalar_text=NULL;}
 }
 static char *capture_objective(Reader *p,const char *text) {
     if(!p->objective_enabled)return NULL;size_t bytes=strlen(text)+1;
@@ -322,9 +324,16 @@ static int add_values(Reader *p, size_t column, size_t start, size_t n, char **f
         if (p->ne >= NATIVE_RECORDS)
             disable_native(p);
         char *text = capture(p, field[i + 1]);
-        char *objective_text=row==p->objective_row?capture_objective(p,field[i+1]):NULL;
-        p->entries[p->ne++] = (Entry){column, row, number, text,
-                                      lab_source_number_interval(field[i + 1], number),objective_text};
+        LabInterval enclosure = lab_source_number_interval(field[i + 1], number);
+        char *scalar = NULL;
+        if (row == p->objective_row) {
+            scalar = capture_objective(p, field[i + 1]);
+        } else if (enclosure.lower != enclosure.upper && p->exception_tokens < 4096 &&
+                   strlen(field[i + 1]) <= 64) {
+            scalar = lab_strdup(field[i + 1]);
+            ++p->exception_tokens;
+        }
+        p->entries[p->ne++] = (Entry){column, row, number, text, enclosure, scalar};
     }
     return 0;
 }
@@ -684,8 +693,23 @@ static int finish(Reader *p) {
         if(m->native_exact && index[a.row]!=SIZE_MAX &&
            (!a.text || lab_exact_decimal(native_sum,a.text) || !native_value_fits(native_sum)))
             discard_native(m);
-        if(m->objective_exact && a.row==objective && (!a.objective_text||lab_exact_decimal(objective_sum,a.objective_text)||!native_value_fits(objective_sum)))discard_objective(m);
-        free(a.objective_text);p->entries[e-1].objective_text=a.objective_text=NULL;
+        if(m->objective_exact && a.row==objective && (!a.scalar_text||lab_exact_decimal(objective_sum,a.scalar_text)||!native_value_fits(objective_sum)))discard_objective(m);
+        /* Keep sparse decimal exceptions only for original single records.
+         * A duplicate group needs the exact sum of every token. */
+        int singleton = e == p->ne || a.column != p->entries[e].column ||
+                        a.row != p->entries[e].row;
+        if (!m->exact && !m->native_exact && singleton && index[a.row] != SIZE_MAX &&
+            a.scalar_text && !lab_exact_decimal(term, a.scalar_text) && native_value_fits(term)) {
+            LabSourceEnvelope *env = m->envelope;
+            if (!env->exceptions)
+                env->exceptions = lab_alloc(p->exception_tokens, sizeof *env->exceptions);
+            LabDecimalCoefficient *saved = &env->exceptions[env->exception_count++];
+            saved->entry = unique;
+            saved->rounded = a.value;
+            mpq_init(saved->value);
+            mpq_set(saved->value, term);
+        }
+        free(a.scalar_text);p->entries[e-1].scalar_text=a.scalar_text=NULL;
         free(a.text);
         p->entries[e - 1].text = a.text = NULL;
         while (e < p->ne && a.column == p->entries[e].column && a.row == p->entries[e].row) {
@@ -704,10 +728,10 @@ static int finish(Reader *p) {
                 else {mpq_add(native_sum,native_sum,native_term);if(!native_value_fits(native_sum))discard_native(m);}
             }
             if(m->objective_exact&&a.row==objective) {
-                if(!next->objective_text||lab_exact_decimal(objective_term,next->objective_text)||!native_value_fits(objective_term))discard_objective(m);
+                if(!next->scalar_text||lab_exact_decimal(objective_term,next->scalar_text)||!native_value_fits(objective_term))discard_objective(m);
                 else {mpq_add(objective_sum,objective_sum,objective_term);if(!native_value_fits(objective_sum))discard_objective(m);}
             }
-            free(next->objective_text);next->objective_text=NULL;
+            free(next->scalar_text);next->scalar_text=NULL;
             free(next->text);
             next->text = NULL;
             if (!isfinite(a.value)) {
@@ -792,7 +816,7 @@ static void cleanup(Reader *p) {
         free(p->cols[j].lower_text);
         free(p->cols[j].upper_text);
     }
-    for (size_t k = 0; k < p->ne; k++){free(p->entries[k].text);free(p->entries[k].objective_text);}
+    for (size_t k = 0; k < p->ne; k++){free(p->entries[k].text);free(p->entries[k].scalar_text);}
     free(p->rows);
     free(p->cols);
     free(p->entries);
@@ -803,7 +827,7 @@ static void cleanup(Reader *p) {
     free(p->range_name);
     free(p->bound_name);
 }
-int lab_model_read(LabModel *model, const char *path) {
+static int read_model(LabModel *model, const char *path) {
     Reader p = {.output=model,.exact_enabled=1,.native_enabled=1,.objective_enabled=1,.objective_row=SIZE_MAX};
     model->parsed_decimal = 1;
     enum { NONE, ROWS, COLUMNS, RHS, RANGES, BOUNDS, SENSE, OBJECTIVE } section = NONE;
@@ -959,6 +983,12 @@ int lab_model_read(LabModel *model, const char *path) {
         finish(&p);
     cleanup(&p);
     return model->error[0] ? -1 : 0;
+}
+int lab_model_read(LabModel *model, const char *path) {
+    return read_model(model, path);
+}
+int lab_model_read_mip(LabModel *model, const char *path) {
+    return read_model(model, path);
 }
 void lab_model_free(LabModel *model) {
     for (size_t i = 0; i < model->rows; ++i)

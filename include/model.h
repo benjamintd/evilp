@@ -38,6 +38,7 @@ typedef struct {
 /* Start from a zero-initialized model. On failure the diagnostic stays in
  * model->error; lab_model_free is valid after either success or failure. */
 int lab_model_read(LabModel *model, const char *path);
+int lab_model_read_mip(LabModel *model, const char *path);
 void lab_model_free(LabModel *model);
 
 #endif

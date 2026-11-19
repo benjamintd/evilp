@@ -147,6 +147,15 @@ class SourcePricing(unittest.TestCase):
                                     if source:
                                         self.assertGreater(result['source_support_scans'], 0)
                                     elif not offset:
+                                        if result.get('glpk_basis_status') == 'source_verified_point_and_bound':
+                                            # The direct proposal has its own rigorous support scan.
+                                            # Exercise the native binary pricing path on the same input.
+                                            self.assertGreater(result['source_support_scans'], 0)
+                                            run, result, model, solution = self.solve(
+                                                root / (name + '-basis'), text, mode, ['--glpk-basis'])
+                                            self.assertEqual(run.returncode, 0, (run.stdout, run.stderr))
+                                            self.assertEqual(result['status'], 'optimal')
+                                            self.assertEqual(self.checked(model, solution, True), expected)
                                         self.assertEqual(result['source_support_scans'], 0)
                                         self.assertGreater(result['source_support_binary_paths'], 0)
 

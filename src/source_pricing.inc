@@ -1,7 +1,7 @@
 /* Bounded source-objective decisions. This file never changes .exact or the
  * floating factor: exact signs select ordinary guarded primal pivots, and an
  * exact source dual can close a numerically rejected support-gap check. */
-enum { SOURCE_PRICE_ROWS = 4096, SOURCE_PRICE_COLS = 16384, SOURCE_PRICE_NNZ = 100000 };
+enum { SOURCE_PRICE_ROWS = 4096, SOURCE_PRICE_COLS = 131072, SOURCE_PRICE_NNZ = 2000000 };
 static int source_price_q(const mpq_t q) {
     return mpz_sgn(mpq_denref(q)) > 0 &&
            mpz_sizeinbase(mpq_numref(q), 2) <= LAB_RATIONAL_MAX_BITS &&
@@ -154,7 +154,7 @@ static int source_price_entry(const Work *w, size_t j, size_t k, mpq_t q) {
 static int source_price_coverage(const Work *w, double deadline) {
     const LabModel *m = w->model;
     size_t *head = lab_alloc(m->rows, sizeof(size_t)), *next = lab_alloc(w->m, sizeof(size_t));
-    unsigned char *seen = lab_alloc(w->m, 1);
+    size_t *seen = lab_alloc(w->m, sizeof *seen);
     mpq_t q;
     mpq_init(q);
     int valid = 1;
@@ -170,22 +170,21 @@ static int source_price_coverage(const Work *w, double deadline) {
             valid = 0;
             break;
         }
-        memset(seen, 0, w->m);
         const Column *c = &w->a[j];
         for (size_t k = 0; k < c->count; k++)
-            seen[c->row[k]] = 1;
+            seen[c->row[k]] = j + 1;
         size_t original = w->original[j];
         for (size_t k = m->col_start[original]; k < m->col_start[original + 1]; k++) {
-            if (lab_source_exact_coefficient(m, k, q) || !source_price_guard(q, deadline)) {
-                valid = 0;
-                break;
+            /* Only omitted coordinates need a source zero check here. The
+             * dual solve and reduced-cost scan fetch represented coefficients. */
+            for (size_t i = head[m->row_index[k]]; i != SIZE_MAX; i = next[i]) {
+                if (seen[i] != j + 1 &&
+                    (lab_source_exact_coefficient(m, k, q) ||
+                     !source_price_guard(q, deadline) || mpq_sgn(q))) {
+                    valid = 0;
+                    break;
+                }
             }
-            if (mpq_sgn(q))
-                for (size_t i = head[m->row_index[k]]; i != SIZE_MAX; i = next[i])
-                    if (!seen[i]) {
-                        valid = 0;
-                        break;
-                    }
             if (!valid)
                 break;
         }
@@ -563,6 +562,12 @@ static int source_gap_closure(Work *w, const double *point) {
     int available = 0, bad = 1;
     if (valid)
         bad = source_price_gap(w, point, dual, deadline, &available);
+    if (available == 1 && !bad) {
+        w->result->dual_rational = lab_alloc(m->rows, sizeof(char *));
+        w->result->dual_rows = m->rows;
+        for (size_t i = 0; i < m->rows; i++)
+            w->result->dual_rational[i] = mpq_get_str(NULL, 10, dual[i]);
+    }
     source_price_free(pi, w->m);
     source_price_free(dual, m->rows);
     mpq_clears(scale, term, NULL);
