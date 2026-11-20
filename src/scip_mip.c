@@ -134,7 +134,8 @@ int lab_scip_mip(const LabModel *m, const double *lower, const double *upper,
         SCIPsetIntParam(s, "separating/rapidlearning/freq", 0) != SCIP_OKAY ||
         SCIPsetIntParam(s, "separating/aggregation/maxroundsroot", 10) != SCIP_OKAY ||
         SCIPsetRealParam(s, "heuristics/rens/minfixingrate", 0.3) != SCIP_OKAY ||
-        SCIPsetIntParam(s, "heuristics/farkasdiving/freq", 20) != SCIP_OKAY ||
+        SCIPsetIntParam(s, "heuristics/rins/freq", 15) != SCIP_OKAY ||
+        SCIPsetIntParam(s, "heuristics/farkasdiving/freq", -1) != SCIP_OKAY ||
         SCIPsetIntParam(s, "heuristics/conflictdiving/freq", 20) != SCIP_OKAY)
         goto done;
     if ((m->rows >= 2000 || m->nnz >= 100000) &&

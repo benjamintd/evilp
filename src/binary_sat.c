@@ -451,6 +451,95 @@ static int sequential_counter(Encoder *e, const Term *t, int n, int64_t cap) {
     return ok;
 }
 
+/* Exact Generalized-Arc-Consistent (GAC) Totalizer encoding (Bailleux & Boufkhad
+ * 2003) for unweighted cardinality sum_{i=0}^{n-1} t[i].lit <= cap, 2 <= cap <= 512. */
+typedef struct {
+    int *lits;
+    int len;
+} TotNode;
+
+static int pb_totalizer_at_most(Encoder *e, const Term *t, int n, int cap) {
+    if (n <= cap || cap < 2 || cap > 512)
+        return 0;
+    if ((int64_t)n * cap > 250000 || e->clauses + (size_t)n * (size_t)cap * 2 > MAX_CLAUSES)
+        return 0;
+    TotNode *layer = lab_alloc((size_t)n, sizeof *layer);
+    int cur_n = n;
+    for (int i = 0; i < n; ++i) {
+        layer[i].lits = lab_alloc(1, sizeof(int));
+        layer[i].lits[0] = t[i].lit;
+        layer[i].len = 1;
+    }
+    int ok = 1;
+    while (cur_n > 1 && ok) {
+        int next_n = 0;
+        for (int i = 0; i < cur_n; i += 2) {
+            if (i + 1 == cur_n) {
+                layer[next_n++] = layer[i];
+                continue;
+            }
+            if (e->clauses > MAX_CLAUSES || stopped(e)) {
+                ok = 0;
+                break;
+            }
+            const int *L = layer[i].lits;
+            int la = layer[i].len;
+            const int *R = layer[i + 1].lits;
+            int rb = layer[i + 1].len;
+            int is_root = (cur_n == 2);
+            if (is_root) {
+                for (int a = 1; a <= la; ++a) {
+                    int b = cap + 1 - a;
+                    if (b >= 1 && b <= rb)
+                        binary_clause(e, -L[a - 1], -R[b - 1]);
+                }
+                free(layer[i].lits);
+                free(layer[i + 1].lits);
+                layer[next_n++] = (TotNode){NULL, 0};
+            } else {
+                int olen = la + rb;
+                if (olen > cap)
+                    olen = cap;
+                int *O = lab_alloc((size_t)olen, sizeof(int));
+                for (int k = 0; k < olen; ++k)
+                    O[k] = fresh_var(e);
+                for (int a = 1; a <= la; ++a)
+                    binary_clause(e, -L[a - 1], O[a - 1]);
+                for (int b = 1; b <= rb; ++b)
+                    binary_clause(e, -R[b - 1], O[b - 1]);
+                for (int a = 1; a <= la; ++a) {
+                    for (int b = 1; b <= rb; ++b) {
+                        int s = a + b;
+                        if (s <= cap)
+                            ternary_clause(e, -L[a - 1], -R[b - 1], O[s - 1]);
+                        else {
+                            if (s == cap + 1)
+                                binary_clause(e, -L[a - 1], -R[b - 1]);
+                            break;
+                        }
+                    }
+                }
+                free(layer[i].lits);
+                free(layer[i + 1].lits);
+                layer[next_n++] = (TotNode){O, olen};
+            }
+        }
+        if (!ok) {
+            for (int k = 0; k < next_n; ++k)
+                free(layer[k].lits);
+            for (int k = next_n * 2; k < cur_n; ++k)
+                free(layer[k].lits);
+            free(layer);
+            return 0;
+        }
+        cur_n = next_n;
+    }
+    for (int k = 0; k < cur_n; ++k)
+        free(layer[k].lits);
+    free(layer);
+    return ok && e->clauses <= MAX_CLAUSES;
+}
+
 static int at_most(Encoder *e, Term *t, int n, int64_t cap) {
     int64_t total = 0, minimum = INT64_MAX;
     for (int i = 0; i < n; ++i) {
@@ -524,6 +613,9 @@ static int at_most(Encoder *e, Term *t, int n, int64_t cap) {
             }
             return e->clauses <= MAX_CLAUSES;
         }
+        if (scaled_total == m && scaled_cap >= 2 && scaled_cap <= 512 && m >= 16 &&
+            (int64_t)m * scaled_cap <= 250000)
+            return pb_totalizer_at_most(e, t, m, (int)scaled_cap);
         if (scaled_cap <= 512 && (int64_t)m * scaled_cap <= 120000)
             return sequential_counter(e, t, m, scaled_cap);
         if (m <= 65536)
@@ -1390,6 +1482,14 @@ static int small_integer_sat(const LabModel *m, const double *lo, const double *
         }
     } else {
         int64_t pb_lo = 0, pb_hi = obj_total / obj_gcd;
+        {
+            double rem = deadline - lab_now();
+            double cap_s = (pb_hi - pb_lo > 256) ? fmin(1.5, 0.08 * rem) : fmin(8.0, 0.45 * rem);
+            if (rem > cap_s)
+                deadline = lab_now() + cap_s;
+        }
+        int64_t pb_step = 1;
+        int pb_sat_streak = 0;
         Term *cut_terms = lab_alloc((size_t)n_obj_bits, sizeof *cut_terms);
         while (lab_now() < deadline && budget) {
             int64_t pb_probe = -1;
@@ -1398,7 +1498,12 @@ static int small_integer_sat(const LabModel *m, const double *lo, const double *
                     result = 1;
                     break;
                 }
-                pb_probe = pb_hi - pb_lo <= 2 ? pb_hi - 1 : pb_lo + (pb_hi - pb_lo) / 2;
+                if (pb_hi - pb_lo <= 1)
+                    pb_probe = pb_hi - 1;
+                else if (pb_step >= pb_hi - pb_lo)
+                    pb_probe = pb_lo + (pb_hi - pb_lo) / 2;
+                else
+                    pb_probe = pb_hi - pb_step;
             }
             Encoder es = {.solver = kissat_init(),
                           .variables = e.variables,
@@ -1423,7 +1528,7 @@ static int small_integer_sat(const LabModel *m, const double *lo, const double *
             budget -= slice;
             if (!incumbent) {
                 double rem = deadline - lab_now();
-                es.deadline = lab_now() + fmin(rem, fmax(2.0, 0.35 * rem));
+                es.deadline = lab_now() + fmin(rem, fmax(1.5, fmin(5.0, 0.20 * rem)));
             }
             kissat_set_decision_limit(es.solver, slice);
             ++*calls;
@@ -1444,8 +1549,22 @@ static int small_integer_sat(const LabModel *m, const double *lo, const double *
                     if (bv == (lit > 0))
                         cur_scaled += obj_terms[k].weight;
                 }
+                int64_t new_hi = cur_scaled / obj_gcd;
+                if (incumbent) {
+                    int64_t gain = pb_hi - new_hi;
+                    if (gain <= pb_step && new_hi - pb_lo > 4) {
+                        if (++pb_sat_streak >= 2) {
+                            int64_t half = (new_hi - pb_lo) / 2;
+                            pb_step = pb_step < half ? pb_step * 2 : half;
+                            pb_sat_streak = 0;
+                        }
+                    } else {
+                        pb_step = 1;
+                        pb_sat_streak = 0;
+                    }
+                }
                 incumbent = 1;
-                pb_hi = cur_scaled / obj_gcd;
+                pb_hi = new_hi;
                 if (pb_hi <= pb_lo) {
                     result = 1;
                     break;
@@ -1456,6 +1575,8 @@ static int small_integer_sat(const LabModel *m, const double *lo, const double *
                     break;
                 }
                 pb_lo = pb_probe + 1;
+                pb_step = 1;
+                pb_sat_streak = 0;
                 if (pb_lo >= pb_hi) {
                     result = 1;
                     break;
@@ -1996,6 +2117,16 @@ int lab_binary_sat(const LabModel *m, const double *lo, const double *hi, double
             cb_free(&base_cnf);
         }
     }
+    if (pb_mode && cost.n > 0) {
+        double rem = deadline - lab_now();
+        double cap_s = (cost.n <= 4) ? fmin(18.0, 0.55 * rem)
+                                     : ((pb_hi - pb_lo > 256) ? fmin(1.5, 0.08 * rem)
+                                                              : fmin(8.0, 0.45 * rem));
+        if (rem > cap_s)
+            deadline = lab_now() + cap_s;
+    }
+    int64_t pb_step = 1;
+    int pb_sat_streak = 0;
     while (lab_now() < deadline && budget) {
         if (pb_mode && !have_base)
             break;
@@ -2014,7 +2145,12 @@ int lab_binary_sat(const LabModel *m, const double *lo, const double *hi, double
                 result = 1;
                 break;
             }
-            pb_probe = pb_hi - pb_lo <= 2 ? pb_hi - 1 : pb_lo + (pb_hi - pb_lo) / 2;
+            if (pb_hi - pb_lo <= 1)
+                pb_probe = pb_hi - 1;
+            else if (pb_step >= pb_hi - pb_lo)
+                pb_probe = pb_lo + (pb_hi - pb_lo) / 2;
+            else
+                pb_probe = pb_hi - pb_step;
         }
         int skipped_rows = 0;
         int encoded = 1;
@@ -2070,7 +2206,7 @@ int lab_binary_sat(const LabModel *m, const double *lo, const double *hi, double
         budget -= slice;
         if (pb_mode && !incumbent && cost.n > 0) {
             double rem = deadline - lab_now();
-            e.deadline = lab_now() + fmin(rem, fmax(2.0, 0.35 * rem));
+            e.deadline = lab_now() + fmin(rem, fmax(1.5, fmin(5.0, 0.20 * rem)));
         }
         kissat_set_decision_limit(e.solver, slice);
         ++*calls;
@@ -2094,12 +2230,27 @@ int lab_binary_sat(const LabModel *m, const double *lo, const double *hi, double
                     if (pb_mode)
                         cur_scaled += cost.scaled[k];
                 }
-            incumbent = 1;
             if (pb_mode) {
-                pb_hi = cur_scaled / cost.scaled_gcd;
+                int64_t new_hi = cur_scaled / cost.scaled_gcd;
+                if (incumbent) {
+                    int64_t gain = pb_hi - new_hi;
+                    if (gain <= pb_step && new_hi - pb_lo > 4) {
+                        if (++pb_sat_streak >= 2) {
+                            int64_t half = (new_hi - pb_lo) / 2;
+                            pb_step = pb_step < half ? pb_step * 2 : half;
+                            pb_sat_streak = 0;
+                        }
+                    } else {
+                        pb_step = 1;
+                        pb_sat_streak = 0;
+                    }
+                }
+                incumbent = 1;
+                pb_hi = new_hi;
                 if (pb_hi <= pb_lo)
                     result = 1;
             } else {
+                incumbent = 1;
                 seed = 0;
                 local_deadline = lab_now() + .6 * (deadline - lab_now());
                 if (!mpq_sgn(cost.cutoff))
@@ -2113,6 +2264,8 @@ int lab_binary_sat(const LabModel *m, const double *lo, const double *hi, double
         } else if (status == 20) {
             if (pb_mode && incumbent) {
                 pb_lo = pb_probe + 1;
+                pb_step = 1;
+                pb_sat_streak = 0;
                 if (pb_lo >= pb_hi)
                     result = 1;
             } else {

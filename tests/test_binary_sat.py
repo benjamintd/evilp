@@ -214,6 +214,26 @@ class BinarySAT(unittest.TestCase):
         self.assertEqual(r_nat['status'], 'optimal', r_nat)
         self.assertEqual(v, v_nat)
 
+    def test_pb_totalizer_unit_cardinality_and_descent(self):
+        # 36 binary vars with unit-weight cardinality rows (n >= 16, cap >= 2 -> GAC Totalizer)
+        # and unit objective (> 16 terms -> pb_mode adaptive linear-exponential descent).
+        n = 36
+        costs = [1] * n
+        rows = [
+            ([1] * n, 14, 24),
+            ([1 if j < 24 else 0 for j in range(n)], None, 9),
+            ([1 if j >= 12 else 0 for j in range(n)], None, 10),
+            ([1 if j % 2 == 0 else -1 for j in range(n)], -1, 1),
+            ([1 if j % 3 == 0 else -1 if j % 3 == 1 else 0 for j in range(n)], 0, 2),
+        ]
+        m = model(costs, rows, maximize=False)
+        r, v = self.solve(m)
+        self.assertEqual(r['status'], 'optimal', r)
+        self.assertGreater(r['sat_calls'], 0)
+        r_ref, v_ref = self.solve(m, ['--no-binary-sat'])
+        self.assertEqual(r_ref['status'], 'optimal', r_ref)
+        self.assertEqual(v, v_ref)
+
 
 if __name__ == '__main__':
     unittest.main()
