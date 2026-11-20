@@ -631,6 +631,8 @@ static int complete_point_search(Search *s, const Node *node, const char *messag
     trace(s, node, event, SIZE_MAX, objective, 1);
     return 1;
 }
+#define LAB_PHASE(sp, name) do { if (getenv("LAB_PHASE_TRACE")) \
+    fprintf(stderr, "phase %s remaining=%.3f\n", (name), remaining(sp)); } while (0)
 #ifdef LAB_SCIP_INTEGER
 /* Returns 1 if search terminated (optimal/infeasible/time_limit/node_limit), 0 to continue. */
 static int run_scip_mip(Search *s, const Node *node) {
@@ -1047,6 +1049,7 @@ void lab_bb_solve(const LabModel *model, const LabBbOptions *options, LabBbResul
         }
         LabLpResult lp;
         result->nodes++;
+        LAB_PHASE(&s, "specialized");
         if (!node->parent && !options->no_presolve && !options->lp.no_exact) {
             size_t trials = 0;
             char **decimal = NULL;
@@ -1139,9 +1142,13 @@ void lab_bb_solve(const LabModel *model, const LabBbOptions *options, LabBbResul
             }
         }
 #ifdef LAB_KISSAT
+        LAB_PHASE(&s, "sat");
         if (!node->parent && !options->no_presolve && !options->lp.no_exact &&
             options->binary_sat >= 0 && (options->binary_sat || (n >= 64 && model->rows > 64))) {
-            int sat = lab_binary_sat(model, s.lower, s.upper, lab_now() + .85 * remaining(&s),
+            /* SAT either closes quickly or not at all on the benchmark corpus; cap its
+             * share so a stalled encoding cannot starve the branch-and-cut engine. */
+            double sat_budget = fmin(.85 * remaining(&s), fmax(25.0, .25 * remaining(&s)));
+            int sat = lab_binary_sat(model, s.lower, s.upper, lab_now() + sat_budget,
                                      options->sat_decision_limit ? options->sat_decision_limit : options->node_limit,
                                      s.repair_lower, &result->sat_calls);
             double objective;
@@ -1171,6 +1178,7 @@ void lab_bb_solve(const LabModel *model, const LabBbOptions *options, LabBbResul
 #ifdef LAB_SCIP_INTEGER
         if (!node->parent && !options->no_presolve && !options->lp.no_exact && !options->cold &&
             !options->first_fractional && !options->no_root_cuts && !options->no_root_diving) {
+            LAB_PHASE(&s, "integer_mip");
             LabIntegerMipStats stats;
             int found = lab_integer_mip(model, s.base_lower, s.base_upper,
                                         lab_now() + .75 * remaining(&s),
@@ -1197,6 +1205,7 @@ void lab_bb_solve(const LabModel *model, const LabBbOptions *options, LabBbResul
             for (size_t i = 0; is_partition && i < model->rows; i++)
                 if (model->row_lower[i] != 1 || model->row_upper[i] != 1)
                     is_partition = 0;
+            LAB_PHASE(&s, "scip_mip");
             if (!is_partition && run_scip_mip(&s, node)) {
                 release(node);
                 goto cleanup;
