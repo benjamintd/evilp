@@ -1,0 +1,30 @@
+{
+  "schema": 1,
+  "role": "Optional C17 integer branch-and-cut engine with linear-time BFRT bound-flip update, 3-way degenerate ratio sort, cached-basis strong branching with infeasibility bounds, free-row conflict analysis, and time-limit/basis fixes",
+  "sources": [
+    {
+      "name": "SCIP",
+      "version": "9.2.4",
+      "commit": "a94f778ac864f6c488e64f10f683c9d05253aa79",
+      "url": "https://codeload.github.com/scipopt/scip/tar.gz/a94f778ac864f6c488e64f10f683c9d05253aa79",
+      "sha256": "249a2705eae81e99651d9d0cc2b037a94fad6af94441eb1605c27e9f3f833c92",
+      "license": "Apache-2.0",
+      "license_file": "LICENSE"
+    },
+    {
+      "name": "QSopt_ex",
+      "version": "2.5.10.3",
+      "commit": "e5d498fde468e4669a3fbc4736e5d3b878e8c148",
+      "url": "https://codeload.github.com/jonls/qsopt-ex/tar.gz/e5d498fde468e4669a3fbc4736e5d3b878e8c148",
+      "sha256": "2057309accfe27fee553090e19f0c051a101e393a758cc31549e194a88bf0fbe",
+      "license": "GPL-3.0-or-later",
+      "license_file": "License.txt"
+    }
+  ],
+  "patches": {
+    "config/patches/scip-9.2.4-c17-v5.patch": "33eb396ec572055d80a82683de90ea81ebba33af54091c2693f3d83fbcc4971f",
+    "config/patches/scip-qsopt-ex-compat.h": "798b0c471d5f0eee462c7cb26cbc96997b6d26bcd2e2096ac2f8204a30ddb4bb",
+    "config/patches/qsopt-ex-c17-v7.patch": "2216fbd42694ea9ac86b8b345776603aa9ea0445d31ad61413a73a7f5c52bda1"
+  },
+  "version": 7
+}

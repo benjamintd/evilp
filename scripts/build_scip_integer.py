@@ -11,7 +11,7 @@ import tarfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_LOCK = ROOT / 'config/scip-integer-v6.lock.json'
+DEFAULT_LOCK = ROOT / 'config/scip-integer-v7.lock.json'
 
 
 def sha(path):
