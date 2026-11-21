@@ -57,8 +57,18 @@ SAT-active instances: 15 solved (was 14), no lost solves.
 | Screen (240 instances, 60 s) | Correct solves | Wins vs HiGHS | of which HiGHS unsolved |
 |---|---:|---:|---:|
 | HiGHS 1.15.1 | 43 reported | — | — |
-| Lab, previous full screen (`lab-screen-60s-v6`) | 40 | 33 | — |
+| Lab, previous full screen (`lab-screen-60s-v6`)* | 40 | 33 | — |
 | Lab v9 | 43 | 36 | 16 |
+
+\* Not valid timing evidence: 160 of its 240 rows ran across macOS system
+sleep (Lab's internal solve clock exceeds the harness wall time by more than
+5 s). On macOS `CLOCK_MONOTONIC`, which Lab uses for deadlines, advances
+during sleep while the harness's `time.monotonic()` does not, producing
+spurious time limits and watchdog stops. The v9 screen has no affected rows.
+The HiGHS baseline's 18 suspicious rows (early time limits and watchdogs)
+were rerun awake; HiGHS again stopped early on all 18, so the 36 wins stand.
+The screen runner now runs under `caffeinate` and marks such rows
+`sleep_affected`, never as passes or failures.
 
 Fleet models (user data, no locked reference; every Lab witness checker-valid):
 Lab proves optimality on 2 of 6 (2300 in 43.2 s, 2330 in 36.1 s; HiGHS 1 of 6,
