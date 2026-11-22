@@ -1,0 +1,72 @@
+--- a/src/blockmemshell/memory.c
++++ b/src/blockmemshell/memory.c
+@@ -1361,7 +1361,7 @@
+    )
+ {
+    CHUNK* chunk;
+-   CHUNK* nexteager;
++   CHUNK* lastchunk;
+    FREELIST* lazyfree;
+ 
+    assert(chkmem != NULL);
+@@ -1379,7 +1379,11 @@
+    chkmem->ngarbagecalls++;
+ #endif
+ 
+-   /* put the lazy free elements into the eager free lists */
++   /* put the lazy free elements into the eager free lists, caching the last
++    * chunk for O(1) sequential frees and immediately freeing any chunk that
++    * becomes completely unused (avoiding an O(nchunks) scan over firsteager).
++    */
++   lastchunk = NULL;
+    while( chkmem->lazyfree != NULL )
+    {
+       /* unlink first element from the lazy free list */
+@@ -1388,7 +1392,10 @@
+       chkmem->lazyfreesize--;
+ 
+       /* identify the chunk of the element */
+-      chunk = findChunk(chkmem, (void*)lazyfree);
++      if( lastchunk != NULL && (size_t)lazyfree >= (size_t)lastchunk->store && (size_t)lazyfree < (size_t)lastchunk->storeend )
++         chunk = lastchunk;
++      else
++         chunk = findChunk(chkmem, (void*)lazyfree);
+ #ifndef NDEBUG
+       if( chunk == NULL )
+       {
+@@ -1400,23 +1407,21 @@
+       /* add the element to the chunk's eager free list */
+       freeChunkElement(chunk, (void*)lazyfree);
+       assert(chunk->eagerfreesize > 0);
+-   }
+-   assert(chkmem->lazyfreesize == 0);
+-
+-   /* delete completely unused chunks, but keep at least one */
+-   chunk = chkmem->firsteager;
+-   while( chunk != NULL && chkmem->nchunks > 1 )
+-   {
+-      nexteager = chunk->nexteager;
+-      if( chunk->eagerfreesize == chunk->storesize )
++
++      if( chunk->eagerfreesize == chunk->storesize && chkmem->nchunks > 1 )
+       {
+ #ifndef NDEBUG
+-	 chkmem->ngarbagefrees++;
+-#endif
+-	 freeChunk(&chunk, memsize);
++         chkmem->ngarbagefrees++;
++#endif
++         freeChunk(&chunk, memsize);
++         lastchunk = NULL;
+       }
+-      chunk = nexteager;
+-   }
++      else
++      {
++         lastchunk = chunk;
++      }
++   }
++   assert(chkmem->lazyfreesize == 0);
+ 
+    checkChkmem(chkmem);
+ }
