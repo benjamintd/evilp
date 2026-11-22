@@ -1,0 +1,244 @@
+--- a/src/scip/struct_event.h
++++ b/src/scip/struct_event.h
+@@ -191,6 +191,9 @@
+    SCIP_EVENTHDLR**      eventhdlrs;         /**< array with event handlers to process the event */
+    SCIP_EVENTDATA**      eventdata;          /**< array with user data for the issued event */
+    int*                  nextpos;            /**< linked lists for free, delayed added and delayed deleted slot positions */
++   int*                  hashhead;           /**< lazy hash table bucket heads (NULL until search on large filter) */
++   int*                  hashnext;           /**< lazy hash chain next pointers (sized to eventfilter->size when active) */
++   int                   hashsize;           /**< number of hash buckets (power of two, 0 when inactive) */
+    int                   size;               /**< size of filter arrays (available slots in arrays) */
+    int                   len;                /**< number entries in filter arrays (used and deleted) */
+    int                   firstfreepos;       /**< first deleted slot; remaining slots are in poslist */
+--- a/src/scip/event.c
++++ b/src/scip/event.c
+@@ -31,6 +31,8 @@
+ /*---+----1----+----2----+----3----+----4----+----5----+----6----+----7----+----8----+----9----+----0----+----1----+----2*/
+ 
+ #include <assert.h>
++#include <limits.h>
++#include <stdint.h>
+ #include <string.h>
+ 
+ #include "scip/branch.h"
+@@ -1788,6 +1790,80 @@
+  * Event filter methods
+  */
+ 
++/** hash function for event filter lookup */
++static
++unsigned int eventfilterHash(
++   SCIP_EVENTTYPE const  eventtype,          /**< event type */
++   SCIP_EVENTHDLR*const  eventhdlr,          /**< event handler */
++   SCIP_EVENTDATA*const  eventdata,          /**< event data */
++   unsigned int const    mask                /**< hashsize - 1 */
++   )
++{
++   uint64_t x = (uint64_t)(uintptr_t)eventdata
++      ^ ((uint64_t)(uintptr_t)eventhdlr * 0x9e3779b97f4a7c15ULL)
++      ^ ((uint64_t)eventtype * 0xbf58476d1ce4e5b9ULL);
++   x ^= x >> 30;
++   x *= 0xbf58476d1ce4e5b9ULL;
++   x ^= x >> 27;
++   x *= 0x94d049bb133111ebULL;
++   x ^= x >> 31;
++   return (unsigned int)(x & (uint64_t)mask);
++}
++
++/** builds or rebuilds the lazy hash index over all active eventfilter entries */
++static
++SCIP_RETCODE eventfilterBuildHash(
++   SCIP_EVENTFILTER*     eventfilter,        /**< event filter */
++   BMS_BLKMEM*           blkmem              /**< block memory buffer */
++   )
++{
++   int newhashsize;
++   int target;
++   int i;
++
++   assert(eventfilter != NULL);
++   assert(blkmem != NULL);
++   assert(eventfilter->size > 0);
++
++   target = eventfilter->size > (INT_MAX / 2) ? eventfilter->size : eventfilter->size * 2;
++   newhashsize = 256;
++   while( newhashsize < target && newhashsize <= (INT_MAX / 2) )
++      newhashsize <<= 1;
++
++   if( eventfilter->hashnext == NULL )
++   {
++      SCIP_ALLOC( BMSallocBlockMemoryArray(blkmem, &eventfilter->hashnext, eventfilter->size) );
++   }
++   if( eventfilter->hashhead != NULL )
++   {
++      BMSfreeBlockMemoryArray(blkmem, &eventfilter->hashhead, eventfilter->hashsize);
++      eventfilter->hashsize = 0;
++   }
++   SCIP_ALLOC( BMSallocBlockMemoryArray(blkmem, &eventfilter->hashhead, newhashsize) );
++   eventfilter->hashsize = newhashsize;
++
++   for( i = 0; i < newhashsize; ++i )
++      eventfilter->hashhead[i] = -1;
++
++   /* insert in ascending order so bucket chains search from largest index down */
++   for( i = 0; i < eventfilter->len; ++i )
++   {
++      if( eventfilter->eventtypes[i] != SCIP_EVENTTYPE_DISABLED && eventfilter->nextpos[i] == -2 )
++      {
++         unsigned int b = eventfilterHash(eventfilter->eventtypes[i], eventfilter->eventhdlrs[i],
++            eventfilter->eventdata[i], (unsigned int)(newhashsize - 1));
++         eventfilter->hashnext[i] = eventfilter->hashhead[b];
++         eventfilter->hashhead[b] = i;
++      }
++      else
++      {
++         eventfilter->hashnext[i] = -1;
++      }
++   }
++
++   return SCIP_OKAY;
++}
++
+ /** resizes eventfilter arrays to be able to store at least num entries */
+ static
+ SCIP_RETCODE eventfilterEnsureMem(
+@@ -1810,6 +1886,10 @@
+       SCIP_ALLOC( BMSreallocBlockMemoryArray(blkmem, &eventfilter->eventhdlrs, eventfilter->size, newsize) );
+       SCIP_ALLOC( BMSreallocBlockMemoryArray(blkmem, &eventfilter->eventdata, eventfilter->size, newsize) );
+       SCIP_ALLOC( BMSreallocBlockMemoryArray(blkmem, &eventfilter->nextpos, eventfilter->size, newsize) );
++      if( eventfilter->hashnext != NULL )
++      {
++         SCIP_ALLOC( BMSreallocBlockMemoryArray(blkmem, &eventfilter->hashnext, eventfilter->size, newsize) );
++      }
+       eventfilter->size = newsize;
+    }
+    assert(num <= eventfilter->size);
+@@ -1831,6 +1911,9 @@
+    (*eventfilter)->eventhdlrs = NULL;
+    (*eventfilter)->eventdata = NULL;
+    (*eventfilter)->nextpos = NULL;
++   (*eventfilter)->hashhead = NULL;
++   (*eventfilter)->hashnext = NULL;
++   (*eventfilter)->hashsize = 0;
+    (*eventfilter)->size = 0;
+    (*eventfilter)->len = 0;
+    (*eventfilter)->firstfreepos = -1;
+@@ -1873,6 +1956,14 @@
+    }
+ 
+    /* free event filter data */
++   if( (*eventfilter)->hashhead != NULL )
++   {
++      BMSfreeBlockMemoryArray(blkmem, &(*eventfilter)->hashhead, (*eventfilter)->hashsize);
++   }
++   if( (*eventfilter)->hashnext != NULL )
++   {
++      BMSfreeBlockMemoryArray(blkmem, &(*eventfilter)->hashnext, (*eventfilter)->size);
++   }
+    BMSfreeBlockMemoryArrayNull(blkmem, &(*eventfilter)->eventtypes, (*eventfilter)->size);
+    BMSfreeBlockMemoryArrayNull(blkmem, &(*eventfilter)->eventhdlrs, (*eventfilter)->size);
+    BMSfreeBlockMemoryArrayNull(blkmem, &(*eventfilter)->eventdata, (*eventfilter)->size);
+@@ -1942,6 +2033,21 @@
+    eventfilter->eventdata[pos] = eventdata;
+    eventfilter->nextpos[pos] = -2;
+ 
++   if( eventfilter->hashhead != NULL )
++   {
++      if( eventfilter->len > eventfilter->hashsize )
++      {
++         SCIP_CALL( eventfilterBuildHash(eventfilter, blkmem) );
++      }
++      else
++      {
++         unsigned int b = eventfilterHash(eventtype, eventhdlr, eventdata,
++            (unsigned int)(eventfilter->hashsize - 1));
++         eventfilter->hashnext[pos] = eventfilter->hashhead[b];
++         eventfilter->hashhead[b] = pos;
++      }
++   }
++
+    if( filterpos != NULL )
+       *filterpos = pos;
+ 
+@@ -1986,6 +2092,8 @@
+    int                   filterpos           /**< position of event filter entry, or -1 if unknown */
+    )
+ {
++   SCIP_Bool unlinked = FALSE;
++
+    assert(eventfilter != NULL);
+    assert(blkmem != NULL);
+    assert(set != NULL);
+@@ -1995,7 +2103,42 @@
+ 
+    /* search position of event filter entry, if not given by the user */
+    if( filterpos == -1 )
+-      filterpos = eventfilterSearch(eventfilter, eventtype, eventhdlr, eventdata);
++   {
++      if( eventfilter->hashhead == NULL && eventfilter->len >= 128 )
++      {
++         SCIP_CALL( eventfilterBuildHash(eventfilter, blkmem) );
++      }
++      if( eventfilter->hashhead != NULL )
++      {
++         unsigned int b = eventfilterHash(eventtype, eventhdlr, eventdata,
++            (unsigned int)(eventfilter->hashsize - 1));
++         int prev = -1;
++         int cur = eventfilter->hashhead[b];
++         while( cur != -1 )
++         {
++            if( eventdata == eventfilter->eventdata[cur]
++               && eventhdlr == eventfilter->eventhdlrs[cur]
++               && eventtype == eventfilter->eventtypes[cur]
++               && eventfilter->nextpos[cur] == -2 )
++            {
++               if( prev == -1 )
++                  eventfilter->hashhead[b] = eventfilter->hashnext[cur];
++               else
++                  eventfilter->hashnext[prev] = eventfilter->hashnext[cur];
++               eventfilter->hashnext[cur] = -1;
++               filterpos = cur;
++               unlinked = TRUE;
++               break;
++            }
++            prev = cur;
++            cur = eventfilter->hashnext[cur];
++         }
++      }
++      else
++      {
++         filterpos = eventfilterSearch(eventfilter, eventtype, eventhdlr, eventdata);
++      }
++   }
+    if( filterpos == -1 )
+    {
+       SCIPerrorMessage("no event for event handler %p with data %p and event mask %" SCIP_EVENTTYPE_FORMAT " found in event filter %p\n",
+@@ -2007,6 +2150,28 @@
+    assert(eventfilter->eventhdlrs[filterpos] == eventhdlr);
+    assert(eventfilter->eventdata[filterpos] == eventdata);
+    assert(eventfilter->nextpos[filterpos] == -2);
++
++   if( eventfilter->hashhead != NULL && !unlinked )
++   {
++      unsigned int b = eventfilterHash(eventtype, eventhdlr, eventdata,
++         (unsigned int)(eventfilter->hashsize - 1));
++      int prev = -1;
++      int cur = eventfilter->hashhead[b];
++      while( cur != -1 )
++      {
++         if( cur == filterpos )
++         {
++            if( prev == -1 )
++               eventfilter->hashhead[b] = eventfilter->hashnext[cur];
++            else
++               eventfilter->hashnext[prev] = eventfilter->hashnext[cur];
++            eventfilter->hashnext[cur] = -1;
++            break;
++         }
++         prev = cur;
++         cur = eventfilter->hashnext[cur];
++      }
++   }
+ 
+    /* if updates are delayed, insert entry into the list of delayed deletions;
+     * otherwise, delete the entry from the filter directly and add the slot to the free list

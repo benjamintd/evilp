@@ -1,0 +1,375 @@
+#include "lpi/lpi.h"
+#include "scip/scip.h"
+#include "scip/scipdefplugins.h"
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+#define CHECK(x)                                                                                   \
+    do {                                                                                           \
+        if (!(x)) {                                                                                \
+            fprintf(stderr, "test_v16_engine failed at line %d: %s\n", __LINE__, #x);              \
+            return 1;                                                                              \
+        }                                                                                          \
+    } while (0)
+#define OK(x) CHECK((x) == SCIP_OKAY)
+
+static double elapsed_s(struct timespec a, struct timespec b) {
+    return (double)(b.tv_sec - a.tv_sec) + 1e-9 * (double)(b.tv_nsec - a.tv_nsec);
+}
+
+/* 1. Stress dense-column LU factorization (lazy column pruning + cancellations +
+ *    adaptive dense U-solve bailout for dim >= 256) and verify primal/dual optimality. */
+static int test_dense_lu_and_u_bailout(void) {
+    const int nrows = 300;
+    const int nstruct = 340;
+    const int ndense = 10;
+    const int max_nnz = nrows * 12 + ndense * nrows;
+    double *obj = calloc((size_t)nstruct, sizeof *obj);
+    double *lo = calloc((size_t)nstruct, sizeof *lo);
+    double *hi = calloc((size_t)nstruct, sizeof *hi);
+    double *lhs = calloc((size_t)nrows, sizeof *lhs);
+    double *rhs = calloc((size_t)nrows, sizeof *rhs);
+    int *beg = calloc((size_t)nstruct, sizeof *beg);
+    int *ind = calloc((size_t)max_nnz, sizeof *ind);
+    double *val = calloc((size_t)max_nnz, sizeof *val);
+    CHECK(obj && lo && hi && lhs && rhs && beg && ind && val);
+
+    for (int i = 0; i < nrows; ++i) {
+        lhs[i] = 1.0 + 0.1 * (double)(i % 7);
+        rhs[i] = 1e20;
+    }
+
+    int nnz = 0;
+    for (int j = 0; j < nstruct; ++j) {
+        obj[j] = 1.0 + 0.05 * (double)((j * 13 + 5) % 29);
+        lo[j] = 0.0;
+        hi[j] = 10.0;
+        beg[j] = nnz;
+        if (j < nrows) {
+            /* Banded upper-triangular coupling chain + cancellation pairs */
+            ind[nnz] = j;
+            val[nnz++] = 2.0;
+            if (j > 0) {
+                ind[nnz] = j - 1;
+                val[nnz++] = (j % 3 == 0) ? -1.0 : 1.0;
+            }
+            if (j >= 2) {
+                ind[nnz] = j - 2;
+                val[nnz++] = 0.5;
+            }
+            if (j + 5 < nrows) {
+                ind[nnz] = j + 5;
+                val[nnz++] = (j % 2 == 0) ? 0.25 : -0.25;
+            }
+        } else if (j < nrows + ndense) {
+            /* Dense linking columns (~40% density) */
+            int phase = j - nrows;
+            obj[j] = 0.2 + 0.03 * (double)phase;
+            for (int r = phase % 2; r < nrows; r += 2) {
+                if ((r + phase) % 5 != 0) {
+                    ind[nnz] = r;
+                    val[nnz++] = ((r + phase) % 3 == 0) ? -0.5 : 1.0;
+                }
+            }
+        } else {
+            /* Extra sparse columns */
+            for (int k = 0; k < 4; ++k) {
+                int r = (j * 17 + k * 53) % nrows;
+                ind[nnz] = r;
+                val[nnz++] = 1.0 + 0.2 * (double)k;
+            }
+        }
+    }
+    CHECK(nnz <= max_nnz);
+
+    SCIP_LPI *lp = NULL;
+    OK(SCIPlpiCreate(&lp, NULL, "v16_dense_lu", SCIP_OBJSEN_MINIMIZE));
+    OK(SCIPlpiLoadColLP(lp, SCIP_OBJSEN_MINIMIZE, nstruct, obj, lo, hi, NULL, nrows, lhs, rhs, NULL,
+                        nnz, beg, ind, val));
+    OK(SCIPlpiSolveDual(lp));
+    CHECK(SCIPlpiIsOptimal(lp));
+
+    double objval = 0.0;
+    double *prim = calloc((size_t)nstruct, sizeof *prim);
+    double *dual = calloc((size_t)nrows, sizeof *dual);
+    double *act = calloc((size_t)nrows, sizeof *act);
+    CHECK(prim && dual && act);
+    OK(SCIPlpiGetSol(lp, &objval, prim, dual, NULL, NULL));
+
+    /* Independently check Ax >= lhs and c^T x == objval */
+    double calc_obj = 0.0;
+    for (int j = 0; j < nstruct; ++j) {
+        CHECK(prim[j] >= lo[j] - 1e-7 && prim[j] <= hi[j] + 1e-7);
+        calc_obj += obj[j] * prim[j];
+        int end = (j + 1 < nstruct) ? beg[j + 1] : nnz;
+        for (int k = beg[j]; k < end; ++k)
+            act[ind[k]] += val[k] * prim[j];
+    }
+    CHECK(fabs(calc_obj - objval) <= 1e-6 * (1.0 + fabs(objval)));
+    for (int i = 0; i < nrows; ++i) {
+        CHECK(act[i] >= lhs[i] - 1e-6);
+        CHECK(dual[i] >= -1e-6);
+    }
+
+    /* Trigger bound changes + re-solves (Forrest-Tomlin updates & refactorizations) */
+    for (int step = 0; step < 6; ++step) {
+        int col = nrows + (step % ndense);
+        double newub = 0.5 + 0.3 * (double)step;
+        double newlb = 0.0;
+        OK(SCIPlpiChgBounds(lp, 1, &col, &newlb, &newub));
+        OK(SCIPlpiSolveDual(lp));
+        CHECK(SCIPlpiIsOptimal(lp));
+    }
+
+    /* Check sparse BInv rows match dense BInv rows on sampled indices */
+    double *drow = calloc((size_t)nrows, sizeof *drow);
+    double *srow = calloc((size_t)nrows, sizeof *srow);
+    int *rinds = calloc((size_t)nrows, sizeof *rinds);
+    CHECK(drow && srow && rinds);
+    for (int r = 0; r < nrows; r += 37) {
+        int ninds = -1;
+        memset(drow, 0, (size_t)nrows * sizeof *drow);
+        memset(srow, 0, (size_t)nrows * sizeof *srow);
+        OK(SCIPlpiGetBInvRow(lp, r, drow, NULL, NULL));
+        OK(SCIPlpiGetBInvRow(lp, r, srow, rinds, &ninds));
+        CHECK(ninds >= 0 && ninds <= nrows);
+        for (int i = 0; i < nrows; ++i)
+            CHECK(fabs(drow[i] - srow[i]) <= 1e-9 * (1.0 + fabs(drow[i])));
+    }
+
+    free(drow);
+    free(srow);
+    free(rinds);
+    free(prim);
+    free(dual);
+    free(act);
+    OK(SCIPlpiFree(&lp));
+    free(obj);
+    free(lo);
+    free(hi);
+    free(lhs);
+    free(rhs);
+    free(beg);
+    free(ind);
+    free(val);
+    return 0;
+}
+
+/* 2. Stress primal steepest-edge norm reuse across objective changes (feaspump pattern)
+ *    and safe invalidation across dual solves, row/col additions, and matrix edits. */
+static int test_primal_norm_reuse_and_invalidation(void) {
+    const int nrows = 40;
+    const int ncols = 60;
+    double *obj = calloc((size_t)ncols, sizeof *obj);
+    double *lo = calloc((size_t)ncols, sizeof *lo);
+    double *hi = calloc((size_t)ncols, sizeof *hi);
+    double *lhs = calloc((size_t)nrows, sizeof *lhs);
+    double *rhs = calloc((size_t)nrows, sizeof *rhs);
+    int *beg = calloc((size_t)ncols, sizeof *beg);
+    int *ind = calloc((size_t)(ncols * 4), sizeof *ind);
+    double *val = calloc((size_t)(ncols * 4), sizeof *val);
+    CHECK(obj && lo && hi && lhs && rhs && beg && ind && val);
+
+    for (int i = 0; i < nrows; ++i) {
+        lhs[i] = 1.5;
+        rhs[i] = 1e20;
+    }
+    for (int j = 0; j < ncols; ++j) {
+        obj[j] = 1.0 + 0.1 * (double)(j % 11);
+        lo[j] = 0.0;
+        hi[j] = 5.0;
+        beg[j] = j * 4;
+        for (int k = 0; k < 4; ++k) {
+            ind[beg[j] + k] = (j * 3 + k * 7) % nrows;
+            val[beg[j] + k] = 1.0 + 0.25 * (double)((j + k) % 3);
+        }
+    }
+
+    SCIP_LPI *lp = NULL;
+    OK(SCIPlpiCreate(&lp, NULL, "v16_psteep", SCIP_OBJSEN_MINIMIZE));
+    OK(SCIPlpiLoadColLP(lp, SCIP_OBJSEN_MINIMIZE, ncols, obj, lo, hi, NULL, nrows, lhs, rhs, NULL,
+                        ncols * 4, beg, ind, val));
+    OK(SCIPlpiSetIntpar(lp, SCIP_LPPAR_PRICING, (int)SCIP_PRICING_STEEP));
+    OK(SCIPlpiSolvePrimal(lp));
+    CHECK(SCIPlpiIsOptimal(lp));
+
+    int *cinds = calloc((size_t)ncols, sizeof *cinds);
+    CHECK(cinds != NULL);
+    for (int j = 0; j < ncols; ++j)
+        cinds[j] = j;
+
+    /* 15 repeated objective changes + primal solves (feaspump pattern) */
+    for (int iter = 0; iter < 15; ++iter) {
+        for (int j = 0; j < ncols; ++j)
+            obj[j] = ((j + iter * 5) % 7 < 3) ? -1.0 : 1.0 + 0.07 * (double)((j * 3 + iter) % 13);
+        OK(SCIPlpiChgObj(lp, ncols, cinds, obj));
+        OK(SCIPlpiSolvePrimal(lp));
+        CHECK(SCIPlpiIsOptimal(lp));
+    }
+
+    /* Check agreement with a fresh LP on the final objective */
+    double warm_obj = 0.0;
+    OK(SCIPlpiGetObjval(lp, &warm_obj));
+    SCIP_LPI *ref = NULL;
+    OK(SCIPlpiCreate(&ref, NULL, "v16_ref", SCIP_OBJSEN_MINIMIZE));
+    OK(SCIPlpiLoadColLP(ref, SCIP_OBJSEN_MINIMIZE, ncols, obj, lo, hi, NULL, nrows, lhs, rhs, NULL,
+                        ncols * 4, beg, ind, val));
+    OK(SCIPlpiSolveDual(ref));
+    CHECK(SCIPlpiIsOptimal(ref));
+    double ref_obj = 0.0;
+    OK(SCIPlpiGetObjval(ref, &ref_obj));
+    CHECK(fabs(warm_obj - ref_obj) <= 1e-7 * (1.0 + fabs(ref_obj)));
+    OK(SCIPlpiFree(&ref));
+
+    /* Interleave dual solve, row addition, col addition, coef edit, then primal solve */
+    OK(SCIPlpiSolveDual(lp));
+    CHECK(SCIPlpiIsOptimal(lp));
+
+    int rbeg = 0;
+    int rind[3] = {0, 5, 10};
+    double rval[3] = {1.0, 1.0, 1.0};
+    double rlhs = 0.5, rrhs = 1e20;
+    OK(SCIPlpiAddRows(lp, 1, &rlhs, &rrhs, NULL, 3, &rbeg, rind, rval));
+    OK(SCIPlpiSolvePrimal(lp));
+    CHECK(SCIPlpiIsOptimal(lp));
+
+    int cbeg = 0;
+    int cind[2] = {0, nrows};
+    double cval[2] = {2.0, 1.0};
+    double cobj = 0.5, clb = 0.0, cub = 3.0;
+    OK(SCIPlpiAddCols(lp, 1, &cobj, &clb, &cub, NULL, 2, &cbeg, cind, cval));
+    OK(SCIPlpiSolvePrimal(lp));
+    CHECK(SCIPlpiIsOptimal(lp));
+
+    OK(SCIPlpiChgCoef(lp, 0, ncols, 3.0));
+    OK(SCIPlpiSolvePrimal(lp));
+    CHECK(SCIPlpiIsOptimal(lp));
+
+    OK(SCIPlpiFree(&lp));
+    free(cinds);
+    free(obj);
+    free(lo);
+    free(hi);
+    free(lhs);
+    free(rhs);
+    free(beg);
+    free(ind);
+    free(val);
+    return 0;
+}
+
+typedef struct {
+    SCIP_VAR *var;
+    SCIP_EVENTHDLR *hdlr;
+    int calls;
+    int did_delayed_ops;
+    int delayed_pos;
+} EventStressCtx;
+
+static SCIP_DECL_EVENTEXEC(stress_event_exec) {
+    EventStressCtx *ctx = (EventStressCtx *)SCIPeventhdlrGetData(eventhdlr);
+    (void)event;
+    ctx->calls++;
+    /* On the first callback during SCIPeventfilterProcess (delayupdates == TRUE),
+     * exercise both delayed addition and delayed deletion with filterpos = -1. */
+    if (!ctx->did_delayed_ops && eventdata == (SCIP_EVENTDATA *)(uintptr_t)10) {
+        ctx->did_delayed_ops = 1;
+        SCIP_CALL(SCIPdropVarEvent(scip, ctx->var, SCIP_EVENTTYPE_LBTIGHTENED, ctx->hdlr,
+                                   (SCIP_EVENTDATA *)(uintptr_t)20, -1));
+        SCIP_CALL(SCIPcatchVarEvent(scip, ctx->var, SCIP_EVENTTYPE_LBTIGHTENED, ctx->hdlr,
+                                    (SCIP_EVENTDATA *)(uintptr_t)999999, &ctx->delayed_pos));
+    }
+    return SCIP_OKAY;
+}
+
+/* 3. Stress SCIP_EventFilter lazy O(1) hash table: 4096 events, duplicates,
+ *    delayed add/del during SCIPeventfilterProcess, and O(n) drop with filterpos = -1. */
+static int test_eventfilter_lazy_hash(void) {
+    const int n = 4096;
+    SCIP *scip = NULL;
+    OK(SCIPcreate(&scip));
+    OK(SCIPincludeDefaultPlugins(scip));
+    OK(SCIPcreateProbBasic(scip, "eventfilter_stress"));
+
+    EventStressCtx ctx;
+    memset(&ctx, 0, sizeof ctx);
+    ctx.delayed_pos = -1;
+
+    SCIP_EVENTHDLR *hdlr = NULL;
+    OK(SCIPincludeEventhdlrBasic(scip, &hdlr, "v16_stress_ev", "eventfilter hash stress",
+                                 stress_event_exec, (SCIP_EVENTHDLRDATA *)&ctx));
+    ctx.hdlr = hdlr;
+
+    SCIP_VAR *var = NULL;
+    OK(SCIPcreateVarBasic(scip, &var, "x", 0.0, 10.0, 1.0, SCIP_VARTYPE_CONTINUOUS));
+    OK(SCIPaddVar(scip, var));
+
+    /* Transform problem so event queue / variable event filters are active */
+    OK(SCIPtransformProb(scip));
+    SCIP_VAR *tvar = SCIPvarGetTransVar(var);
+    CHECK(tvar != NULL);
+    ctx.var = tvar;
+
+    /* Catch n distinct events + 1 duplicate of id=7 */
+    int *fpos = calloc((size_t)n, sizeof *fpos);
+    CHECK(fpos != NULL);
+    for (int i = 0; i < n; ++i) {
+        OK(SCIPcatchVarEvent(scip, tvar, SCIP_EVENTTYPE_LBTIGHTENED, hdlr,
+                             (SCIP_EVENTDATA *)(uintptr_t)(i + 1), &fpos[i]));
+    }
+    int dup_pos = -1;
+    OK(SCIPcatchVarEvent(scip, tvar, SCIP_EVENTTYPE_LBTIGHTENED, hdlr,
+                         (SCIP_EVENTDATA *)(uintptr_t)7, &dup_pos));
+    CHECK(dup_pos >= 0);
+
+    /* Drop the duplicate via filterpos = -1 (activates lazy hash table since len >= 128) */
+    OK(SCIPdropVarEvent(scip, tvar, SCIP_EVENTTYPE_LBTIGHTENED, hdlr,
+                        (SCIP_EVENTDATA *)(uintptr_t)7, -1));
+
+    /* Drop one entry using explicit filterpos != -1 while hash table is active */
+    OK(SCIPdropVarEvent(scip, tvar, SCIP_EVENTTYPE_LBTIGHTENED, hdlr,
+                        (SCIP_EVENTDATA *)(uintptr_t)15, fpos[14]));
+
+    /* Trigger LBTIGHTENED event -> exercises delayed add & delayed del inside Process */
+    OK(SCIPchgVarLbGlobal(scip, tvar, 1.0));
+    CHECK(ctx.did_delayed_ops == 1);
+    CHECK(ctx.calls >= n - 2);
+    CHECK(ctx.delayed_pos >= 0);
+
+    /* Drop the delayed-added entry via filterpos = -1 */
+    OK(SCIPdropVarEvent(scip, tvar, SCIP_EVENTTYPE_LBTIGHTENED, hdlr,
+                        (SCIP_EVENTDATA *)(uintptr_t)999999, -1));
+
+    /* Now drop all remaining ~4094 events with filterpos = -1 and time it (must be O(n)) */
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    for (int i = 0; i < n; ++i) {
+        int id = i + 1;
+        if (id == 15 || id == 20)
+            continue;
+        OK(SCIPdropVarEvent(scip, tvar, SCIP_EVENTTYPE_LBTIGHTENED, hdlr,
+                            (SCIP_EVENTDATA *)(uintptr_t)id, -1));
+    }
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    double dt = elapsed_s(t0, t1);
+    CHECK(dt < 0.5);
+
+    free(fpos);
+    OK(SCIPreleaseVar(scip, &var));
+    OK(SCIPfree(&scip));
+    return 0;
+}
+
+int main(void) {
+    if (test_dense_lu_and_u_bailout() != 0)
+        return 1;
+    if (test_primal_norm_reuse_and_invalidation() != 0)
+        return 1;
+    if (test_eventfilter_lazy_hash() != 0)
+        return 1;
+    printf("test_v16_engine: ok\n");
+    return 0;
+}
