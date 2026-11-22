@@ -1,0 +1,205 @@
+--- a/src/scip/cons_knapsack.c
++++ b/src/scip/cons_knapsack.c
+@@ -5826,9 +5826,9 @@
+    if( nbinvars == 0 )
+       return SCIP_OKAY;
+ 
+-   /* set up data structures */
+-   SCIP_CALL( SCIPallocBufferArray(scip, &consvars, nbinvars) );
+-   SCIP_CALL( SCIPallocBufferArray(scip, &consvals, nbinvars) );
++   /* set up data structures (at most MIN(nbinvars, nknapvars) binary terms can be produced) */
++   SCIP_CALL( SCIPallocBufferArray(scip, &consvars, MIN(nbinvars, nknapvars)) );
++   SCIP_CALL( SCIPallocBufferArray(scip, &consvals, MIN(nbinvars, nknapvars)) );
+ 
+    /* get conshdlrdata to use cleared memory */
+    conshdlr = SCIPfindConshdlr(scip, CONSHDLR_NAME);
+@@ -6096,58 +6096,138 @@
+    nconsvars = 0;
+ 
+    /* calculate scalar which makes all coefficients integral in relative allowed difference in between
+-    * -SCIPepsilon(scip) and KNAPSACKRELAX_MAXDELTA
++    * -SCIPepsilon(scip) and KNAPSACKRELAX_MAXDELTA.
++    * When tmpindices is tracked (!noknapsackconshdlr), operate sparsely on the sorted unique touched
++    * binary indices instead of scanning all nbinvars zeros on every constraint.
+     */
+-   SCIP_CALL( SCIPcalcIntegralScalar(binvals, nbinvars, -SCIPepsilon(scip), KNAPSACKRELAX_MAXDELTA,
+-         KNAPSACKRELAX_MAXDNOM, KNAPSACKRELAX_MAXSCALE, &intscalar, &success) );
+-   SCIPdebugMsg(scip, " -> intscalar = %.15g\n", intscalar);
+-
+-   /* if coefficients cannot be made integral, we have to use a scalar of 1.0 and only round fractional coefficients down */
+-   if( !success )
+-      intscalar = 1.0;
+-
+-   /* make all coefficients integral and positive:
+-    *  - scale a~_j = a_j * intscalar
+-    *  - substitute x~_j = 1 - x_j if a~_j < 0
+-    */
+-   rhs = rhs * intscalar;
+-
+-   SCIPdebugMsg(scip, " -> rhs = %.15g\n", rhs);
+-   minact = 0;
+-   maxact = 0;
+-   for( i = 0; i < nbinvars; i++ )
+-   {
+-      SCIP_VAR* var;
+-      SCIP_Longint val;
+-
+-      val = (SCIP_Longint)SCIPfloor(scip, binvals[i] * intscalar);
+-      if( val == 0 )
+-         continue;
+-
+-      if( val > 0 )
+-      {
+-         var = binvars[i];
+-         SCIPdebugMsg(scip, " -> positive scaled binary variable %+" SCIP_LONGINT_FORMAT "<%s> (unscaled %.15g): not changed (rhs=%.15g)\n",
+-            val, SCIPvarGetName(var), binvals[i], rhs);
+-      }
+-      else
+-      {
+-         assert(val < 0);
+-
+-         SCIP_CALL( SCIPgetNegatedVar(scip, binvars[i], &var) );
+-         val = -val;  /*lint !e2704*/
+-         rhs += val;
+-         SCIPdebugMsg(scip, " -> negative scaled binary variable %+" SCIP_LONGINT_FORMAT "<%s> (unscaled %.15g): substituted by (1 - <%s>) (rhs=%.15g)\n",
+-            -val, SCIPvarGetName(binvars[i]), binvals[i], SCIPvarGetName(var), rhs);
+-      }
+-
+-      if( SCIPvarGetLbLocal(var) > 0.5 )
+-         minact += val;
+-      if( SCIPvarGetUbLocal(var) > 0.5 )
+-         maxact += val;
+-      consvals[nconsvars] = val;
+-      consvars[nconsvars] = var;
+-      nconsvars++;
++   if( !noknapsackconshdlr )
++   {
++      int nuniq = 0;
++      int k;
++
++      if( tmp == 0 )
++         goto TERMINATE;
++
++      if( tmp > 1 )
++         SCIPsortInt(tmpindices, tmp);
++      for( k = 0; k < tmp; ++k )
++      {
++         if( nuniq == 0 || tmpindices[k] != tmpindices[nuniq - 1] )
++            tmpindices[nuniq++] = tmpindices[k];
++      }
++      tmp = nuniq;
++
++      {
++         SCIP_Real* sparsevals = NULL;
++         SCIP_RETCODE retcode;
++
++         SCIP_CALL( SCIPallocBufferArray(scip, &sparsevals, nuniq) );
++         for( k = 0; k < nuniq; ++k )
++            sparsevals[k] = binvals[tmpindices[k]];
++         retcode = SCIPcalcIntegralScalar(sparsevals, nuniq, -SCIPepsilon(scip), KNAPSACKRELAX_MAXDELTA,
++            KNAPSACKRELAX_MAXDNOM, KNAPSACKRELAX_MAXSCALE, &intscalar, &success);
++         SCIPfreeBufferArray(scip, &sparsevals);
++         SCIP_CALL( retcode );
++      }
++      SCIPdebugMsg(scip, " -> intscalar = %.15g\n", intscalar);
++
++      if( !success )
++         intscalar = 1.0;
++
++      rhs = rhs * intscalar;
++
++      SCIPdebugMsg(scip, " -> rhs = %.15g\n", rhs);
++      minact = 0;
++      maxact = 0;
++      for( k = 0; k < nuniq; ++k )
++      {
++         SCIP_VAR* var;
++         SCIP_Longint val;
++
++         i = tmpindices[k];
++         val = (SCIP_Longint)SCIPfloor(scip, binvals[i] * intscalar);
++         if( val == 0 )
++            continue;
++
++         if( val > 0 )
++         {
++            var = binvars[i];
++            SCIPdebugMsg(scip, " -> positive scaled binary variable %+" SCIP_LONGINT_FORMAT "<%s> (unscaled %.15g): not changed (rhs=%.15g)\n",
++               val, SCIPvarGetName(var), binvals[i], rhs);
++         }
++         else
++         {
++            assert(val < 0);
++
++            SCIP_CALL( SCIPgetNegatedVar(scip, binvars[i], &var) );
++            val = -val;  /*lint !e2704*/
++            rhs += val;
++            SCIPdebugMsg(scip, " -> negative scaled binary variable %+" SCIP_LONGINT_FORMAT "<%s> (unscaled %.15g): substituted by (1 - <%s>) (rhs=%.15g)\n",
++               -val, SCIPvarGetName(binvars[i]), binvals[i], SCIPvarGetName(var), rhs);
++         }
++
++         if( SCIPvarGetLbLocal(var) > 0.5 )
++            minact += val;
++         if( SCIPvarGetUbLocal(var) > 0.5 )
++            maxact += val;
++         consvals[nconsvars] = val;
++         consvars[nconsvars] = var;
++         nconsvars++;
++      }
++   }
++   else
++   {
++      SCIP_CALL( SCIPcalcIntegralScalar(binvals, nbinvars, -SCIPepsilon(scip), KNAPSACKRELAX_MAXDELTA,
++            KNAPSACKRELAX_MAXDNOM, KNAPSACKRELAX_MAXSCALE, &intscalar, &success) );
++      SCIPdebugMsg(scip, " -> intscalar = %.15g\n", intscalar);
++
++      /* if coefficients cannot be made integral, we have to use a scalar of 1.0 and only round fractional coefficients down */
++      if( !success )
++         intscalar = 1.0;
++
++      /* make all coefficients integral and positive:
++       *  - scale a~_j = a_j * intscalar
++       *  - substitute x~_j = 1 - x_j if a~_j < 0
++       */
++      rhs = rhs * intscalar;
++
++      SCIPdebugMsg(scip, " -> rhs = %.15g\n", rhs);
++      minact = 0;
++      maxact = 0;
++      for( i = 0; i < nbinvars; i++ )
++      {
++         SCIP_VAR* var;
++         SCIP_Longint val;
++
++         val = (SCIP_Longint)SCIPfloor(scip, binvals[i] * intscalar);
++         if( val == 0 )
++            continue;
++
++         if( val > 0 )
++         {
++            var = binvars[i];
++            SCIPdebugMsg(scip, " -> positive scaled binary variable %+" SCIP_LONGINT_FORMAT "<%s> (unscaled %.15g): not changed (rhs=%.15g)\n",
++               val, SCIPvarGetName(var), binvals[i], rhs);
++         }
++         else
++         {
++            assert(val < 0);
++
++            SCIP_CALL( SCIPgetNegatedVar(scip, binvars[i], &var) );
++            val = -val;  /*lint !e2704*/
++            rhs += val;
++            SCIPdebugMsg(scip, " -> negative scaled binary variable %+" SCIP_LONGINT_FORMAT "<%s> (unscaled %.15g): substituted by (1 - <%s>) (rhs=%.15g)\n",
++               -val, SCIPvarGetName(binvars[i]), binvals[i], SCIPvarGetName(var), rhs);
++         }
++
++         if( SCIPvarGetLbLocal(var) > 0.5 )
++            minact += val;
++         if( SCIPvarGetUbLocal(var) > 0.5 )
++            maxact += val;
++         consvals[nconsvars] = val;
++         consvars[nconsvars] = var;
++         nconsvars++;
++      }
+    }
+ 
+    if( nconsvars > 0 )

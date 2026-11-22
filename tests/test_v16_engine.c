@@ -363,12 +363,90 @@ static int test_eventfilter_lazy_hash(void) {
     return 0;
 }
 
+/* 4. Stress sparse SCIPseparateRelaxedKnapsack on a large binary + continuous VUB model:
+ *    calls SCIPseparateRelaxedKnapsack directly with duplicate VUB substitutions onto the
+ *    same binary variable and verifies cut generation + clean binvals zeroing + O(nnz) speed. */
+static int test_sparse_relaxed_knapsack(void) {
+    const int nbin = 4000;
+    const int ncont = 6;
+    SCIP *scip = NULL;
+    OK(SCIPcreate(&scip));
+    OK(SCIPincludeDefaultPlugins(scip));
+    OK(SCIPsetIntParam(scip, "display/verblevel", 0));
+    OK(SCIPcreateProbBasic(scip, "sparse_knap_relax"));
+
+    SCIP_VAR **bvars = calloc((size_t)nbin, sizeof *bvars);
+    SCIP_VAR **cvars = calloc((size_t)ncont, sizeof *cvars);
+    CHECK(bvars && cvars);
+    for (int i = 0; i < nbin; ++i) {
+        char name[32];
+        snprintf(name, sizeof name, "b%d", i);
+        OK(SCIPcreateVarBasic(scip, &bvars[i], name, 0.0, 1.0, 1.0, SCIP_VARTYPE_BINARY));
+        OK(SCIPaddVar(scip, bvars[i]));
+    }
+    for (int j = 0; j < ncont; ++j) {
+        char name[32];
+        snprintf(name, sizeof name, "c%d", j);
+        OK(SCIPcreateVarBasic(scip, &cvars[j], name, 0.0, 10.0, 0.5, SCIP_VARTYPE_CONTINUOUS));
+        OK(SCIPaddVar(scip, cvars[j]));
+        /* VUB: c_j <= 3.5 * b_{j % 3} so duplicate binary targets occur during substitution */
+        SCIP_CONS *vub = NULL;
+        SCIP_VAR *vars[2] = {cvars[j], bvars[j % 3]};
+        SCIP_Real vals[2] = {1.0, -3.5};
+        OK(SCIPcreateConsBasicLinear(scip, &vub, name, 2, vars, vals, -SCIPinfinity(scip), 0.0));
+        OK(SCIPaddCons(scip, vub));
+        OK(SCIPreleaseCons(scip, &vub));
+    }
+
+    OK(SCIPtransformProb(scip));
+    SCIP_SOL *sol = NULL;
+    OK(SCIPcreateSol(scip, &sol, NULL));
+    for (int i = 0; i < 10; ++i)
+        OK(SCIPsetSolVal(scip, sol, SCIPvarGetTransVar(bvars[i]), 0.6));
+    for (int j = 0; j < ncont; ++j)
+        OK(SCIPsetSolVal(scip, sol, SCIPvarGetTransVar(cvars[j]), 2.0));
+
+    SCIP_VAR *kvars[10];
+    SCIP_Real kvals[10] = {2.5, 2.5, 2.5, 2.5, -1.0, -1.0, 1.5, 1.5, 1.5, 1.5};
+    for (int k = 0; k < 4; ++k)
+        kvars[k] = SCIPvarGetTransVar(bvars[k]);
+    kvars[4] = SCIPvarGetTransVar(cvars[0]);
+    kvars[5] = SCIPvarGetTransVar(cvars[3]);
+    for (int k = 6; k < 10; ++k)
+        kvars[k] = SCIPvarGetTransVar(bvars[k + 1000]);
+
+    /* Call 400 times: O(nnz) takes < 0.05s; old O(nbin) took ~0.5s+ */
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    for (int rep = 0; rep < 400; ++rep) {
+        SCIP_Bool cutoff = FALSE;
+        int ncuts = 0;
+        OK(SCIPseparateRelaxedKnapsack(scip, NULL, NULL, 10, kvars, kvals, 1.0, 5.0, sol, &cutoff,
+                                       &ncuts));
+        CHECK(!cutoff);
+    }
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    CHECK(elapsed_s(t0, t1) < 0.5);
+
+    OK(SCIPfreeSol(scip, &sol));
+    for (int i = 0; i < nbin; ++i)
+        OK(SCIPreleaseVar(scip, &bvars[i]));
+    for (int j = 0; j < ncont; ++j)
+        OK(SCIPreleaseVar(scip, &cvars[j]));
+    free(bvars);
+    free(cvars);
+    OK(SCIPfree(&scip));
+    return 0;
+}
+
 int main(void) {
     if (test_dense_lu_and_u_bailout() != 0)
         return 1;
     if (test_primal_norm_reuse_and_invalidation() != 0)
         return 1;
     if (test_eventfilter_lazy_hash() != 0)
+        return 1;
+    if (test_sparse_relaxed_knapsack() != 0)
         return 1;
     printf("test_v16_engine: ok\n");
     return 0;

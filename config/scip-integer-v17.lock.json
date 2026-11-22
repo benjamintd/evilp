@@ -1,0 +1,64 @@
+{
+  "schema": 1,
+  "role": "C17 SCIP/QSopt_ex engine with awake-time budgets, reusable eta storage, fixed internal_lpinfo reuse, O(1)-amortized lazy column pruning in LU factorization, iterative exact-order sparse L/U solves, primal steepest-edge norm reuse across objective changes, zero-malloc sparse BInv/tableau rows, rollback-able product-form eta strong branching, presolve stop checks, and lazy O(1) SCIP_EventFilter hash lookup, sparse O(nnz) SCIPseparateRelaxedKnapsack scaling, hoisted compute_zA, and 1e-4 simplex tolerance drift clamp",
+  "sources": [
+    {
+      "name": "SCIP",
+      "version": "9.2.4",
+      "commit": "a94f778ac864f6c488e64f10f683c9d05253aa79",
+      "url": "https://codeload.github.com/scipopt/scip/tar.gz/a94f778ac864f6c488e64f10f683c9d05253aa79",
+      "sha256": "249a2705eae81e99651d9d0cc2b037a94fad6af94441eb1605c27e9f3f833c92",
+      "license": "Apache-2.0",
+      "license_file": "LICENSE"
+    },
+    {
+      "name": "QSopt_ex",
+      "version": "2.5.10.3",
+      "commit": "e5d498fde468e4669a3fbc4736e5d3b878e8c148",
+      "url": "https://codeload.github.com/jonls/qsopt-ex/tar.gz/e5d498fde468e4669a3fbc4736e5d3b878e8c148",
+      "sha256": "2057309accfe27fee553090e19f0c051a101e393a758cc31549e194a88bf0fbe",
+      "license": "GPL-3.0-or-later",
+      "license_file": "License.txt"
+    }
+  ],
+  "patches": {
+    "config/patches/scip-9.2.4-c17-v7.patch": "ce64426621401e984acff6ab030f3f6a62c96715166b4645aa092659ead86bfa",
+    "config/patches/scip-qsopt-ex-compat.h": "798b0c471d5f0eee462c7cb26cbc96997b6d26bcd2e2096ac2f8204a30ddb4bb",
+    "config/patches/qsopt-ex-c17-v9.patch": "f4a4731262b6e0201673b63cd7873270fceb12f7f957fa74de19d46f37308135",
+    "config/patches/scip-awake-budgets-v1.patch": "81bb10f69d85a71a820c907b929250819326e2ff65daf7e698dbd7626c112258",
+    "config/patches/qsopt-ex-awake-budgets-v1.patch": "6bbbbad28413a6f81a725a2ed4edfa7a4e96f882ad97681ac1cebcd68d4eec9c",
+    "config/patches/qsopt-ex-eta-storage-v1.patch": "bde59d12eee58080fa1900e661024a5a4f3b5b0114bd840a5acce856bf099042",
+    "config/patches/qsopt-ex-empty-vectors-v1.patch": "c2a967c3fddff792f14ff89cf26e09fefc5babf9f2f0b7b42fbcb05872df23d3",
+    "config/patches/scip-qso-empty-row-v1.patch": "0d85f8b5dca86c9fe26039b3119e89dd4f9353fc4096789158f3c282828c7379",
+    "config/patches/qsopt-ex-reuse-and-lu-v1.patch": "08a7355bc2a91f01974bda2d2f91ab34a393128c12f6afe83dffc6883f15876f",
+    "config/patches/qsopt-ex-sparse-binv-v1.patch": "d6d27875725b5f37c528d73c2e47d274d451d1245194782efac068ab361daeb0",
+    "config/patches/qsopt-ex-sb-rollback-v1.patch": "9490159f15f6be2048cc98e8c6fe3fb59650599a229b15f7b709666a25eec80a",
+    "config/patches/scip-qso-sparse-binv-v1.patch": "7db926f8e55897b7b43dbc40a1069b40041da77e5a7d0d326325336e74b4ece2",
+    "config/patches/scip-presol-stopchecks-v1.patch": "d6443efcf51fe290bffe9acbf47cc38f2cf5972268cfbda9e6a39ef83fc47c27",
+    "config/patches/qsopt-ex-fast-factor-v1.patch": "9fd90489d77cd0f18c097f01e7c780f1e7f6dedd6d94a6776caf05eadf93e8b4",
+    "config/patches/scip-eventfilter-hash-v1.patch": "865c4a871702b4bbfe0b2b1b706bf101f96e304c0bc38e0936d08c41d0bde73a",
+    "config/patches/scip-knapsack-sparse-relax-v1.patch": "66b4fa833125f58795658092954dfdf9073f19defcee9451818295734c6b7760",
+    "config/patches/qsopt-ex-fct-and-tol-v1.patch": "d4d925ef17b9e8dcc50bacc5f806ef90fb8f0e660ddfa868c29f2e9f5112526b"
+  },
+  "version": 17,
+  "overlays": {
+    "SCIP": [
+      "config/patches/scip-awake-budgets-v1.patch",
+      "config/patches/scip-qso-empty-row-v1.patch",
+      "config/patches/scip-qso-sparse-binv-v1.patch",
+      "config/patches/scip-presol-stopchecks-v1.patch",
+      "config/patches/scip-eventfilter-hash-v1.patch",
+      "config/patches/scip-knapsack-sparse-relax-v1.patch"
+    ],
+    "QSopt_ex": [
+      "config/patches/qsopt-ex-awake-budgets-v1.patch",
+      "config/patches/qsopt-ex-eta-storage-v1.patch",
+      "config/patches/qsopt-ex-empty-vectors-v1.patch",
+      "config/patches/qsopt-ex-reuse-and-lu-v1.patch",
+      "config/patches/qsopt-ex-sparse-binv-v1.patch",
+      "config/patches/qsopt-ex-sb-rollback-v1.patch",
+      "config/patches/qsopt-ex-fast-factor-v1.patch",
+      "config/patches/qsopt-ex-fct-and-tol-v1.patch"
+    ]
+  }
+}

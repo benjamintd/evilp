@@ -1,0 +1,212 @@
+--- a/qsopt_ex/fct.c
++++ b/qsopt_ex/fct.c
+@@ -496,34 +496,46 @@
+ {
+ 	int rval = 0;
+ 	int i, j, nz = 0;
+-	int col, mcnt, mbeg;
++	int nnbasic = lp->nnbasic;
++	int *nbaz = lp->nbaz;
++	int *matcnt = lp->matcnt;
++	int *matbeg = lp->matbeg;
++	int *matind = lp->matind;
++	EGLPNUM_TYPE *matval = lp->matval;
++	int *zAindx = zA->indx;
++	EGLPNUM_TYPE *zAcoef = zA->coef;
++	int *zindx = z->indx;
++	EGLPNUM_TYPE *zcoef = z->coef;
++	int znz = z->nzcnt;
+ 	EGLPNUM_TYPE sum;
+ 	EGLPNUM_TYPE *v = lp->work.coef;
+ 
+ 	EGLPNUM_TYPENAME_EGlpNumInitVar (sum);
+-	for (i = 0; i < z->nzcnt; i++)
+-		EGLPNUM_TYPENAME_EGlpNumCopy (v[z->indx[i]], z->coef[i]);
+-
+-	for (j = 0; j < lp->nnbasic; j++)
+-	{
++	for (i = 0; i < znz; i++)
++		EGLPNUM_TYPENAME_EGlpNumCopy (v[zindx[i]], zcoef[i]);
++
++	for (j = 0; j < nnbasic; j++)
++	{
++		int col = nbaz[j];
++		int mcnt = matcnt[col];
++		int mbeg = matbeg[col];
++		int *ind = matind + mbeg;
++		EGLPNUM_TYPE *mval = matval + mbeg;
+ 		EGLPNUM_TYPENAME_EGlpNumZero (sum);
+-		col = lp->nbaz[j];
+-		mcnt = lp->matcnt[col];
+-		mbeg = lp->matbeg[col];
+ 		for (i = 0; i < mcnt; i++)
+-			EGLPNUM_TYPENAME_EGlpNumAddInnProdTo (sum, v[lp->matind[mbeg + i]], lp->matval[mbeg + i]);
++			EGLPNUM_TYPENAME_EGlpNumAddInnProdTo (sum, v[ind[i]], mval[i]);
+ 
+ 		if (EGLPNUM_TYPENAME_EGlpNumIsNeqZero (sum, ztoler))
+ 		{
+-			EGLPNUM_TYPENAME_EGlpNumCopy (zA->coef[nz], sum);
+-			zA->indx[nz] = j;
++			EGLPNUM_TYPENAME_EGlpNumCopy (zAcoef[nz], sum);
++			zAindx[nz] = j;
+ 			nz++;
+ 		}
+ 	}
+ 	zA->nzcnt = nz;
+ 
+-	for (i = 0; i < z->nzcnt; i++)
+-		EGLPNUM_TYPENAME_EGlpNumZero (v[z->indx[i]]);
++	for (i = 0; i < znz; i++)
++		EGLPNUM_TYPENAME_EGlpNumZero (v[zindx[i]]);
+ 	EGLPNUM_TYPENAME_EGlpNumClearVar (sum);
+ 	EG_RETURN (rval);
+ }
+@@ -538,35 +550,44 @@
+ 	int rval = 0;
+ 	int i, j, k, ix;
+ 	int nz = 0;
+-	int row, col;
+-	int rcnt, rbeg;
++	int znz = z->nzcnt;
++	int *rowcnt = lp->rowcnt;
++	int *rowbeg = lp->rowbeg;
++	int *rowind = lp->rowind;
++	EGLPNUM_TYPE *rowval = lp->rowval;
++	int *vstat = lp->vstat;
++	int *vindex = lp->vindex;
++	int *zAindx = zA->indx;
++	EGLPNUM_TYPE *zAcoef = zA->coef;
+ 	EGLPNUM_TYPE val;
+ 
+-	if (z->nzcnt == 0)
++	if (znz == 0)
+ 	{
+ 		zA->nzcnt = 0;
+ 		EG_RETURN (rval);
+ 	}
+ 	EGLPNUM_TYPENAME_EGlpNumInitVar (val);
+-	if (z->nzcnt == 1)
++	if (znz == 1)
+ 	{
+ 		EGLPNUM_TYPE prod;
++		int row = z->indx[0];
++		int rcnt = rowcnt[row];
++		int rbeg = rowbeg[row];
++		int *rind = rowind + rbeg;
++		EGLPNUM_TYPE *rvalp = rowval + rbeg;
+ 		EGLPNUM_TYPENAME_EGlpNumInitVar (prod);
+-		row = z->indx[0];
+ 		EGLPNUM_TYPENAME_EGlpNumCopy (val, z->coef[0]);
+-		rcnt = lp->rowcnt[row];
+-		rbeg = lp->rowbeg[row];
+ 		for (j = 0; j < rcnt; j++)
+ 		{
+-			col = lp->rowind[rbeg + j];
+-			if (lp->vstat[col] != STAT_BASIC)
++			int col = rind[j];
++			if (vstat[col] != STAT_BASIC)
+ 			{
+ 				EGLPNUM_TYPENAME_EGlpNumCopy (prod, val);
+-				EGLPNUM_TYPENAME_EGlpNumMultTo (prod, lp->rowval[rbeg + j]);
++				EGLPNUM_TYPENAME_EGlpNumMultTo (prod, rvalp[j]);
+ 				if (EGLPNUM_TYPENAME_EGlpNumIsNeqZero (prod, ztoler))
+ 				{
+-					EGLPNUM_TYPENAME_EGlpNumCopy (zA->coef[nz], prod);
+-					zA->indx[nz] = lp->vindex[col];
++					EGLPNUM_TYPENAME_EGlpNumCopy (zAcoef[nz], prod);
++					zAindx[nz] = vindex[col];
+ 					nz++;
+ 				}
+ 			}
+@@ -576,39 +597,48 @@
+ 		EGLPNUM_TYPENAME_EGlpNumClearVar (val);
+ 		EG_RETURN (rval);
+ 	}
+-	k = 0;
+-	for (i = 0; i < z->nzcnt; i++)
+-	{
+-		row = z->indx[i];
+-		EGLPNUM_TYPENAME_EGlpNumCopy (val, z->coef[i]);
+-		rcnt = lp->rowcnt[row];
+-		rbeg = lp->rowbeg[row];
+-		for (j = 0; j < rcnt; j++)
+-		{
+-			col = lp->rowind[rbeg + j];
+-			if (lp->vstat[col] != STAT_BASIC)
++	{
++		int *iwork = lp->iwork;
++		int *windx = lp->work.indx;
++		EGLPNUM_TYPE *wcoef = lp->work.coef;
++		int *zindx = z->indx;
++		EGLPNUM_TYPE *zcoef = z->coef;
++		k = 0;
++		for (i = 0; i < znz; i++)
++		{
++			int row = zindx[i];
++			int rcnt = rowcnt[row];
++			int rbeg = rowbeg[row];
++			int *rind = rowind + rbeg;
++			EGLPNUM_TYPE *rvalp = rowval + rbeg;
++			EGLPNUM_TYPENAME_EGlpNumCopy (val, zcoef[i]);
++			for (j = 0; j < rcnt; j++)
+ 			{
+-				ix = lp->vindex[col];
+-				if (lp->iwork[ix] == 0)
++				int col = rind[j];
++				if (vstat[col] != STAT_BASIC)
+ 				{
+-					lp->iwork[ix] = 1;
+-					lp->work.indx[k++] = ix;
++					ix = vindex[col];
++					if (iwork[ix] == 0)
++					{
++						iwork[ix] = 1;
++						windx[k++] = ix;
++					}
++					EGLPNUM_TYPENAME_EGlpNumAddInnProdTo (wcoef[ix], val, rvalp[j]);
+ 				}
+-				EGLPNUM_TYPENAME_EGlpNumAddInnProdTo (lp->work.coef[ix], val, lp->rowval[rbeg + j]);
+ 			}
+ 		}
+-	}
+-	for (j = 0; j < k; j++)
+-	{
+-		ix = lp->work.indx[j];
+-		EGLPNUM_TYPENAME_EGlpNumCopy (val, lp->work.coef[ix]);
+-		EGLPNUM_TYPENAME_EGlpNumZero (lp->work.coef[ix]);
+-		lp->iwork[ix] = 0;
+-		if (EGLPNUM_TYPENAME_EGlpNumIsNeqZero (val, ztoler))
+-		{
+-			EGLPNUM_TYPENAME_EGlpNumCopy (zA->coef[nz], val);
+-			zA->indx[nz] = ix;
+-			nz++;
++		for (j = 0; j < k; j++)
++		{
++			ix = windx[j];
++			EGLPNUM_TYPENAME_EGlpNumCopy (val, wcoef[ix]);
++			EGLPNUM_TYPENAME_EGlpNumZero (wcoef[ix]);
++			iwork[ix] = 0;
++			if (EGLPNUM_TYPENAME_EGlpNumIsNeqZero (val, ztoler))
++			{
++				EGLPNUM_TYPENAME_EGlpNumCopy (zAcoef[nz], val);
++				zAindx[nz] = ix;
++				nz++;
++			}
+ 		}
+ 	}
+ 	zA->nzcnt = nz;
+--- a/qsopt_ex/simplex.c
++++ b/qsopt_ex/simplex.c
+@@ -1356,6 +1356,12 @@
+ 				it.solstatus = ILL_MAX_ITER;
+ 				goto LIMIT_TERMINATE;
+ 			}
++			if (EGLPNUM_TYPENAME_EGlpNumIsGreaDbl (lp->tol->pfeas_tol, 1e-4) &&
++					!(lp->custom_pfeas_tol > 1e-4))
++				EGLPNUM_TYPENAME_EGlpNumSet (lp->tol->pfeas_tol, 1e-4);
++			if (EGLPNUM_TYPENAME_EGlpNumIsGreaDbl (lp->tol->dfeas_tol, 1e-4) &&
++					!(lp->custom_dfeas_tol > 1e-4))
++				EGLPNUM_TYPENAME_EGlpNumSet (lp->tol->dfeas_tol, 1e-4);
+ 			goto START;
+ 		}
+ 		else if (it.nextstep == SIMPLEX_CONTINUE)
