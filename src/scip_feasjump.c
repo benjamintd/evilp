@@ -5,6 +5,7 @@
 #include "scip/cons_logicor.h"
 #include "scip/cons_setppc.h"
 #include "scip/cons_varbound.h"
+#include <limits.h>
 #include <math.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -40,11 +41,14 @@ typedef struct {
 
     double *x;
     double *best_x;
+    double *best_viol_x;
     double *act;
     double *w;
     int *viol_list;
     int *viol_pos;
     int nviol;
+    int n_int;
+    int n_cont;
 
     int *cand_list;
     int *cand_pos;
@@ -96,6 +100,7 @@ static void fj_free(FjState *st) {
     free(st->cval);
     free(st->x);
     free(st->best_x);
+    free(st->best_viol_x);
     free(st->act);
     free(st->w);
     free(st->viol_list);
@@ -677,6 +682,7 @@ static int fj_build_state(SCIP *scip, FjState *st, int from_lp) {
     st->cval = calloc(st->nnz ? st->nnz : 1, sizeof *st->cval);
     st->x = calloc((size_t)nvars, sizeof *st->x);
     st->best_x = calloc((size_t)nvars, sizeof *st->best_x);
+    st->best_viol_x = calloc((size_t)nvars, sizeof *st->best_viol_x);
     st->act = calloc((size_t)st->nrows, sizeof *st->act);
     st->w = calloc((size_t)st->nrows, sizeof *st->w);
     st->viol_list = calloc((size_t)st->nrows, sizeof *st->viol_list);
@@ -687,12 +693,15 @@ static int fj_build_state(SCIP *scip, FjState *st, int from_lp) {
     st->last_move = calloc((size_t)nvars, sizeof *st->last_move);
 
     if (!st->lb || !st->ub || !st->obj || !st->is_int || !st->is_bin || !st->cstart ||
-        !st->crow || !st->cval || !st->x || !st->best_x || !st->act || !st->w || !st->viol_list ||
-        !st->viol_pos || !st->cand_list || !st->cand_pos || !st->var_viol_cnt || !st->last_move) {
+        !st->crow || !st->cval || !st->x || !st->best_x || !st->best_viol_x || !st->act || !st->w ||
+        !st->viol_list || !st->viol_pos || !st->cand_list || !st->cand_pos || !st->var_viol_cnt ||
+        !st->last_move) {
         fj_free(st);
         return 1;
     }
 
+    st->n_int = 0;
+    st->n_cont = 0;
     for (int j = 0; j < nvars; ++j) {
         double l = SCIPvarGetLbLocal(vars[j]);
         double u = SCIPvarGetUbLocal(vars[j]);
@@ -702,6 +711,10 @@ static int fj_build_state(SCIP *scip, FjState *st, int from_lp) {
         SCIP_VARTYPE vt = SCIPvarGetType(vars[j]);
         st->is_int[j] = (vt == SCIP_VARTYPE_BINARY || vt == SCIP_VARTYPE_INTEGER) ? 1U : 0U;
         st->is_bin[j] = (st->is_int[j] && fabs(st->lb[j]) <= 1e-12 && fabs(st->ub[j] - 1.0) <= 1e-12) ? 1U : 0U;
+        if (st->is_int[j])
+            st->n_int++;
+        else
+            st->n_cont++;
     }
 
     /* Build CSC from CSR */
@@ -788,13 +801,163 @@ static SCIP_RETCODE fj_submit_vec(SCIP *scip, SCIP_HEUR *heur, const FjState *st
     return SCIP_OKAY;
 }
 
+static int fj_try_swap(FjState *st, int step) {
+    if (st->nviol <= 0)
+        return 0;
+    int r = st->viol_list[fj_rand(&st->rng) % (uint64_t)st->nviol];
+    size_t r0 = st->rstart[r];
+    size_t r1 = st->rstart[r + 1];
+    size_t rlen = r1 - r0;
+    if (rlen < 2)
+        return 0;
+
+    /* Pick a binary variable j1 in violated row r whose flip reduces row r's violation. */
+    double old_vr = row_viol(st->act[r], st->rlhs[r], st->rrhs[r]);
+    int best_j1 = -1;
+    double best_g1 = -1e30;
+    double best_v1 = 0.0;
+    size_t scan1 = rlen <= 16 ? rlen : 16;
+    for (size_t t = 0; t < scan1; ++t) {
+        size_t idx = (rlen <= 16) ? (r0 + t) : (r0 + (size_t)(fj_rand(&st->rng) % (uint64_t)rlen));
+        int j1 = st->rcol[idx];
+        if (!st->is_bin[j1] || step - st->last_move[j1] < 2)
+            continue;
+        if (st->cstart[j1 + 1] - st->cstart[j1] > 128)
+            continue;
+        double v1 = (st->x[j1] < 0.5) ? 1.0 : 0.0;
+        double d1 = v1 - st->x[j1];
+        double new_vr = row_viol(st->act[r] + st->rval[idx] * d1, st->rlhs[r], st->rrhs[r]);
+        if (new_vr >= old_vr - 1e-9)
+            continue;
+        double od1 = 0.0;
+        double g1 = eval_candidate_delta(st, j1, v1, &od1);
+        if (g1 > best_g1) {
+            best_g1 = g1;
+            best_j1 = j1;
+            best_v1 = v1;
+        }
+    }
+    if (best_j1 < 0)
+        return 0;
+
+    int j1 = best_j1;
+    double v1 = best_v1;
+    double d1 = v1 - st->x[j1];
+    double od1 = st->obj[j1] * d1;
+
+    /* Find the most-damaged row r2 caused by flipping j1. */
+    int worst_r2 = -1;
+    double worst_inc = 1e-9;
+    for (size_t k = st->cstart[j1]; k < st->cstart[j1 + 1]; ++k) {
+        int rr = st->crow[k];
+        if (rr == st->obj_row)
+            continue;
+        double ov = row_viol(st->act[rr], st->rlhs[rr], st->rrhs[rr]);
+        double nv = row_viol(st->act[rr] + st->cval[k] * d1, st->rlhs[rr], st->rrhs[rr]);
+        double inc = st->w[rr] * (nv - ov);
+        if (inc > worst_inc) {
+            worst_inc = inc;
+            worst_r2 = rr;
+        }
+    }
+    if (worst_r2 < 0)
+        return 0;
+
+    /* Temporarily shift row activities by j1 to evaluate exact 2-var swap deltas. */
+    for (size_t k = st->cstart[j1]; k < st->cstart[j1 + 1]; ++k)
+        st->act[st->crow[k]] += st->cval[k] * d1;
+
+    size_t s0 = st->rstart[worst_r2];
+    size_t s1 = st->rstart[worst_r2 + 1];
+    size_t slen = s1 - s0;
+    size_t scan2 = slen <= 16 ? slen : 16;
+    int best_j2 = -1;
+    double best_v2 = 0.0;
+    double best_total = 1e-9;
+    for (size_t t = 0; t < scan2; ++t) {
+        size_t idx = (slen <= 16) ? (s0 + t) : (s0 + (size_t)(fj_rand(&st->rng) % (uint64_t)slen));
+        int j2 = st->rcol[idx];
+        if (j2 == j1 || !st->is_bin[j2] || step - st->last_move[j2] < 2)
+            continue;
+        double v2 = (st->x[j2] < 0.5) ? 1.0 : 0.0;
+        double od2 = 0.0;
+        double g2 = eval_candidate_delta(st, j2, v2, &od2);
+        double total = best_g1 + g2 - 1e-9 * (od1 + od2);
+        if (total > best_total) {
+            best_total = total;
+            best_j2 = j2;
+            best_v2 = v2;
+        }
+    }
+
+    for (size_t k = st->cstart[j1]; k < st->cstart[j1 + 1]; ++k)
+        st->act[st->crow[k]] -= st->cval[k] * d1;
+    st->moves_since_recompute++;
+
+    if (best_j2 >= 0) {
+        fj_apply_move(st, j1, v1, step);
+        fj_apply_move(st, best_j2, best_v2, step);
+        return 1;
+    }
+    return 0;
+}
+
+/* Fix integer variables to FJ's candidate and solve the remaining continuous probing LP. */
+static SCIP_RETCODE fj_probing_lp_repair(SCIP *scip, SCIP_HEUR *heur, const FjState *st,
+                                         const double *vec, SCIP_Bool *stored) {
+    *stored = FALSE;
+    if (st->n_int <= 0 || st->n_cont <= 0)
+        return SCIP_OKAY;
+    if (SCIPinProbing(scip) || !SCIPhasCurrentNodeLP(scip) || !SCIPisLPConstructed(scip) ||
+        SCIPgetLPSolstat(scip) != SCIP_LPSOLSTAT_OPTIMAL || SCIPisStopped(scip))
+        return SCIP_OKAY;
+
+    SCIP_CALL(SCIPstartProbing(scip));
+    SCIP_CALL(SCIPnewProbingNode(scip));
+
+    SCIP_Bool cutoff = FALSE;
+    for (int j = 0; j < st->nvars && !cutoff; ++j) {
+        if (!st->is_int[j])
+            continue;
+        SCIP_VAR *v = st->vars[j];
+        double lb = SCIPvarGetLbLocal(v);
+        double ub = SCIPvarGetUbLocal(v);
+        if (lb >= ub - 1e-12)
+            continue;
+        double val = round(vec[j]);
+        if (val < lb)
+            val = lb;
+        if (val > ub)
+            val = ub;
+        SCIP_CALL(SCIPfixVarProbing(scip, v, val));
+    }
+
+    if (!cutoff) {
+        SCIP_CALL(SCIPpropagateProbing(scip, 2, &cutoff, NULL));
+    }
+    if (!cutoff && !SCIPisStopped(scip)) {
+        SCIP_Bool lperror = FALSE;
+        SCIP_CALL(SCIPsolveProbingLP(scip, 2000, &lperror, &cutoff));
+        if (!lperror && !cutoff && SCIPgetLPSolstat(scip) == SCIP_LPSOLSTAT_OPTIMAL) {
+            SCIP_SOL *sol = NULL;
+            SCIP_CALL(SCIPcreateSol(scip, &sol, heur));
+            SCIP_CALL(SCIPlinkLPSol(scip, sol));
+            SCIP_CALL(SCIPtrySolFree(scip, &sol, FALSE, FALSE, TRUE, TRUE, TRUE, stored));
+        }
+    }
+
+    SCIP_CALL(SCIPendProbing(scip));
+    return SCIP_OKAY;
+}
+
 static SCIP_DECL_HEUREXEC(heurExecFeasjump) {
     (void)nodeinfeasible;
     *result = SCIP_DIDNOTRUN;
 
-    if (SCIPgetDepth(scip) > 0 || SCIPgetNVars(scip) <= 0)
+    int depth = SCIPgetDepth(scip);
+    if (SCIPgetNVars(scip) <= 0 || SCIPisStopped(scip))
         return SCIP_OKAY;
-    if (SCIPisStopped(scip))
+    if (depth > 0 && (SCIPgetNSols(scip) > 0 || SCIPgetNNodes(scip) > 500))
         return SCIP_OKAY;
 
     int from_lp = (heurtiming == SCIP_HEURTIMING_AFTERLPNODE) ? 1 : 0;
@@ -810,7 +973,13 @@ static SCIP_DECL_HEUREXEC(heurExecFeasjump) {
     double rem = tlim - SCIPgetSolvingTime(scip);
     if (rem <= 0.1)
         return SCIP_OKAY;
-    double budget = fmin(0.15, 0.03 * rem);
+    double budget;
+    if (depth > 0)
+        budget = fmin(0.06, 0.015 * rem);
+    else if (SCIPgetNSols(scip) == 0)
+        budget = fmin(0.25, 0.04 * rem);
+    else
+        budget = fmin(0.15, 0.03 * rem);
     if (budget < 0.02)
         budget = 0.02;
     double deadline = lab_now() + budget;
@@ -830,6 +999,7 @@ static SCIP_DECL_HEUREXEC(heurExecFeasjump) {
     int n_submitted = 0;
     int best_submitted = 0;
     int rejects = 0;
+    int lp_repairs = 0;
 
     if (SCIPgetNSols(scip) > 0) {
         SCIP_SOL *bs = SCIPgetBestSol(scip);
@@ -851,22 +1021,31 @@ static SCIP_DECL_HEUREXEC(heurExecFeasjump) {
     int nmodes = 0;
     if (from_lp) {
         modes[nmodes++] = 0;
-        modes[nmodes++] = 1;
+        if (depth == 0)
+            modes[nmodes++] = 1;
     } else {
         modes[nmodes++] = 1;
-        modes[nmodes++] = 2;
+        if (depth == 0)
+            modes[nmodes++] = 2;
     }
 
     double max_w = 1.0;
-    int max_steps = 80000;
+    int max_steps = (depth == 0) ? 80000 : 25000;
     for (int m = 0; m < nmodes && lab_now() < deadline && rejects < 3; ++m) {
         double mode_dl = (m + 1 < nmodes) ? (lab_now() + 0.65 * (deadline - lab_now())) : deadline;
         fj_init_point(scip, &st, modes[m]);
         max_w = 1.0;
+        int best_nviol = INT_MAX;
+        int local_mins = 0;
 
         for (int step = 0; step < max_steps; ++step) {
             if ((step & 255) == 0 && lab_now() >= mode_dl)
                 break;
+
+            if (st.nviol > 0 && st.nviol < best_nviol) {
+                best_nviol = st.nviol;
+                memcpy(st.best_viol_x, st.x, (size_t)st.nvars * sizeof *st.best_viol_x);
+            }
 
             if (st.nviol == 0) {
                 /* Eliminate any floating-point drift before polishing/accepting */
@@ -960,6 +1139,11 @@ static SCIP_DECL_HEUREXEC(heurExecFeasjump) {
                 continue;
             }
 
+            local_mins++;
+            /* Try a 2-variable binary swap to break equality/assignment deadlocks. */
+            if ((local_mins & 3) == 1 && fj_try_swap(&st, step))
+                continue;
+
             /* Local minimum: bump weights on violated rows and escape via a random violated row */
             for (int vi = 0; vi < st.nviol; ++vi) {
                 int r = st.viol_list[vi];
@@ -967,10 +1151,12 @@ static SCIP_DECL_HEUREXEC(heurExecFeasjump) {
                 if (st.w[r] > max_w)
                     max_w = st.w[r];
             }
-            if (max_w > 1e5) {
+            if ((local_mins & 511) == 0 || max_w > 1e5) {
+                double decay = (max_w > 1e5) ? 0.5 : 0.85;
+                double add = 1.0 - decay;
                 for (int r = 0; r < st.nrows; ++r)
-                    st.w[r] = 0.5 * st.w[r] + 0.5;
-                max_w = 0.5 * max_w + 0.5;
+                    st.w[r] = decay * st.w[r] + add;
+                max_w = decay * max_w + add;
             }
 
             int r = st.viol_list[fj_rand(&st.rng) % (uint64_t)st.nviol];
@@ -1003,6 +1189,21 @@ static SCIP_DECL_HEUREXEC(heurExecFeasjump) {
             else
                 break;
         }
+
+        /* On mixed-integer models without a feasible point from coordinate jumps,
+         * fix FJ's minimum-violation integer vector and solve the continuous probing LP. */
+        if (from_lp && n_submitted == 0 && lp_repairs < 2 && best_nviol < INT_MAX &&
+            st.n_int > 0 && st.n_cont > 0 && rem > 1.0 && !SCIPisStopped(scip)) {
+            SCIP_Bool stored = FALSE;
+            lp_repairs++;
+            SCIP_CALL(fj_probing_lp_repair(scip, heur, &st, st.best_viol_x, &stored));
+            if (stored) {
+                *result = SCIP_FOUNDSOL;
+                n_submitted++;
+                has_best = 1;
+            }
+        }
+
         /* If pure feasibility succeeded, no need for second restart */
         if (has_best && !has_obj)
             break;
@@ -1023,7 +1224,7 @@ SCIP_RETCODE lab_scip_include_feasjump(SCIP *scip) {
     SCIP_HEUR *heur = NULL;
     SCIP_CALL(SCIPincludeHeurBasic(
         scip, &heur, "feasjump", "pure-C17 Feasibility Jump primal heuristic", 'J',
-        50000, 0, 0, 0,
+        50000, 20, 0, 20,
         SCIP_HEURTIMING_BEFORENODE | SCIP_HEURTIMING_AFTERLPNODE,
         FALSE, heurExecFeasjump, NULL));
     return SCIP_OKAY;

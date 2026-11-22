@@ -1,0 +1,101 @@
+--- a/qsopt_ex/zeit.c
++++ b/qsopt_ex/zeit.c
+@@ -180,6 +180,20 @@
+ #endif /* HAVE_CLOCK */
+ #endif /* HAVE_TIMES */
+ #endif /* HAVE_GETRUSAGE */
++
++/* Wall time used for simplex budgets, including time descheduled while awake. */
++double ILLutil_deadline_zeit (void)
++{
++    struct timespec ts;
++#ifdef __APPLE__
++    const clockid_t clockid = CLOCK_UPTIME_RAW;
++#else
++    const clockid_t clockid = CLOCK_MONOTONIC;
++#endif
++    if (clock_gettime(clockid, &ts) != 0)
++        abort();
++    return (double) ts.tv_sec + (double) ts.tv_nsec / 1e9;
++}
+ 
+ double ILLutil_real_zeit (
+ 	void)
+--- a/qsopt_ex/zeit.h
++++ b/qsopt_ex/zeit.h
+@@ -38,6 +38,8 @@
+ ILLutil_timer;
+ 
+ 
++double ILLutil_deadline_zeit (void);
++
+ double ILLutil_zeit (
+ 	void),
+   ILLutil_real_zeit (
+--- a/qsopt_ex/simplex.c
++++ b/qsopt_ex/simplex.c
+@@ -449,7 +449,7 @@
+ 	lp->pIIratio = RATIOTEST_HARRIS;
+ 	lp->dIratio = RATIOTEST_HARRIS;
+ 	lp->dIIratio = RATIOTEST_HARRIS;
+-	lp->starttime = ILLutil_zeit ();
++	lp->starttime = ILLutil_deadline_zeit ();
+ 	ILLutil_sprand (1, &(lp->rstate));
+ 	return 0;
+ }
+@@ -643,7 +643,7 @@
+ 	lp->pIIratio = RATIOTEST_HARRIS;
+ 	lp->dIratio = RATIOTEST_HARRIS;
+ 	lp->dIIratio = RATIOTEST_HARRIS;
+-	lp->starttime = ILLutil_zeit ();
++	lp->starttime = ILLutil_deadline_zeit ();
+ 	ILLutil_sprand (1, &(lp->rstate));
+ 
+ CLEANUP:
+@@ -1182,7 +1182,7 @@
+ #endif
+ 	it.solstatus = ILL_LP_UNSOLVED;
+ 	init_lp_status_info (&(lp->basisstat));
+-	if (ILLutil_zeit () - lp->starttime >= lp->maxtime)
++	if (ILLutil_deadline_zeit () - lp->starttime >= lp->maxtime)
+ 	{
+ 		it.solstatus = ILL_MAX_TIME;
+ 		goto TERMINATE;
+@@ -1447,7 +1447,7 @@
+ 		int bstat = 0;
+ 
+ 		QSlog("time = %.3f, pI = %d, pII = %d, dI = %d, dII = %d,",
+-								ILLutil_zeit () - lp->starttime, lp->cnts->pI_iter,
++								ILLutil_deadline_zeit () - lp->starttime, lp->cnts->pI_iter,
+ 								lp->cnts->pII_iter, lp->cnts->dI_iter, lp->cnts->dII_iter);
+ 		get_current_stat (&(lp->basisstat), it.algorithm, &bstat);
+ 		switch (bstat)
+@@ -1581,7 +1581,7 @@
+ 	int phase)
+ {
+ 	EGLPNUM_TYPE print_val;
+-	double tottime = ((it->itercnt & 255) == 0) ? (ILLutil_zeit () - lp->starttime) : 0.0;
++	double tottime = ((it->itercnt & 255) == 0) ? (ILLutil_deadline_zeit () - lp->starttime) : 0.0;
+ 	int curtime = ILLutil_our_floor (tottime);	/* MONIKA */
+ 	char print_str[20];
+ 	EGLPNUM_TYPENAME_feas_info fi;
+--- a/qsopt_ex/price.c
++++ b/qsopt_ex/price.c
+@@ -775,7 +775,7 @@
+ 
+ 	for (j = 0; j < lp->nnbasic; j++)
+ 	{
+-		if ((j & 63) == 0 && ILLutil_zeit () - lp->starttime >= lp->maxtime * 0.25)
++		if ((j & 63) == 0 && ILLutil_deadline_zeit () - lp->starttime >= lp->maxtime * 0.25)
+ 		{
+ 			for (; j < lp->nnbasic; j++)
+ 				EGLPNUM_TYPENAME_EGlpNumOne (psinfo->norms[j]);
+@@ -987,7 +987,7 @@
+ 
+ 	for (i = 0; i < lp->nrows; i++)
+ 	{
+-		if ((i & 63) == 0 && ILLutil_zeit () - lp->starttime >= lp->maxtime * 0.25)
++		if ((i & 63) == 0 && ILLutil_deadline_zeit () - lp->starttime >= lp->maxtime * 0.25)
+ 		{
+ 			for (; i < lp->nrows; i++)
+ 				EGLPNUM_TYPENAME_EGlpNumOne (dsinfo->norms[i]);

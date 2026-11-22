@@ -1,0 +1,220 @@
+--- a/src/scip/clock.c
++++ b/src/scip/clock.c
+@@ -72,6 +72,23 @@
+ /*lint -esym(*,timeval)*/
+ /*lint -esym(*,gettimeofday)*/
+ 
++/* Elapsed budgets use awake time. Keep the calendar-time API separate. */
++#if !defined(_WIN32) && !defined(_WIN64)
++static void getElapsedTime(struct timeval* tp)
++{
++   struct timespec ts;
++#ifdef __APPLE__
++   const clockid_t clockid = CLOCK_UPTIME_RAW;
++#else
++   const clockid_t clockid = CLOCK_MONOTONIC;
++#endif
++   if( clock_gettime(clockid, &ts) != 0 )
++      abort();
++   tp->tv_sec = ts.tv_sec;
++   tp->tv_usec = ts.tv_nsec / 1000;
++}
++#endif
++
+ /** converts wall clock time into seconds */
+ static
+ SCIP_Real walltime2sec(
+@@ -330,7 +347,7 @@
+ #if defined(_WIN32) || defined(_WIN64)
+             clck->data.wallclock.sec -= time(NULL);
+ #else
+-            gettimeofday(&tp, NULL);
++            getElapsedTime(&tp);
+             if( tp.tv_usec > clck->data.wallclock.usec ) /*lint !e115 !e40*/
+             {
+                clck->data.wallclock.sec -= (tp.tv_sec + 1); /*lint !e115 !e40*/
+@@ -400,7 +417,7 @@
+ #if defined(_WIN32) || defined(_WIN64)
+             clck->data.wallclock.sec += time(NULL);
+ #else
+-            gettimeofday(&tp, NULL);
++            getElapsedTime(&tp);
+             if( tp.tv_usec + clck->data.wallclock.usec > 1000000 ) /*lint !e115 !e40*/
+             {
+                clck->data.wallclock.sec += (tp.tv_sec + 1); /*lint !e115 !e40*/
+@@ -497,7 +514,7 @@
+ #if defined(_WIN32) || defined(_WIN64)
+          result = walltime2sec(clck->data.wallclock.sec + time(NULL), 0);
+ #else
+-         gettimeofday(&tp, NULL);
++         getElapsedTime(&tp);
+          if( tp.tv_usec + clck->data.wallclock.usec > 1000000 ) /*lint !e115 !e40*/
+             result = walltime2sec(clck->data.wallclock.sec + tp.tv_sec + 1, /*lint !e115 !e40*/
+                (clck->data.wallclock.usec - 1000000) + tp.tv_usec); /*lint !e115 !e40*/
+@@ -595,7 +612,7 @@
+ #if defined(_WIN32) || defined(_WIN64)
+          clck->data.wallclock.sec -= time(NULL);
+ #else
+-         gettimeofday(&tp, NULL);
++         getElapsedTime(&tp);
+          if( tp.tv_usec > clck->data.wallclock.usec ) /*lint !e115 !e40*/
+          {
+             clck->data.wallclock.sec -= (tp.tv_sec + 1); /*lint !e115 !e40*/
+--- a/src/scip/heur_locks.c
++++ b/src/scip/heur_locks.c
+@@ -100,6 +100,7 @@
+    SCIP_Real             minfixingratelp;    /**< minimum fixing rate over all variables (including continuous) to solve LP */
+    SCIP_Real             minimprove;         /**< factor by which locks heuristic should at least improve the incumbent */
+    SCIP_Real             nodesquot;          /**< subproblem nodes in relation to nodes of the original problem */
++   int                   maxlpiters;         /**< iteration budget for the probing LP (-1: unlimited) */
+    int                   maxproprounds;      /**< maximum number of propagation rounds during probing */
+    SCIP_Bool             updatelocks;        /**< should the locks be updated based on LP rows? */
+    SCIP_Bool             copycuts;           /**< should all active cuts from cutpool be copied to constraints in
+@@ -801,7 +802,7 @@
+ #ifdef NDEBUG
+       {
+          SCIP_Bool retstat;
+-         retstat = SCIPsolveProbingLP(scip, -1, &lperror, &cutoff);
++         retstat = SCIPsolveProbingLP(scip, heurdata->maxlpiters, &lperror, &cutoff);
+          if( retstat != SCIP_OKAY )
+          {
+             SCIPwarningMessage(scip, "Error while solving LP in LOCKS heuristic; LP solve terminated with code <%d>\n",
+@@ -809,7 +810,7 @@
+          }
+       }
+ #else
+-      SCIP_CALL( SCIPsolveProbingLP(scip, -1, &lperror, &cutoff) );
++      SCIP_CALL( SCIPsolveProbingLP(scip, heurdata->maxlpiters, &lperror, &cutoff) );
+ #endif
+       SCIPdebugMsg(scip, "ending solving locks-lp at time %g\n", SCIPgetSolvingTime(scip));
+ 
+@@ -817,6 +818,10 @@
+ 
+       SCIPdebugMsg(scip, " -> new LP iterations: %" SCIP_LONGINT_FORMAT "\n", SCIPgetNLPIterations(scip));
+       SCIPdebugMsg(scip, " -> error=%u, status=%d\n", lperror, SCIPgetLPSolstat(scip));
++
++      /* Hand the node back to the main search when the optional probe uses its budget. */
++      if( lpstatus == SCIP_LPSOLSTAT_ITERLIMIT )
++         goto TERMINATE;
+ 
+       /* check if this is a feasible solution */
+       if( !lperror && lpstatus == SCIP_LPSOLSTAT_OPTIMAL )
+@@ -1095,6 +1100,9 @@
+          heurInitsolLocks, heurExitsolLocks, heurExecLocks,
+          heurdata) );
+ 
++   SCIP_CALL( SCIPaddIntParam(scip, "heuristics/" HEUR_NAME "/maxlpiters",
++         "iteration limit for the probing LP (-1: unlimited)",
++         &heurdata->maxlpiters, TRUE, -1, -1, INT_MAX, NULL, NULL) );
+    SCIP_CALL( SCIPaddIntParam(scip, "heuristics/" HEUR_NAME "/maxproprounds",
+          "maximum number of propagation rounds to be performed in each propagation call (-1: no limit, -2: parameter settings)",
+          &heurdata->maxproprounds, TRUE, DEFAULT_MAXPROPROUNDS, -2, INT_MAX, NULL, NULL) );
+--- a/src/scip/scip_copy.c
++++ b/src/scip/scip_copy.c
+@@ -3334,16 +3334,15 @@
+    return SCIP_OKAY;
+ }
+ 
+-/** copies limits to a primal heuristic sub-SCIP, optionally capping its time limit */
+-SCIP_RETCODE SCIPcopyLimitsHeur(
+-   SCIP*                 sourcescip,         /**< source SCIP data structure */
+-   SCIP*                 targetscip          /**< target SCIP data structure */
++/** further restrict a heuristic child without resetting its node or solution limits */
++SCIP_RETCODE SCIPcapHeurTime(
++   SCIP*                 sourcescip,
++   SCIP*                 targetscip
+    )
+ {
+    SCIP_Real frac;
+-   SCIP_Real timelimit;
+-
+-   SCIP_CALL( SCIPcopyLimits(sourcescip, targetscip) );
++   SCIP_Real remaining;
++   SCIP_Real childlimit;
+ 
+    if( SCIPgetParam(sourcescip, "heuristics/subsciptimefrac") == NULL )
+       return SCIP_OKAY;
+@@ -3351,13 +3350,25 @@
+    if( frac >= 1.0 )
+       return SCIP_OKAY;
+ 
+-   SCIP_CALL( SCIPgetRealParam(targetscip, "limits/time", &timelimit) );
+-   if( SCIPisInfinity(targetscip, timelimit) )
++   SCIP_CALL( getCopyTimelimit(sourcescip, &remaining) );
++   if( SCIPisInfinity(sourcescip, remaining) && frac > 0.0 )
+       return SCIP_OKAY;
+-   timelimit *= MAX(frac, 0.0);
+-   SCIP_CALL( SCIPsetRealParam(targetscip, "limits/time", timelimit) );
+-
++   SCIP_CALL( SCIPgetRealParam(targetscip, "limits/time", &childlimit) );
++   remaining = MAX(remaining, 0.0) * frac;
++   if( remaining < childlimit )
++   {
++      SCIP_CALL( SCIPsetRealParam(targetscip, "limits/time", remaining) );
++   }
+    return SCIP_OKAY;
++}
++
++SCIP_RETCODE SCIPcopyLimitsHeur(
++   SCIP*                 sourcescip,
++   SCIP*                 targetscip
++   )
++{
++   SCIP_CALL( SCIPcopyLimits(sourcescip, targetscip) );
++   return SCIPcapHeurTime(sourcescip, targetscip);
+ }
+ 
+ /** sets the working limits as well as common search parameters for the auxiliary problem
+--- a/src/scip/scip_copy.h
++++ b/src/scip/scip_copy.h
+@@ -1262,6 +1262,10 @@
+  *
+  *  See \ref SCIP_Stage "SCIP_STAGE" for a complete list of all possible solving stages.
+  */
++/** limit a heuristic child to its current limit or a fraction of the remaining parent time */
++SCIP_EXPORT
++SCIP_RETCODE SCIPcapHeurTime(SCIP* sourcescip, SCIP* targetscip);
++
+ /** like SCIPcopyLimits(), but for primal heuristic sub-SCIPs: if the (optional) real parameter
+  *  "heuristics/subsciptimefrac" exists in the source SCIP, the sub-SCIP time limit is additionally capped
+  *  at that fraction of the remaining time; without the parameter this equals SCIPcopyLimits()
+--- a/src/scip/heur_alns.c
++++ b/src/scip/heur_alns.c
+@@ -2309,6 +2309,7 @@
+ 
+    /* set solve limits for sub-SCIP */
+    SCIP_CALL( setLimits(subscip, solvelimits) );
++   SCIP_CALL( SCIPcapHeurTime(scip, subscip) );
+ 
+    /* change random seed of sub-SCIP */
+    if( heurdata->subsciprandseeds )
+--- a/src/scip/heur_scheduler.c
++++ b/src/scip/heur_scheduler.c
+@@ -2221,6 +2221,7 @@
+ 
+    /* set solve limits for sub-SCIP */
+    SCIP_CALL( setLimits(subscip, solvelimits) );
++   SCIP_CALL( SCIPcapHeurTime(scip, subscip) );
+ 
+    /* change random seed of sub-SCIP */
+    if( heurdata->subsciprandseeds )
+--- a/src/scip/heur_trustregion.c
++++ b/src/scip/heur_trustregion.c
+@@ -384,6 +384,7 @@
+ 
+    heurdata->nodelimit = nsubnodes;
+    SCIP_CALL( SCIPsetCommonSubscipParams(scip, subscip, nsubnodes, MAX(10, nsubnodes/10), heurdata->bestsollimit) );
++   SCIP_CALL( SCIPcapHeurTime(scip, subscip) );
+ 
+    SCIP_CALL( addTrustRegionConstraints(scip, subscip, subvars, heurdata) );
+ 
+--- a/src/scip/heur_localbranching.c
++++ b/src/scip/heur_localbranching.c
+@@ -394,6 +394,7 @@
+ 
+    heurdata->nodelimit = nsubnodes;
+    SCIP_CALL( SCIPsetCommonSubscipParams(scip, subscip, nsubnodes, MAX(10, nsubnodes/10), heurdata->bestsollimit) );
++   SCIP_CALL( SCIPcapHeurTime(scip, subscip) );
+ 
+    /* adds the local branching constraint and the objective cutoff to the auxiliary problem */
+    SCIP_CALL( addLocalbranchingConstraintAndObjcutoff(scip, subscip, heur, subvars) );

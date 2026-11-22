@@ -1,0 +1,765 @@
+--- a/qsopt_ex/factor.c
++++ b/qsopt_ex/factor.c
+@@ -140,6 +140,20 @@
+ 	f->uc_delay = 0;
+ 	f->tran_stack = 0;
+ 	f->tran_cap = 0;
++	f->pf_mode = 0;
++	f->pf_cnt = 0;
++	f->pf_max = 0;
++	f->pf_freebeg = 0;
++	f->pf_space = 0;
++	f->pf_beg = 0;
++	f->pf_nzcnt = 0;
++	f->pf_p = 0;
++	f->pf_piv = 0;
++	f->pf_indx = 0;
++	f->pf_coef = 0;
++	f->pf_mark = 0;
++	f->pf_mark_cap = 0;
++	EGLPNUM_TYPENAME_ILLsvector_init (&f->pf_tmp);
+ 	f->dmat = 0;
+ 	EGLPNUM_TYPENAME_ILLsvector_init (&f->xtmp);
+ }
+@@ -192,6 +206,9 @@
+ 
+ 	EGLPNUM_TYPENAME_EGlpNumFreeArray (f->dmat);
+ 	EGLPNUM_TYPENAME_ILLsvector_free (&f->xtmp);
++	f->pf_mode = 0;
++	f->pf_cnt = 0;
++	f->pf_freebeg = 0;
+ }
+ 
+ /* Eta entries are overwritten before use after each reset. Only the final
+@@ -209,6 +226,17 @@
+ 	ILL_IFFREE(f->uc_delay);
+ 	ILL_IFFREE(f->tran_stack);
+ 	f->tran_cap = 0;
++	ILL_IFFREE(f->pf_beg);
++	ILL_IFFREE(f->pf_nzcnt);
++	ILL_IFFREE(f->pf_p);
++	EGLPNUM_TYPENAME_EGlpNumFreeArray (f->pf_piv);
++	ILL_IFFREE(f->pf_indx);
++	EGLPNUM_TYPENAME_EGlpNumFreeArray (f->pf_coef);
++	ILL_IFFREE(f->pf_mark);
++	EGLPNUM_TYPENAME_ILLsvector_free (&f->pf_tmp);
++	f->pf_max = 0;
++	f->pf_space = 0;
++	f->pf_mark_cap = 0;
+ }
+ 
+ int EGLPNUM_TYPENAME_ILLfactor_set_factor_iparam (
+@@ -3609,6 +3637,194 @@
+ #endif /* SOLVE_DEBUG */
+ }
+ 
++static int pf_ensure_buffers (
++	EGLPNUM_TYPENAME_factor_work * f,
++	int need_entries)
++{
++	int rval = 0;
++	int max_etas = 128;
++	(void) rval;
++	if (f->pf_max < max_etas)
++	{
++		ILL_IFFREE(f->pf_beg);
++		ILL_IFFREE(f->pf_nzcnt);
++		ILL_IFFREE(f->pf_p);
++		EGLPNUM_TYPENAME_EGlpNumFreeArray (f->pf_piv);
++		f->pf_max = 0;
++		ILL_SAFE_MALLOC (f->pf_beg, max_etas, int);
++		ILL_SAFE_MALLOC (f->pf_nzcnt, max_etas, int);
++		ILL_SAFE_MALLOC (f->pf_p, max_etas, int);
++		f->pf_piv = EGLPNUM_TYPENAME_EGlpNumAllocArray (max_etas);
++		if (!f->pf_piv)
++			return E_UPDATE_NOSPACE;
++		f->pf_max = max_etas;
++	}
++	if (f->dim > f->pf_mark_cap)
++	{
++		int cap = f->dim + (f->dim >> 2) + 32;
++		ILL_IFFREE(f->pf_mark);
++		EGLPNUM_TYPENAME_ILLsvector_free (&f->pf_tmp);
++		f->pf_mark_cap = 0;
++		ILL_SAFE_MALLOC (f->pf_mark, cap, unsigned char);
++		memset (f->pf_mark, 0, (size_t) cap);
++		if (EGLPNUM_TYPENAME_ILLsvector_alloc (&f->pf_tmp, cap))
++			return E_UPDATE_NOSPACE;
++		f->pf_mark_cap = cap;
++	}
++	if (f->pf_freebeg + need_entries > f->pf_space)
++	{
++		int max_space = f->dim * 16;
++		int next;
++		int *nindx;
++		if (max_space < 65536)
++			max_space = 65536;
++		if (f->pf_freebeg + need_entries > max_space)
++			return E_UPDATE_NOSPACE;
++		next = f->pf_space ? f->pf_space * 2 : 1024;
++		while (next < f->pf_freebeg + need_entries)
++			next *= 2;
++		if (next > max_space)
++			next = max_space;
++		nindx = ILLutil_reallocrus (f->pf_indx, (size_t) next * sizeof (*nindx));
++		if (!nindx)
++			return E_UPDATE_NOSPACE;
++		f->pf_indx = nindx;
++		EGLPNUM_TYPENAME_EGlpNumReallocArray (&f->pf_coef, next);
++		f->pf_space = next;
++	}
++	return 0;
++CLEANUP:
++	return E_UPDATE_NOSPACE;
++}
++
++static void pf_apply_ftran (
++	EGLPNUM_TYPENAME_factor_work * f,
++	EGLPNUM_TYPENAME_svector * x)
++{
++	EGLPNUM_TYPE *work = f->work_coef;
++	int *list = f->work_indx;
++	unsigned char *mark = f->pf_mark;
++	int n = 0, i, k, out_nz = 0;
++	EGLPNUM_TYPE alpha;
++
++	EGLPNUM_TYPENAME_EGlpNumInitVar (alpha);
++	for (i = 0; i < x->nzcnt; i++)
++	{
++		int idx = x->indx[i];
++		EGLPNUM_TYPENAME_EGlpNumCopy (work[idx], x->coef[i]);
++		if (!mark[idx])
++		{
++			mark[idx] = 1;
++			list[n++] = idx;
++		}
++	}
++	for (k = 0; k < f->pf_cnt; k++)
++	{
++		int p = f->pf_p[k];
++		if (!mark[p] || !EGLPNUM_TYPENAME_EGlpNumIsNeqqZero (work[p]))
++			continue;
++		EGLPNUM_TYPENAME_EGlpNumCopyFrac (alpha, work[p], f->pf_piv[k]);
++		EGLPNUM_TYPENAME_EGlpNumCopy (work[p], alpha);
++		{
++			int beg = f->pf_beg[k];
++			int cnt = f->pf_nzcnt[k];
++			int *indx = f->pf_indx + beg;
++			EGLPNUM_TYPE *coef = f->pf_coef + beg;
++			for (i = 0; i < cnt; i++)
++			{
++				int idx = indx[i];
++				EGLPNUM_TYPENAME_EGlpNumSubInnProdTo (work[idx], alpha, coef[i]);
++				if (!mark[idx])
++				{
++					mark[idx] = 1;
++					list[n++] = idx;
++				}
++			}
++		}
++	}
++	for (i = 0; i < n; i++)
++	{
++		int idx = list[i];
++		mark[idx] = 0;
++		if (EGLPNUM_TYPENAME_EGlpNumIsNeqZero (work[idx], f->szero_tol))
++		{
++			x->indx[out_nz] = idx;
++			EGLPNUM_TYPENAME_EGlpNumCopy (x->coef[out_nz], work[idx]);
++			out_nz++;
++		}
++		EGLPNUM_TYPENAME_EGlpNumZero (work[idx]);
++	}
++	x->nzcnt = out_nz;
++	EGLPNUM_TYPENAME_EGlpNumClearVar (alpha);
++}
++
++static void pf_apply_btran (
++	EGLPNUM_TYPENAME_factor_work * f,
++	EGLPNUM_TYPENAME_svector * a,
++	EGLPNUM_TYPENAME_svector * out)
++{
++	EGLPNUM_TYPE *work = f->work_coef;
++	int *list = f->work_indx;
++	unsigned char *mark = f->pf_mark;
++	int n = 0, i, k, out_nz = 0;
++	EGLPNUM_TYPE dot;
++
++	EGLPNUM_TYPENAME_EGlpNumInitVar (dot);
++	for (i = 0; i < a->nzcnt; i++)
++	{
++		int idx = a->indx[i];
++		EGLPNUM_TYPENAME_EGlpNumCopy (work[idx], a->coef[i]);
++		if (!mark[idx])
++		{
++			mark[idx] = 1;
++			list[n++] = idx;
++		}
++	}
++	for (k = f->pf_cnt - 1; k >= 0; k--)
++	{
++		int p = f->pf_p[k];
++		int beg = f->pf_beg[k];
++		int cnt = f->pf_nzcnt[k];
++		int *indx = f->pf_indx + beg;
++		EGLPNUM_TYPE *coef = f->pf_coef + beg;
++		EGLPNUM_TYPENAME_EGlpNumCopy (dot, work[p]);
++		for (i = 0; i < cnt; i++)
++		{
++			int idx = indx[i];
++			if (mark[idx])
++				EGLPNUM_TYPENAME_EGlpNumSubInnProdTo (dot, coef[i], work[idx]);
++		}
++		if (EGLPNUM_TYPENAME_EGlpNumIsNeqqZero (dot))
++		{
++			EGLPNUM_TYPENAME_EGlpNumDivTo (dot, f->pf_piv[k]);
++			EGLPNUM_TYPENAME_EGlpNumCopy (work[p], dot);
++			if (!mark[p])
++			{
++				mark[p] = 1;
++				list[n++] = p;
++			}
++		}
++		else if (mark[p])
++		{
++			EGLPNUM_TYPENAME_EGlpNumZero (work[p]);
++		}
++	}
++	for (i = 0; i < n; i++)
++	{
++		int idx = list[i];
++		mark[idx] = 0;
++		if (EGLPNUM_TYPENAME_EGlpNumIsNeqqZero (work[idx]))
++		{
++			out->indx[out_nz] = idx;
++			EGLPNUM_TYPENAME_EGlpNumCopy (out->coef[out_nz], work[idx]);
++			out_nz++;
++		}
++		EGLPNUM_TYPENAME_EGlpNumZero (work[idx]);
++	}
++	out->nzcnt = out_nz;
++	EGLPNUM_TYPENAME_EGlpNumClearVar (dot);
++}
++
+ /* EGLPNUM_TYPENAME_ILLfactor_ftran solves Bx=a for x */
+ void EGLPNUM_TYPENAME_ILLfactor_ftran (
+ 	EGLPNUM_TYPENAME_factor_work * f,
+@@ -3709,6 +3925,10 @@
+ 	{
+ 		ILLfactor_ftranu (f, work_coef, x);
+ 	}
++	if (f->pf_cnt > 0)
++	{
++		pf_apply_ftran (f, x);
++	}
+ 
+ #ifdef SORT_RESULTS
+ 	sort_vector (x);
+@@ -3762,6 +3982,17 @@
+ 	}
+ #endif /* DEBUG_FACTOR */
+ 
++	if (f->pf_mode)
++	{
++		EGLPNUM_TYPENAME_ILLfactor_ftran (f, a, x);
++		upd->nzcnt = x->nzcnt;
++		for (i = 0; i < x->nzcnt; i++)
++		{
++			upd->indx[i] = x->indx[i];
++			EGLPNUM_TYPENAME_EGlpNumCopy (upd->coef[i], x->coef[i]);
++		}
++		return;
++	}
+ 	if (a->nzcnt >= SPARSE_FACTOR * f->dim)
+ 	{
+ 		aindx = a->indx;
+@@ -4453,6 +4684,13 @@
+ 	}
+ #endif /* DEBUG_FACTOR */
+ 
++	if (f->pf_cnt > 0)
++	{
++		pf_apply_btran (f, a, &f->pf_tmp);
++		a = &f->pf_tmp;
++		aindx = a->indx;
++		acoef = a->coef;
++	}
+ 	if (a->nzcnt >= SPARSE_FACTOR * f->dim)
+ 	{
+ 		aindx = a->indx;
+@@ -5417,6 +5655,58 @@
+ #ifdef UPDATE_STUDY
+ 	nupdate++;
+ #endif
++
++	if (f->pf_mode)
++	{
++		int found_piv = 0;
++		int k_idx = f->pf_cnt;
++		int off_cnt = 0;
++		EGLPNUM_TYPE piv, apiv;
++		EGLPNUM_TYPENAME_EGlpNumInitVar (piv);
++		EGLPNUM_TYPENAME_EGlpNumInitVar (apiv);
++		EGLPNUM_TYPENAME_EGlpNumZero (piv);
++		for (i = 0; i < a->nzcnt; i++)
++		{
++			if (a->indx[i] == col_p)
++			{
++				EGLPNUM_TYPENAME_EGlpNumCopy (piv, a->coef[i]);
++				found_piv = 1;
++				break;
++			}
++		}
++		EGLPNUM_TYPENAME_EGlpNumCopyAbs (apiv, piv);
++		if (!found_piv || EGLPNUM_TYPENAME_EGlpNumIsLessDbl (apiv, 1e-6) ||
++			(f->pf_max > 0 && k_idx >= f->pf_max) ||
++			pf_ensure_buffers (f, a->nzcnt) != 0)
++		{
++			f->pf_mode = 0;
++			f->pf_cnt = 0;
++			f->pf_freebeg = 0;
++			*p_refact = 1;
++			EGLPNUM_TYPENAME_EGlpNumClearVar (piv);
++			EGLPNUM_TYPENAME_EGlpNumClearVar (apiv);
++			return E_UPDATE_NOSPACE;
++		}
++		f->pf_beg[k_idx] = f->pf_freebeg;
++		f->pf_p[k_idx] = col_p;
++		EGLPNUM_TYPENAME_EGlpNumCopy (f->pf_piv[k_idx], piv);
++		for (i = 0; i < a->nzcnt; i++)
++		{
++			if (a->indx[i] != col_p && EGLPNUM_TYPENAME_EGlpNumIsNeqZero (a->coef[i], f->szero_tol))
++			{
++				f->pf_indx[f->pf_freebeg] = a->indx[i];
++				EGLPNUM_TYPENAME_EGlpNumCopy (f->pf_coef[f->pf_freebeg], a->coef[i]);
++				f->pf_freebeg++;
++				off_cnt++;
++			}
++		}
++		f->pf_nzcnt[k_idx] = off_cnt;
++		f->pf_cnt++;
++		*p_refact = 0;
++		EGLPNUM_TYPENAME_EGlpNumClearVar (piv);
++		EGLPNUM_TYPENAME_EGlpNumClearVar (apiv);
++		return 0;
++	}
+ 
+ 	row_p = f->ucindx[f->uc_inf[col_p].cbeg];
+ 
+--- a/qsopt_ex/factor.h
++++ b/qsopt_ex/factor.h
+@@ -142,6 +142,21 @@
+ 	int *uc_delay;
+ 	int *tran_stack;
+ 	int tran_cap;
++	/* Rollback-able product-form eta overlay used during strong branching. */
++	int pf_mode;
++	int pf_cnt;
++	int pf_max;
++	int pf_freebeg;
++	int pf_space;
++	int *pf_beg;
++	int *pf_nzcnt;
++	int *pf_p;
++	EGLPNUM_TYPE *pf_piv;
++	int *pf_indx;
++	EGLPNUM_TYPE *pf_coef;
++	unsigned char *pf_mark;
++	int pf_mark_cap;
++	EGLPNUM_TYPENAME_svector pf_tmp;
+ 	EGLPNUM_TYPENAME_svector xtmp;
+ 	int ur_freebeg;
+ 	int ur_space;
+--- a/qsopt_ex/lib.c
++++ b/qsopt_ex/lib.c
+@@ -1096,18 +1096,110 @@
+ 	EGLPNUM_TYPENAME_ILLprice_init_pricing_info (&lpinf);
+ 	lpinf.dI_price = QS_PRICE_DSTEEP;
+ 	lpinf.dII_price = QS_PRICE_DSTEEP;
+-	int base_ready = (factorok != 0 && *factorok == 1 && lp->basisid != -1 && lp->fbasisid == lp->basisid);
++	int base_ready = 0;
++	int from_fresh = 0;
++	int snap_saved = 0;
++	int snap_sol_ok = 0;
++	int snap_basisid = -1;
++	EGLPNUM_TYPENAME_lp_status_info snap_bstat = lp->basisstat;
++	int nr = lp->O->nrows;
++	int nc = lp->O->ncols;
++	int nnb = nc - nr;
++
++	if (factorok != 0 && *factorok == 1 && lp->f != 0 && lp->basisid != -1 &&
++		lp->nrows == nr && lp->ncols == nc && lp->nnbasic == nnb &&
++		lp->baz != 0 && lp->nbaz != 0 && lp->vindex != 0 && lp->vstat != 0)
++	{
++		lp->fbasisid = lp->basisid;
++		base_ready = 1;
++		from_fresh = 1;
++	}
++	else if (B != 0 && lp->internal_valid && nr > 0 && nc > 0 && nnb >= 0 &&
++		lp->nrows == nr && lp->ncols == nc && lp->nnbasic == nnb &&
++		lp->matbeg == lp->O->A.matbeg && lp->matcnt == lp->O->A.matcnt &&
++		lp->matind == lp->O->A.matind && lp->matval == lp->O->A.matval)
++	{
++		int singular = 0;
++		if (EGLPNUM_TYPENAME_ILLbasis_load (lp, B) == 0 &&
++			EGLPNUM_TYPENAME_ILLbasis_factor (lp, &singular) == 0 && !singular)
++		{
++			lp->fbasisid = lp->basisid;
++			base_ready = 1;
++		}
++	}
+ 	if (base_ready && B->rownorms)
+ 	{
+ 		rval = EGLPNUM_TYPENAME_ILLprice_load_rownorms (lp, B->rownorms, &lpinf);
+ 		CHECKRVALG (rval, CLEANUP);
+ 	}
++	if (base_ready && nr > 0 && nc > 0 && nnb >= 0)
++	{
++		if (nr > lp->sb_cap_r)
++		{
++			int cap = nr + (nr >> 2) + 32;
++			ILL_IFFREE(lp->sb_baz);
++			EGLPNUM_TYPENAME_EGlpNumFreeArray (lp->sb_xbz);
++			EGLPNUM_TYPENAME_EGlpNumFreeArray (lp->sb_piz);
++			lp->sb_cap_r = 0;
++			ILL_SAFE_MALLOC (lp->sb_baz, cap, int);
++			lp->sb_xbz = EGLPNUM_TYPENAME_EGlpNumAllocArray (cap);
++			lp->sb_piz = EGLPNUM_TYPENAME_EGlpNumAllocArray (cap);
++			lp->sb_cap_r = cap;
++		}
++		if (nc > lp->sb_cap_c)
++		{
++			int cap = nc + (nc >> 2) + 32;
++			ILL_IFFREE(lp->sb_vindex);
++			ILL_IFFREE(lp->sb_vstat);
++			lp->sb_cap_c = 0;
++			ILL_SAFE_MALLOC (lp->sb_vindex, cap, int);
++			ILL_SAFE_MALLOC (lp->sb_vstat, cap, int);
++			lp->sb_cap_c = cap;
++		}
++		if (nnb > lp->sb_cap_nb)
++		{
++			int cap = nnb + (nnb >> 2) + 32;
++			ILL_IFFREE(lp->sb_nbaz);
++			EGLPNUM_TYPENAME_EGlpNumFreeArray (lp->sb_dz);
++			lp->sb_cap_nb = 0;
++			ILL_SAFE_MALLOC (lp->sb_nbaz, cap, int);
++			lp->sb_dz = EGLPNUM_TYPENAME_EGlpNumAllocArray (cap);
++			lp->sb_cap_nb = cap;
++		}
++		if (lp->sb_baz && lp->sb_vindex && lp->sb_vstat && (nnb == 0 || lp->sb_nbaz))
++		{
++			memcpy (lp->sb_baz, lp->baz, (size_t) nr * sizeof (int));
++			if (nnb > 0)
++				memcpy (lp->sb_nbaz, lp->nbaz, (size_t) nnb * sizeof (int));
++			memcpy (lp->sb_vindex, lp->vindex, (size_t) nc * sizeof (int));
++			memcpy (lp->sb_vstat, lp->vstat, (size_t) nc * sizeof (int));
++			snap_basisid = lp->basisid;
++			snap_bstat = lp->basisstat;
++			snap_saved = 1;
++			if (from_fresh && lp->internal_valid && lp->xbz && lp->piz && (nnb == 0 || lp->dz) &&
++				lp->basisstat.dual_feasible && lp->basisstat.primal_feasible &&
++				lp->nbchange == 0 && lp->ncchange == 0)
++			{
++				int j;
++				for (j = 0; j < nr; j++)
++				{
++					EGLPNUM_TYPENAME_EGlpNumCopy (lp->sb_xbz[j], lp->xbz[j]);
++					EGLPNUM_TYPENAME_EGlpNumCopy (lp->sb_piz[j], lp->piz[j]);
++				}
++				for (j = 0; j < nnb; j++)
++					EGLPNUM_TYPENAME_EGlpNumCopy (lp->sb_dz[j], lp->dz[j]);
++				snap_sol_ok = 1;
++			}
++		}
++	}
+ 
+ 	lp->maxiter = iterations;
+ 
+ 	for (i = 0; i < ncand; i++)
+ 	{
++		int col_internal;
+ 		k = candidatelist[i];
++		col_internal = lp->O->structmap[k];
+ 		rval = EGLPNUM_TYPENAME_ILLlib_getbnd (lp, k, 'U', &oldbnd);
+ 		CHECKRVALG (rval, CLEANUP);
+ 		EGLPNUM_TYPENAME_EGlpNumCopy (xi, xlist[i]);
+@@ -1119,10 +1211,83 @@
+ 		CHECKRVALG (rval, CLEANUP);
+ 
+ 		{
+-			int bid_before = lp->basisid;
+-			EGLPNUM_TYPENAME_ILLlp_basis *useB = base_ready ? 0 : B;
++			EGLPNUM_TYPENAME_ILLlp_basis *useB;
++			if (!base_ready && B != 0 && snap_saved && lp->internal_valid &&
++				lp->nrows == nr && lp->ncols == nc && lp->nnbasic == nnb &&
++				lp->matbeg == lp->O->A.matbeg && lp->matcnt == lp->O->A.matcnt &&
++				lp->matind == lp->O->A.matind && lp->matval == lp->O->A.matval)
++			{
++				int singular = 0;
++				if (EGLPNUM_TYPENAME_ILLbasis_load (lp, B) == 0 &&
++					EGLPNUM_TYPENAME_ILLbasis_factor (lp, &singular) == 0 && !singular)
++				{
++					lp->fbasisid = lp->basisid;
++					snap_basisid = lp->basisid;
++					memcpy (lp->sb_baz, lp->baz, (size_t) nr * sizeof (int));
++					if (nnb > 0)
++						memcpy (lp->sb_nbaz, lp->nbaz, (size_t) nnb * sizeof (int));
++					memcpy (lp->sb_vindex, lp->vindex, (size_t) nc * sizeof (int));
++					memcpy (lp->sb_vstat, lp->vstat, (size_t) nc * sizeof (int));
++					if (B->rownorms && lpinf.dsinfo.norms)
++					{
++						int j;
++						for (j = 0; j < nr; j++)
++							EGLPNUM_TYPENAME_EGlpNumCopy (lpinf.dsinfo.norms[j], B->rownorms[j]);
++					}
++					snap_sol_ok = 0;
++					base_ready = 1;
++				}
++			}
++			useB = base_ready ? 0 : B;
++			if (base_ready && snap_saved && lp->f != 0)
++			{
++				lp->f->pf_mode = 1;
++				lp->f->pf_cnt = 0;
++				lp->f->pf_freebeg = 0;
++				lp->sb_fast_start = (snap_sol_ok && lp->vstat[col_internal] == STAT_BASIC) ? 1 : 0;
++			}
+ 			rval = EGLPNUM_TYPENAME_ILLlib_optimize (lp, useB, &lpinf, DUAL_SIMPLEX, &status, 0, itcnt);
+-			base_ready = (useB == 0 && lp->basisid == bid_before && lp->fbasisid == lp->basisid);
++			lp->sb_fast_start = 0;
++			if (useB == 0 && snap_saved && lp->f != 0 && lp->f->pf_mode == 1)
++			{
++				int j;
++				lp->f->pf_cnt = 0;
++				lp->f->pf_freebeg = 0;
++				lp->f->pf_mode = 0;
++				memcpy (lp->baz, lp->sb_baz, (size_t) nr * sizeof (int));
++				if (nnb > 0)
++					memcpy (lp->nbaz, lp->sb_nbaz, (size_t) nnb * sizeof (int));
++				memcpy (lp->vindex, lp->sb_vindex, (size_t) nc * sizeof (int));
++				memcpy (lp->vstat, lp->sb_vstat, (size_t) nc * sizeof (int));
++				lp->basisid = snap_basisid;
++				lp->fbasisid = snap_basisid;
++				if (snap_sol_ok)
++				{
++					for (j = 0; j < nr; j++)
++					{
++						EGLPNUM_TYPENAME_EGlpNumCopy (lp->xbz[j], lp->sb_xbz[j]);
++						EGLPNUM_TYPENAME_EGlpNumCopy (lp->piz[j], lp->sb_piz[j]);
++					}
++					for (j = 0; j < nnb; j++)
++						EGLPNUM_TYPENAME_EGlpNumCopy (lp->dz[j], lp->sb_dz[j]);
++				}
++				if (B->rownorms && lpinf.dsinfo.norms)
++				{
++					for (j = 0; j < nr; j++)
++						EGLPNUM_TYPENAME_EGlpNumCopy (lpinf.dsinfo.norms[j], B->rownorms[j]);
++				}
++				base_ready = 1;
++			}
++			else
++			{
++				if (lp->f != 0)
++				{
++					lp->f->pf_mode = 0;
++					lp->f->pf_cnt = 0;
++					lp->f->pf_freebeg = 0;
++				}
++				base_ready = 0;
++			}
+ 		}
+ 		EGLPNUM_TYPENAME_ILLlib_chgbnd (lp, k, 'U', oldbnd);
+ 		CHECKRVALG (rval, CLEANUP);
+@@ -1153,10 +1318,83 @@
+ 		CHECKRVALG (rval, CLEANUP);
+ 
+ 		{
+-			int bid_before = lp->basisid;
+-			EGLPNUM_TYPENAME_ILLlp_basis *useB = base_ready ? 0 : B;
++			EGLPNUM_TYPENAME_ILLlp_basis *useB;
++			if (!base_ready && B != 0 && snap_saved && lp->internal_valid &&
++				lp->nrows == nr && lp->ncols == nc && lp->nnbasic == nnb &&
++				lp->matbeg == lp->O->A.matbeg && lp->matcnt == lp->O->A.matcnt &&
++				lp->matind == lp->O->A.matind && lp->matval == lp->O->A.matval)
++			{
++				int singular = 0;
++				if (EGLPNUM_TYPENAME_ILLbasis_load (lp, B) == 0 &&
++					EGLPNUM_TYPENAME_ILLbasis_factor (lp, &singular) == 0 && !singular)
++				{
++					lp->fbasisid = lp->basisid;
++					snap_basisid = lp->basisid;
++					memcpy (lp->sb_baz, lp->baz, (size_t) nr * sizeof (int));
++					if (nnb > 0)
++						memcpy (lp->sb_nbaz, lp->nbaz, (size_t) nnb * sizeof (int));
++					memcpy (lp->sb_vindex, lp->vindex, (size_t) nc * sizeof (int));
++					memcpy (lp->sb_vstat, lp->vstat, (size_t) nc * sizeof (int));
++					if (B->rownorms && lpinf.dsinfo.norms)
++					{
++						int j;
++						for (j = 0; j < nr; j++)
++							EGLPNUM_TYPENAME_EGlpNumCopy (lpinf.dsinfo.norms[j], B->rownorms[j]);
++					}
++					snap_sol_ok = 0;
++					base_ready = 1;
++				}
++			}
++			useB = base_ready ? 0 : B;
++			if (base_ready && snap_saved && lp->f != 0)
++			{
++				lp->f->pf_mode = 1;
++				lp->f->pf_cnt = 0;
++				lp->f->pf_freebeg = 0;
++				lp->sb_fast_start = (snap_sol_ok && lp->vstat[col_internal] == STAT_BASIC) ? 1 : 0;
++			}
+ 			rval = EGLPNUM_TYPENAME_ILLlib_optimize (lp, useB, &lpinf, DUAL_SIMPLEX, &status, 0, itcnt);
+-			base_ready = (useB == 0 && lp->basisid == bid_before && lp->fbasisid == lp->basisid);
++			lp->sb_fast_start = 0;
++			if (useB == 0 && snap_saved && lp->f != 0 && lp->f->pf_mode == 1)
++			{
++				int j;
++				lp->f->pf_cnt = 0;
++				lp->f->pf_freebeg = 0;
++				lp->f->pf_mode = 0;
++				memcpy (lp->baz, lp->sb_baz, (size_t) nr * sizeof (int));
++				if (nnb > 0)
++					memcpy (lp->nbaz, lp->sb_nbaz, (size_t) nnb * sizeof (int));
++				memcpy (lp->vindex, lp->sb_vindex, (size_t) nc * sizeof (int));
++				memcpy (lp->vstat, lp->sb_vstat, (size_t) nc * sizeof (int));
++				lp->basisid = snap_basisid;
++				lp->fbasisid = snap_basisid;
++				if (snap_sol_ok)
++				{
++					for (j = 0; j < nr; j++)
++					{
++						EGLPNUM_TYPENAME_EGlpNumCopy (lp->xbz[j], lp->sb_xbz[j]);
++						EGLPNUM_TYPENAME_EGlpNumCopy (lp->piz[j], lp->sb_piz[j]);
++					}
++					for (j = 0; j < nnb; j++)
++						EGLPNUM_TYPENAME_EGlpNumCopy (lp->dz[j], lp->sb_dz[j]);
++				}
++				if (B->rownorms && lpinf.dsinfo.norms)
++				{
++					for (j = 0; j < nr; j++)
++						EGLPNUM_TYPENAME_EGlpNumCopy (lpinf.dsinfo.norms[j], B->rownorms[j]);
++				}
++				base_ready = 1;
++			}
++			else
++			{
++				if (lp->f != 0)
++				{
++					lp->f->pf_mode = 0;
++					lp->f->pf_cnt = 0;
++					lp->f->pf_freebeg = 0;
++				}
++				base_ready = 0;
++			}
+ 		}
+ 		EGLPNUM_TYPENAME_ILLlib_chgbnd (lp, k, 'L', oldbnd);
+ 		CHECKRVALG (rval, CLEANUP);
+@@ -1192,6 +1430,14 @@
+ 
+ CLEANUP:
+ 
++	if (lp->f != 0)
++	{
++		lp->f->pf_mode = 0;
++		lp->f->pf_cnt = 0;
++		lp->f->pf_freebeg = 0;
++	}
++	if (base_ready && snap_saved)
++		lp->basisstat = snap_bstat;
+ 	if (factorok != 0)
+ 		*factorok = base_ready ? 1 : 0;
+ 	EGLPNUM_TYPENAME_EGlpNumClearVar (xi);
+--- a/qsopt_ex/lpdefs.h
++++ b/qsopt_ex/lpdefs.h
+@@ -211,6 +211,17 @@
+ 	int *inv_structmap;
+ 	int inv_structmap_cap;
+ 	int inv_structmap_valid;
++	int sb_fast_start;
++	int *sb_baz;
++	int *sb_nbaz;
++	int *sb_vindex;
++	int *sb_vstat;
++	EGLPNUM_TYPE *sb_xbz;
++	EGLPNUM_TYPE *sb_piz;
++	EGLPNUM_TYPE *sb_dz;
++	int sb_cap_r;
++	int sb_cap_c;
++	int sb_cap_nb;
+ 	int *rowcnt;									/* row info follows, copy of col info */
+ 	int *rowbeg;
+ 	int *rowind;
+--- a/qsopt_ex/simplex.c
++++ b/qsopt_ex/simplex.c
+@@ -113,6 +113,17 @@
+ 	lp->inv_structmap = 0;
+ 	lp->inv_structmap_cap = 0;
+ 	lp->inv_structmap_valid = 0;
++	lp->sb_fast_start = 0;
++	lp->sb_baz = 0;
++	lp->sb_nbaz = 0;
++	lp->sb_vindex = 0;
++	lp->sb_vstat = 0;
++	lp->sb_xbz = 0;
++	lp->sb_piz = 0;
++	lp->sb_dz = 0;
++	lp->sb_cap_r = 0;
++	lp->sb_cap_c = 0;
++	lp->sb_cap_nb = 0;
+ 	EGLPNUM_TYPENAME_ILLbasis_init_basisinfo (lp);
+ 	EGLPNUM_TYPENAME_init_internal_lpinfo (lp);
+ }
+@@ -128,6 +139,16 @@
+ 		ILL_IFFREE(lp->inv_structmap);
+ 		lp->inv_structmap_cap = 0;
+ 		lp->inv_structmap_valid = 0;
++		ILL_IFFREE(lp->sb_baz);
++		ILL_IFFREE(lp->sb_nbaz);
++		ILL_IFFREE(lp->sb_vindex);
++		ILL_IFFREE(lp->sb_vstat);
++		EGLPNUM_TYPENAME_EGlpNumFreeArray (lp->sb_xbz);
++		EGLPNUM_TYPENAME_EGlpNumFreeArray (lp->sb_piz);
++		EGLPNUM_TYPENAME_EGlpNumFreeArray (lp->sb_dz);
++		lp->sb_cap_r = 0;
++		lp->sb_cap_c = 0;
++		lp->sb_cap_nb = 0;
+ 		EGLPNUM_TYPENAME_ILLbasis_free_basisinfo (lp);
+ 		EGLPNUM_TYPENAME_free_internal_lpinfo (lp);
+ 	}
+@@ -1197,16 +1218,24 @@
+ 		goto TERMINATE;
+ 	}
+ 
+-	EGLPNUM_TYPENAME_ILLfct_compute_piz (lp);
+-	EGLPNUM_TYPENAME_ILLfct_compute_dz (lp);
+-	if (it.algorithm == DUAL_SIMPLEX)
++	if (lp->sb_fast_start && B == NULL && it.resumeid == -1 && it.algorithm == DUAL_SIMPLEX)
+ 	{
+-		if (B != NULL || it.resumeid == SIMPLEX_RESUME_UNSHIFT)
+-			EGLPNUM_TYPENAME_ILLfct_dual_adjust (lp, lp->tol->dfeas_tol);
+-		else
+-			EGLPNUM_TYPENAME_ILLfct_dual_adjust (lp, EGLPNUM_TYPENAME_zeroLpNum);
++		lp->sb_fast_start = 0;
+ 	}
+-	EGLPNUM_TYPENAME_ILLfct_compute_xbz (lp);
++	else
++	{
++		lp->sb_fast_start = 0;
++		EGLPNUM_TYPENAME_ILLfct_compute_piz (lp);
++		EGLPNUM_TYPENAME_ILLfct_compute_dz (lp);
++		if (it.algorithm == DUAL_SIMPLEX)
++		{
++			if (B != NULL || it.resumeid == SIMPLEX_RESUME_UNSHIFT)
++				EGLPNUM_TYPENAME_ILLfct_dual_adjust (lp, lp->tol->dfeas_tol);
++			else
++				EGLPNUM_TYPENAME_ILLfct_dual_adjust (lp, EGLPNUM_TYPENAME_zeroLpNum);
++		}
++		EGLPNUM_TYPENAME_ILLfct_compute_xbz (lp);
++	}
+ 
+ 	EGLPNUM_TYPENAME_ILLfct_check_pfeasible (lp, &fi, lp->tol->pfeas_tol);
+ 	EGLPNUM_TYPENAME_ILLfct_check_dfeasible (lp, &fi, lp->tol->dfeas_tol);

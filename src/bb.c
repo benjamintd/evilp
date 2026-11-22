@@ -1,6 +1,7 @@
 #include "bb.h"
 #include "binary_search.h"
 #include "assignment.h"
+#include "pair_assignment.h"
 #include "binary_sat.h"
 #include "flow.h"
 #include "lot_sizing.h"
@@ -1051,6 +1052,17 @@ void lab_bb_solve(const LabModel *model, const LabBbOptions *options, LabBbResul
         result->nodes++;
         LAB_PHASE(&s, "specialized");
         if (!node->parent && !options->no_presolve && !options->lp.no_exact) {
+            size_t pair_nodes = 0;
+            int paired = lab_pair_assignment(model, lab_now() + fmin(2, .4 * remaining(&s)),
+                                             (options->node_limit - result->nodes) / 2,
+                                             s.repair_lower, &pair_nodes);
+            result->nodes += pair_nodes;
+            if (paired && complete_point_search(&s, node,
+                    "Pair assignment search exhausted; original witness checked",
+                    "pair_assignment_optimum")) {
+                release(node);
+                goto cleanup;
+            }
             size_t trials = 0;
             char **decimal = NULL;
             int matched = lab_assignment_solve(model, s.base_lower, s.base_upper,

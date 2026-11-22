@@ -70,6 +70,33 @@ static void source_arithmetic(void) {
             "infinite sides use zero placeholders");
     lab_model_free(&m);
 }
+static void column_record_order(void) {
+    const char *bodies[] = {
+        " x A 1 B .3\n y A -1 B 1\n",
+        " x B .3 A 1\n y B 1\n A -1\n",
+        " x B .1 A 1\n y B 1\n x B .2\n y A -1\n",
+        " x B .1 A 1\n B .2\n y A -1 B 1\n"
+    };
+    for (size_t i = 0; i < sizeof bodies / sizeof *bodies; ++i) {
+        LabModel m = {0};
+        char text[256];
+        snprintf(text, sizeof text, "NAME ORDER\nROWS\n N O\n E A\n E B\nCOLUMNS\n%sENDATA\n",
+                 bodies[i]);
+        read_text(&m, text, 1);
+        require(m.cols == 2 && m.nnz == 4 && m.col_start[1] == 2 && m.exact,
+                "grouped and interleaved columns coalesce to the same CSC shape");
+        require(m.row_index[0] == 0 && m.row_index[1] == 1 && m.row_index[2] == 0 &&
+                m.row_index[3] == 1 && m.value[0] == 1 && m.value[2] == -1 && m.value[3] == 1 &&
+                !mpq_cmp_ui(m.exact->value[1], 3, 10), "sorted rows preserve exact coefficients");
+        lab_model_free(&m);
+    }
+    LabModel m = {0};
+    read_text(&m, "NAME MARK\nROWS\n N O\n E A\nCOLUMNS\n x O 1\n"
+                  " M 'MARKER' 'INTORG'\n A 1\n M 'MARKER' 'INTEND'\nENDATA\n", 0);
+    require(strstr(m.error, "conflicting integer markers") != NULL,
+            "continuation rechecks the integer marker");
+    lab_model_free(&m);
+}
 static void topology_disagreement(void) {
     const char *models[] = {
         "NAME LOST\nROWS\n N O\n G R\nCOLUMNS\n x O 0 R 10000000000000001\n"
@@ -329,6 +356,20 @@ static void source_envelopes(void) {
     n = lab_interval_divide((LabInterval){1, 1}, (LabInterval){-1, 1});
     require(n.lower == -INFINITY && n.upper == INFINITY,
             "uncertain denominator sign cannot tighten");
+    LabInterval unit = {1, 1}, minus = {-1, -1}, range = {DBL_TRUE_MIN, INFINITY};
+    n = lab_interval_multiply(range, unit);
+    require(n.lower == DBL_TRUE_MIN && n.upper == INFINITY, "subnormal unit product is exact");
+    n = lab_interval_divide(range, minus);
+    require(n.lower == -INFINITY && n.upper == -DBL_TRUE_MIN, "negative unit reverses endpoints");
+    n = lab_interval_multiply((LabInterval){-3, -3}, (LabInterval){-DBL_MAX, 2});
+    require(n.lower == -6 && n.upper == INFINITY, "negative singleton with overflow");
+    n = lab_interval_divide((LabInterval){2, 1}, unit);
+    require(n.lower == -INFINITY && n.upper == INFINITY, "invalid numerator remains unresolved");
+    int rounding = fegetround();
+    require(!fesetround(FE_UPWARD), "change rounding mode");
+    n = lab_interval_divide(range, unit);
+    require(n.lower == -INFINITY && n.upper == INFINITY, "rounding-mode guard precedes shortcut");
+    require(!fesetround(rounding), "restore rounding mode");
     LabModel m = {0};
     read_text(&m,
         "NAME ENVELOPE\nROWS\n N O\n L R\nCOLUMNS\n x O 0 R .1\n x R .2\n"
@@ -390,6 +431,7 @@ static void sparse_single_record_decimals(void) {
 int main(void) {
     decimal_parser();
     source_arithmetic();
+    column_record_order();
     topology_disagreement();
     defaults_and_nonconstraints();
     bounded_storage_and_cleanup();

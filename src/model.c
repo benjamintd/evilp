@@ -56,6 +56,7 @@ typedef struct {
     InputCol *cols;
     Entry *entries;
     size_t nr, nc, ne, row_cap, col_cap, entry_cap;
+    int interleaved_columns;
     Names row_names, col_names;
     char *objective_name, *rhs_name, *range_name, *bound_name;
     size_t line;
@@ -314,8 +315,20 @@ static int add_values(Reader *p, size_t column, size_t start, size_t n, char **f
         double number;
         if (row == SIZE_MAX)
             return problem(p, "unknown coefficient row %s", field[i]);
-        if (finite_number(p, field[i + 1], &number))
-            return -1;
+        const char *token = field[i + 1];
+        LabInterval enclosure;
+        /* Unit coefficients dominate sparse incidence and packing models. */
+        if (token[0] == '1' && token[1] == '\0') {
+            number = 1;
+            enclosure = (LabInterval){1, 1};
+        } else if (token[0] == '-' && token[1] == '1' && token[2] == '\0') {
+            number = -1;
+            enclosure = (LabInterval){-1, -1};
+        } else {
+            if (finite_number(p, token, &number))
+                return -1;
+            enclosure = lab_source_number_interval(token, number);
+        }
         if (reserve(p, (void **)&p->entries, &p->entry_cap, p->ne + 1, sizeof *p->entries,
                     MODEL_ENTRIES))
             return -1;
@@ -324,7 +337,6 @@ static int add_values(Reader *p, size_t column, size_t start, size_t n, char **f
         if (p->ne >= NATIVE_RECORDS)
             disable_native(p);
         char *text = capture(p, field[i + 1]);
-        LabInterval enclosure = lab_source_number_interval(field[i + 1], number);
         char *scalar = NULL;
         if (row == p->objective_row) {
             scalar = capture_objective(p, field[i + 1]);
@@ -333,6 +345,8 @@ static int add_values(Reader *p, size_t column, size_t start, size_t n, char **f
             scalar = lab_strdup(field[i + 1]);
             ++p->exception_tokens;
         }
+        if (p->ne && p->entries[p->ne - 1].column > column)
+            p->interleaved_columns = 1;
         p->entries[p->ne++] = (Entry){column, row, number, text, enclosure, scalar};
     }
     return 0;
@@ -459,6 +473,43 @@ static int entry_order(const void *left, const void *right) {
         return a->row < b->row ? -1 : 1;
     return 0;
 }
+/* Grouped MPS columns need only a local row sort. If a column contains
+ * duplicate records, use the original full sort to retain its summation order. */
+static void sort_entries(Reader *p) {
+    if (!p->ne)
+        return;
+    if (!p->interleaved_columns) {
+        /* Remember the last column using each row. Repeated keys keep the
+         * legacy sort even when their records were separated in the input. */
+        size_t *seen = lab_alloc(p->nr, sizeof *seen);
+        int duplicate = 0;
+        for (size_t k = 0; k < p->ne; ++k) {
+            Entry *e = &p->entries[k];
+            if (seen[e->row] == e->column + 1) {
+                duplicate = 1;
+                break;
+            }
+            seen[e->row] = e->column + 1;
+        }
+        free(seen);
+        if (!duplicate) {
+            for (size_t begin = 0, end; begin < p->ne; begin = end) {
+                int ordered = 1;
+                end = begin + 1;
+                while (end < p->ne && p->entries[end].column == p->entries[begin].column) {
+                    if (p->entries[end].row < p->entries[end - 1].row)
+                        ordered = 0;
+                    ++end;
+                }
+                if (!ordered)
+                    qsort(p->entries + begin, end - begin, sizeof *p->entries, entry_order);
+            }
+            return;
+        }
+    }
+    qsort(p->entries, p->ne, sizeof *p->entries, entry_order);
+}
+
 static LabExactModel *prepare_exact(Reader *p, const size_t *index, size_t objective) {
     LabModel *m = p->output;
     if (!p->exact_enabled || m->rows > 128 || m->cols > 256 || p->ne > 20000)
@@ -676,8 +727,7 @@ static int finish(Reader *p) {
     m->envelope = prepare_envelope(p,index,objective);
     /* Sorting gives deterministic coalescing even if a writer interleaves
      * column records. Rows within every final CSC column are sorted. */
-    if (p->ne)
-        qsort(p->entries, p->ne, sizeof *p->entries, entry_order);
+    sort_entries(p);
     size_t unique = 0;
     mpq_t sum,term,native_sum,native_term,objective_sum,objective_term;
     mpq_inits(sum,term,native_sum,native_term,objective_sum,objective_term,NULL);
@@ -837,7 +887,8 @@ static int read_model(LabModel *model, const char *path) {
     if (!input)
         return problem(&p, "cannot open model %s", path);
     gzbuffer(input, 1 << 20);
-    char line[LINE_SIZE], previous[LINE_SIZE] = "";
+    char line[LINE_SIZE];
+    size_t previous = SIZE_MAX;
     z_off_t position = gztell(input);
     while (!model->error[0] && gzgets(input, line, sizeof line)) {
         ++p.line;
@@ -950,16 +1001,19 @@ static int read_model(LabModel *model, const char *path) {
                 const char *name;
                 if (n == 3 || n == 5) {
                     name = field[0];
-                    snprintf(previous, sizeof previous, "%s", name);
                     start = 1;
-                } else if ((n == 2 || n == 4) && previous[0]) {
-                    name = previous;
+                } else if ((n == 2 || n == 4) && previous != SIZE_MAX) {
+                    name = p.cols[previous].name;
                     start = 0;
                 } else {
                     problem(&p, "malformed COLUMNS record");
                     break;
                 }
-                size_t j = get_column(&p, name, marker);
+                size_t j = previous;
+                if (j == SIZE_MAX || p.cols[j].marker != (unsigned)marker ||
+                    strcmp(p.cols[j].name, name))
+                    j = get_column(&p, name, marker);
+                previous = j;
                 if (j == SIZE_MAX)
                     break;
                 add_values(&p, j, start, n, field);

@@ -27,7 +27,7 @@ typedef struct {
 } Solver;
 typedef struct {
     int code, signal, timed_out;
-    double wall, cpu;
+    double wall, cpu, suspended;
     long rss;
 } Process;
 static volatile sig_atomic_t interrupted = 0;
@@ -108,9 +108,25 @@ static int objective_max(const char *path) {
     gzclose(f);
     return max;
 }
+/* A second clock records host suspension independently of solver deadlines.
+ * Read it inside the awake-time interval so descheduling cannot fake sleep. */
+static double including_suspend(void) {
+#if defined(__APPLE__) || defined(CLOCK_BOOTTIME)
+    struct timespec ts;
+#ifdef __APPLE__
+    clockid_t id = CLOCK_MONOTONIC_RAW;
+#else
+    clockid_t id = CLOCK_BOOTTIME;
+#endif
+    if (clock_gettime(id, &ts) == 0)
+        return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+#endif
+    return -1;
+}
 static Process run(char *const args[], const char *log, double limit) {
     Process r = {0};
     double begin = lab_now();
+    double including_begin = including_suspend();
     pid_t pid = fork();
     if (pid < 0)
         die("fork");
@@ -173,7 +189,10 @@ static Process run(char *const args[], const char *log, double limit) {
         struct timespec pause = {0, 20000000};
         nanosleep(&pause, NULL);
     }
+    double including_end = including_suspend();
     r.wall = lab_now() - begin;
+    r.suspended = including_begin >= 0 && including_end >= 0
+                      ? fmax(0.0, including_end - including_begin - r.wall) : -1;
     r.code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
     r.signal = WIFSIGNALED(status) ? WTERMSIG(status) : 0;
     r.cpu = (double)usage.ru_utime.tv_sec + (double)usage.ru_utime.tv_usec / 1e6 +
@@ -821,6 +840,9 @@ static void one(const Instance *inst, const Solver *s, const char *checker, cons
             "\"watchdog_timeout\":%s",
             seed, limit, grace, p.wall, p.cpu, p.rss, p.code, p.signal,
             p.timed_out ? "true" : "false");
+    if (p.suspended >= 0)
+        fprintf(f, ",\"host_suspend_s\":%.9g,\"sleep_affected\":%s", p.suspended,
+                p.suspended > 5.0 ? "true" : "false");
     fprintf(f, ",\"claimed_status\":");
     lab_json_string(f, claimed);
     fprintf(f, ",\"reported_solver_status\":");

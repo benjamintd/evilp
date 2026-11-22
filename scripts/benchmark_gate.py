@@ -124,7 +124,17 @@ def classify(model, run):
         reasons.append('unresolved_' + str(status))
     if checker.get('status') in ('invalid', 'error', 'unsupported'):
         reasons.append('checker_' + checker['status'])
-    if run.get('checker_exit_code') not in (None, 0):
+    # Some adapters emit a header-only solution file for an infeasible model.
+    # The checker explicitly recognizes this format and returns no_solution (4).
+    # An absent primal is expected only under the declared status-only contract.
+    empty_primal = (model['reference_status'] == '=inf=' and status == 'infeasible' and
+                    model.get('validation_contract') == 'reference_status_agreement' and
+                    run.get('checker_exit_code') == 4 and checker.get('status') == 'no_solution' and
+                    checker.get('checked_feasible') is False and checker.get('objective') is None and
+                    checker.get('certificate_status') == 'absent' and
+                    checker.get('certifies_infeasibility') is False and
+                    checker.get('certifies_optimality') is False)
+    if run.get('checker_exit_code') not in (None, 0) and not empty_primal:
         reasons.append('checker_process_error')
     if run.get('reference_status') != model['reference_status']:
         reasons.append('reference_status_mismatch')
@@ -257,6 +267,8 @@ def timing_contract(campaign, candidate, baseline, candidate_solver, baseline_so
             if not isinstance(engine.get(key), str) or not SHA256.fullmatch(engine[key]):
                 errors.append(label + ': frozen ' + key + ' required')
         for name, run in records.items():
+            if run.get('sleep_affected'):
+                errors.append(label + '/' + str(name) + ': host suspension during timed solve')
             if (run.get('campaign_id') != campaign.get('campaign_id') or
                     run.get('hardware_id') != campaign.get('hardware_id') or
                     run.get('measurement') != MEASUREMENT or run.get('budget') != budget or

@@ -1,0 +1,605 @@
+--- a/qsopt_ex/factor.c
++++ b/qsopt_ex/factor.c
+@@ -134,6 +134,12 @@
+ 	f->rrank = 0;
+ 	f->cperm = 0;
+ 	f->crank = 0;
++	f->row_of_col = 0;
++	f->col_of_row = 0;
++	f->ur_delay = 0;
++	f->uc_delay = 0;
++	f->tran_stack = 0;
++	f->tran_cap = 0;
+ 	f->dmat = 0;
+ 	EGLPNUM_TYPENAME_ILLsvector_init (&f->xtmp);
+ }
+@@ -197,6 +203,12 @@
+ 	ILL_IFFREE(f->erindx);
+ 	EGLPNUM_TYPENAME_EGlpNumFreeArray (f->ercoef);
+ 	f->er_capacity = 0;
++	ILL_IFFREE(f->row_of_col);
++	ILL_IFFREE(f->col_of_row);
++	ILL_IFFREE(f->ur_delay);
++	ILL_IFFREE(f->uc_delay);
++	ILL_IFFREE(f->tran_stack);
++	f->tran_cap = 0;
+ }
+ 
+ int EGLPNUM_TYPENAME_ILLfactor_set_factor_iparam (
+@@ -2152,9 +2164,31 @@
+ 		}
+ 	}
+ 
++	if (dim > f->tran_cap)
++	{
++		int cap = dim + (dim >> 2) + 32;
++		ILL_IFFREE(f->row_of_col);
++		ILL_IFFREE(f->col_of_row);
++		ILL_IFFREE(f->ur_delay);
++		ILL_IFFREE(f->uc_delay);
++		ILL_IFFREE(f->tran_stack);
++		f->tran_cap = 0;
++		ILL_SAFE_MALLOC (f->row_of_col, cap, int);
++		ILL_SAFE_MALLOC (f->col_of_row, cap, int);
++		ILL_SAFE_MALLOC (f->ur_delay, cap, int);
++		ILL_SAFE_MALLOC (f->uc_delay, cap, int);
++		ILL_SAFE_MALLOC (f->tran_stack, cap, int);
++		f->tran_cap = cap;
++	}
+ 	for (i = 0; i < dim; i++)
+ 	{
+-		f->rrank[f->rperm[i]] = i;
++		int rr = f->rperm[i];
++		int cc = f->cperm[i];
++		f->rrank[rr] = i;
++		f->row_of_col[cc] = rr;
++		f->col_of_row[rr] = cc;
++		f->ur_delay[i] = 0;
++		f->uc_delay[i] = 0;
+ 	}
+ 
+ 	nzcnt = f->ur_space;
+@@ -3471,160 +3505,101 @@
+ }
+ #endif
+ 
+-static void ftranu3_delay2 (
++static void ILLfactor_ftranu3 (
+ 	EGLPNUM_TYPENAME_factor_work * f,
+-	int c)
+-{
+-	EGLPNUM_TYPENAME_uc_info *uc_inf = f->uc_inf;
+-	int nzcnt;
+-	int *indx;
+-	int i;
+-	int last;
+-
+-	do
+-	{
+-		c = f->cperm[f->rrank[c]];
+-		nzcnt = uc_inf[c].nzcnt;
+-		indx = f->ucindx + uc_inf[c].cbeg;
+-		last = -1;
+-		for (i = 1; i < nzcnt; i++)
+-		{
+-			c = indx[i];
+-			if (uc_inf[c].delay++ == 0)
+-			{
+-				if (last >= 0)
+-				{
+-					ftranu3_delay2 (f, last);
+-				}
+-				last = c;
+-			}
+-		}
+-		c = last;
+-	} while (c >= 0);
+-}
+-
+-#if 0
+-static void ftranu3_process (
+-	EGLPNUM_TYPENAME_factor_work * f,
+-	int c,
++	EGLPNUM_TYPENAME_svector * a,
+ 	EGLPNUM_TYPENAME_svector * x)
+ {
+-	EGLPNUM_TYPENAME_uc_info *uc_inf = f->uc_inf;
+ 	EGLPNUM_TYPE *work = f->work_coef;
+-	int nzcnt;
+-	int *indx;
+-	EGLPNUM_TYPE *coef;
+-	int i;
++	int anzcnt = a->nzcnt;
++	int *aindx = a->indx;
++	EGLPNUM_TYPE *acoef = a->coef;
++	EGLPNUM_TYPENAME_uc_info *uc_inf = f->uc_inf;
++	int *ucindx = f->ucindx;
++	EGLPNUM_TYPE *uccoef = f->uccoef;
++	int *col_of_row = f->col_of_row;
++	int *delay = f->uc_delay;
++	int *stack = f->tran_stack;
++	int *xindx = x->indx;
++	EGLPNUM_TYPE *xcoef = x->coef;
++	int xnz = 0;
++	int i, top = 0;
+ 	EGLPNUM_TYPE v;
+ 
+-	EGLPNUM_TYPENAME_EGlpNumInitVar (v);
+-
+-	EGLPNUM_TYPENAME_EGlpNumCopy (v, work[c]);
+-	EGLPNUM_TYPENAME_EGlpNumZero (work[c]);
+-	c = f->cperm[f->rrank[c]];
+-	nzcnt = uc_inf[c].nzcnt;
+-	indx = f->ucindx + uc_inf[c].cbeg;
+-	coef = f->uccoef + uc_inf[c].cbeg;
+-	EGLPNUM_TYPENAME_EGlpNumDivTo (v, coef[0]);
+-	if (EGLPNUM_TYPENAME_EGlpNumIsNeqZero (v, f->szero_tol))
+-		/*if (v > szero_tol || v < -szero_tol) */
++	for (i = 0; i < anzcnt; i++)
+ 	{
+-		x->indx[x->nzcnt] = c;
+-		EGLPNUM_TYPENAME_EGlpNumCopy (x->coef[x->nzcnt], v);
+-		x->nzcnt++;
++		int r0 = aindx[i];
++		EGLPNUM_TYPENAME_EGlpNumCopy (work[r0], acoef[i]);
++		if (delay[r0]++ == 0)
++		{
++			stack[top++] = r0;
++		}
+ 	}
+-	for (i = 1; i < nzcnt; i++)
++	while (top > 0)
+ 	{
+-		c = indx[i];
+-		EGLPNUM_TYPENAME_EGlpNumSubInnProdTo (work[c], v, coef[i]);
+-		if (--uc_inf[c].delay == 0)
++		int c = col_of_row[stack[--top]];
++		int nzcnt = uc_inf[c].nzcnt;
++		if (nzcnt > 1)
+ 		{
+-			ftranu3_process (f, c, x);
++			int *indx = ucindx + uc_inf[c].cbeg;
++			for (i = 1; i < nzcnt; i++)
++			{
++				int nr = indx[i];
++				if (delay[nr]++ == 0)
++					stack[top++] = nr;
++			}
+ 		}
+ 	}
+-	EGLPNUM_TYPENAME_EGlpNumClearVar (v);
+-}
+-#endif
+ 
+-static void ftranu3_process2 (
+-	EGLPNUM_TYPENAME_factor_work * f,
+-	int c,
+-	EGLPNUM_TYPENAME_svector * x)
+-{
+-	EGLPNUM_TYPENAME_uc_info *uc_inf = f->uc_inf;
+-	EGLPNUM_TYPE *work = f->work_coef;
+-	int nzcnt;
+-	int *indx;
+-	EGLPNUM_TYPE *coef;
+-	int i;
+-	int last;
+-	EGLPNUM_TYPE v;
+-
+ 	EGLPNUM_TYPENAME_EGlpNumInitVar (v);
+-
+-	do
++	for (i = 0; i < anzcnt; i++)
+ 	{
+-		EGLPNUM_TYPENAME_EGlpNumCopy (v, work[c]);
+-		EGLPNUM_TYPENAME_EGlpNumZero (work[c]);
+-		c = f->cperm[f->rrank[c]];
+-		nzcnt = uc_inf[c].nzcnt;
+-		indx = f->ucindx + uc_inf[c].cbeg;
+-		coef = f->uccoef + uc_inf[c].cbeg;
+-		EGLPNUM_TYPENAME_EGlpNumDivTo (v, coef[0]);
+-		if (EGLPNUM_TYPENAME_EGlpNumIsNeqZero (v, f->szero_tol))
+-			/*if (v > szero_tol || v < -szero_tol) */
++		int r0 = aindx[i];
++		if (--delay[r0] == 0)
+ 		{
+-			x->indx[x->nzcnt] = c;
+-			EGLPNUM_TYPENAME_EGlpNumCopy (x->coef[x->nzcnt], v);
+-			x->nzcnt++;
+-		}
+-		last = -1;
+-		for (i = 1; i < nzcnt; i++)
+-		{
+-			c = indx[i];
+-			EGLPNUM_TYPENAME_EGlpNumSubInnProdTo (work[c], v, coef[i]);
+-			if (--uc_inf[c].delay == 0)
++			stack[top++] = r0;
++			while (top > 0)
+ 			{
+-				if (last >= 0)
++				int r = stack[--top];
++				int c = col_of_row[r];
++				int beg = uc_inf[c].cbeg;
++				int nzcnt = uc_inf[c].nzcnt;
++				EGLPNUM_TYPE *coef = uccoef + beg;
++				EGLPNUM_TYPENAME_EGlpNumCopy (v, work[r]);
++				EGLPNUM_TYPENAME_EGlpNumZero (work[r]);
++				EGLPNUM_TYPENAME_EGlpNumDivTo (v, coef[0]);
++				if (EGLPNUM_TYPENAME_EGlpNumIsNeqZero (v, f->szero_tol))
+ 				{
+-					ftranu3_process2 (f, last, x);
++					xindx[xnz] = c;
++					EGLPNUM_TYPENAME_EGlpNumCopy (xcoef[xnz], v);
++					xnz++;
+ 				}
+-				last = c;
++				if (nzcnt > 1)
++				{
++					int *indx = ucindx + beg;
++					int base = top;
++					int j;
++					for (j = 1; j < nzcnt; j++)
++					{
++						int nr = indx[j];
++						EGLPNUM_TYPENAME_EGlpNumSubInnProdTo (work[nr], v, coef[j]);
++						if (--delay[nr] == 0)
++							stack[top++] = nr;
++					}
++					/* Preserve exact Kahn recursion order (first ready child popped first). */
++					for (j = base; j < base + ((top - base) >> 1); j++)
++					{
++						int tmp = stack[j];
++						int opp = top - 1 - (j - base);
++						stack[j] = stack[opp];
++						stack[opp] = tmp;
++					}
++				}
+ 			}
+ 		}
+-		c = last;
+-	} while (c >= 0);
+-	EGLPNUM_TYPENAME_EGlpNumClearVar (v);
+-}
+-
+-static void ILLfactor_ftranu3 (
+-	EGLPNUM_TYPENAME_factor_work * f,
+-	EGLPNUM_TYPENAME_svector * a,
+-	EGLPNUM_TYPENAME_svector * x)
+-{
+-	EGLPNUM_TYPE *work = f->work_coef;
+-	int anzcnt = a->nzcnt;
+-	int *aindx = a->indx;
+-	EGLPNUM_TYPE *acoef = a->coef;
+-	EGLPNUM_TYPENAME_uc_info *uc_inf = f->uc_inf;
+-	int i;
+-
+-	for (i = 0; i < anzcnt; i++)
+-	{
+-		if (uc_inf[aindx[i]].delay++ == 0)
+-		{
+-			ftranu3_delay2 (f, aindx[i]);
+-		}
+-		EGLPNUM_TYPENAME_EGlpNumCopy (work[aindx[i]], acoef[i]);
+ 	}
+-	x->nzcnt = 0;
+-	for (i = 0; i < anzcnt; i++)
+-	{
+-		if (--uc_inf[aindx[i]].delay == 0)
+-		{
+-			ftranu3_process2 (f, aindx[i], x);
+-		}
+-	}
++	x->nzcnt = xnz;
++	EGLPNUM_TYPENAME_EGlpNumClearVar (v);
+ #ifdef SOLVE_DEBUG
+ 	QSlog("EGLPNUM_TYPENAME_ILLfactor_ftran x after u3:");
+ 	for (i = 0; i < x->nzcnt; i++)
+@@ -4340,158 +4315,100 @@
+ }
+ #endif
+ 
+-static void btranu3_delay2 (
++static void ILLfactor_btranu3 (
+ 	EGLPNUM_TYPENAME_factor_work * f,
+-	int r)
+-{
+-	EGLPNUM_TYPENAME_ur_info *ur_inf = f->ur_inf;
+-	int nzcnt;
+-	int *indx;
+-	int i;
+-	int last;
+-
+-	do
+-	{
+-		r = f->rperm[f->crank[r]];
+-		nzcnt = ur_inf[r].nzcnt;
+-		indx = f->urindx + ur_inf[r].rbeg;
+-		last = -1;
+-		for (i = 1; i < nzcnt; i++)
+-		{
+-			r = indx[i];
+-			if (ur_inf[r].delay++ == 0)
+-			{
+-				if (last >= 0)
+-				{
+-					btranu3_delay2 (f, last);
+-				}
+-				last = r;
+-			}
+-		}
+-		r = last;
+-	} while (r >= 0);
+-}
+-
+-#if 0
+-static void btranu3_process (
+-	EGLPNUM_TYPENAME_factor_work * f,
+-	int r,
++	EGLPNUM_TYPENAME_svector * a,
+ 	EGLPNUM_TYPENAME_svector * x)
+ {
+-	EGLPNUM_TYPENAME_ur_info *ur_inf = f->ur_inf;
+ 	EGLPNUM_TYPE *work = f->work_coef;
+-	int nzcnt;
+-	int *indx;
+-	EGLPNUM_TYPE *coef;
+-	int i;
++	int anzcnt = a->nzcnt;
++	int *aindx = a->indx;
++	EGLPNUM_TYPE *acoef = a->coef;
++	EGLPNUM_TYPENAME_ur_info *ur_inf = f->ur_inf;
++	int *urindx = f->urindx;
++	EGLPNUM_TYPE *urcoef = f->urcoef;
++	int *row_of_col = f->row_of_col;
++	int *delay = f->ur_delay;
++	int *stack = f->tran_stack;
++	int *xindx = x->indx;
++	EGLPNUM_TYPE *xcoef = x->coef;
++	int xnz = 0;
++	int i, top = 0;
+ 	EGLPNUM_TYPE v;
+ 
+-	EGLPNUM_TYPENAME_EGlpNumInitVar (v);
+-
+-	EGLPNUM_TYPENAME_EGlpNumCopy (v, work[r]);
+-	EGLPNUM_TYPENAME_EGlpNumZero (work[r]);
+-	r = f->rperm[f->crank[r]];
+-	nzcnt = ur_inf[r].nzcnt;
+-	indx = f->urindx + ur_inf[r].rbeg;
+-	coef = f->urcoef + ur_inf[r].rbeg;
+-	EGLPNUM_TYPENAME_EGlpNumDivTo (v, coef[0]);
+-	if (EGLPNUM_TYPENAME_EGlpNumIsNeqqZero (v))
++	for (i = 0; i < anzcnt; i++)
+ 	{
+-		x->indx[x->nzcnt] = r;
+-		EGLPNUM_TYPENAME_EGlpNumCopy (x->coef[x->nzcnt], v);
+-		x->nzcnt++;
++		int c0 = aindx[i];
++		EGLPNUM_TYPENAME_EGlpNumCopy (work[c0], acoef[i]);
++		if (delay[c0]++ == 0)
++		{
++			stack[top++] = c0;
++		}
+ 	}
+-	for (i = 1; i < nzcnt; i++)
++	while (top > 0)
+ 	{
+-		r = indx[i];
+-		EGLPNUM_TYPENAME_EGlpNumSubInnProdTo (work[r], v, coef[i]);
+-		if (--ur_inf[r].delay == 0)
++		int r = row_of_col[stack[--top]];
++		int nzcnt = ur_inf[r].nzcnt;
++		if (nzcnt > 1)
+ 		{
+-			btranu3_process (f, r, x);
++			int *indx = urindx + ur_inf[r].rbeg;
++			for (i = 1; i < nzcnt; i++)
++			{
++				int nc = indx[i];
++				if (delay[nc]++ == 0)
++					stack[top++] = nc;
++			}
+ 		}
+ 	}
+-	EGLPNUM_TYPENAME_EGlpNumClearVar (v);
+-}
+-#endif
+ 
+-static void btranu3_process2 (
+-	EGLPNUM_TYPENAME_factor_work * f,
+-	int r,
+-	EGLPNUM_TYPENAME_svector * x)
+-{
+-	EGLPNUM_TYPENAME_ur_info *ur_inf = f->ur_inf;
+-	EGLPNUM_TYPE *work = f->work_coef;
+-	int nzcnt;
+-	int *indx;
+-	EGLPNUM_TYPE *coef;
+-	int i;
+-	int last;
+-	EGLPNUM_TYPE v;
+-
+ 	EGLPNUM_TYPENAME_EGlpNumInitVar (v);
+-
+-	do
++	for (i = 0; i < anzcnt; i++)
+ 	{
+-		EGLPNUM_TYPENAME_EGlpNumCopy (v, work[r]);
+-		EGLPNUM_TYPENAME_EGlpNumZero (work[r]);
+-		r = f->rperm[f->crank[r]];
+-		nzcnt = ur_inf[r].nzcnt;
+-		indx = f->urindx + ur_inf[r].rbeg;
+-		coef = f->urcoef + ur_inf[r].rbeg;
+-		EGLPNUM_TYPENAME_EGlpNumDivTo (v, coef[0]);
+-		if (EGLPNUM_TYPENAME_EGlpNumIsNeqqZero (v))
++		int c0 = aindx[i];
++		if (--delay[c0] == 0)
+ 		{
+-			x->indx[x->nzcnt] = r;
+-			EGLPNUM_TYPENAME_EGlpNumCopy (x->coef[x->nzcnt], v);
+-			x->nzcnt++;
+-		}
+-		last = -1;
+-		for (i = 1; i < nzcnt; i++)
+-		{
+-			r = indx[i];
+-			EGLPNUM_TYPENAME_EGlpNumSubInnProdTo (work[r], v, coef[i]);
+-			if (--ur_inf[r].delay == 0)
++			stack[top++] = c0;
++			while (top > 0)
+ 			{
+-				if (last >= 0)
++				int c = stack[--top];
++				int r = row_of_col[c];
++				int beg = ur_inf[r].rbeg;
++				int nzcnt = ur_inf[r].nzcnt;
++				EGLPNUM_TYPE *coef = urcoef + beg;
++				EGLPNUM_TYPENAME_EGlpNumCopy (v, work[c]);
++				EGLPNUM_TYPENAME_EGlpNumZero (work[c]);
++				EGLPNUM_TYPENAME_EGlpNumDivTo (v, coef[0]);
++				if (EGLPNUM_TYPENAME_EGlpNumIsNeqqZero (v))
+ 				{
+-					btranu3_process2 (f, last, x);
++					xindx[xnz] = r;
++					EGLPNUM_TYPENAME_EGlpNumCopy (xcoef[xnz], v);
++					xnz++;
+ 				}
+-				last = r;
++				if (nzcnt > 1)
++				{
++					int *indx = urindx + beg;
++					int base = top;
++					int j;
++					for (j = 1; j < nzcnt; j++)
++					{
++						int nc = indx[j];
++						EGLPNUM_TYPENAME_EGlpNumSubInnProdTo (work[nc], v, coef[j]);
++						if (--delay[nc] == 0)
++							stack[top++] = nc;
++					}
++					for (j = base; j < base + ((top - base) >> 1); j++)
++					{
++						int tmp = stack[j];
++						int opp = top - 1 - (j - base);
++						stack[j] = stack[opp];
++						stack[opp] = tmp;
++					}
++				}
+ 			}
+ 		}
+-		r = last;
+-	} while (r >= 0);
+-	EGLPNUM_TYPENAME_EGlpNumClearVar (v);
+-}
+-
+-static void ILLfactor_btranu3 (
+-	EGLPNUM_TYPENAME_factor_work * f,
+-	EGLPNUM_TYPENAME_svector * a,
+-	EGLPNUM_TYPENAME_svector * x)
+-{
+-	EGLPNUM_TYPE *work = f->work_coef;
+-	int anzcnt = a->nzcnt;
+-	int *aindx = a->indx;
+-	EGLPNUM_TYPE *acoef = a->coef;
+-	EGLPNUM_TYPENAME_ur_info *ur_inf = f->ur_inf;
+-	int i;
+-
+-	for (i = 0; i < anzcnt; i++)
+-	{
+-		if (ur_inf[aindx[i]].delay++ == 0)
+-		{
+-			btranu3_delay2 (f, aindx[i]);
+-		}
+-		EGLPNUM_TYPENAME_EGlpNumCopy (work[aindx[i]], acoef[i]);
+ 	}
+-	x->nzcnt = 0;
+-	for (i = 0; i < anzcnt; i++)
+-	{
+-		if (--ur_inf[aindx[i]].delay == 0)
+-		{
+-			btranu3_process2 (f, aindx[i], x);
+-		}
+-	}
++	x->nzcnt = xnz;
++	EGLPNUM_TYPENAME_EGlpNumClearVar (v);
+ #ifdef SOLVE_DEBUG
+ 	QSlog("EGLPNUM_TYPENAME_ILLfactor_btran x after u3:");
+ 	for (i = 0; i < x->nzcnt; i++)
+--- a/qsopt_ex/factor.h
++++ b/qsopt_ex/factor.h
+@@ -135,6 +135,13 @@
+ 	int *rrank;
+ 	int *cperm;
+ 	int *crank;
++	/* Retained cache-compact sparse U-solve buffers. */
++	int *row_of_col;
++	int *col_of_row;
++	int *ur_delay;
++	int *uc_delay;
++	int *tran_stack;
++	int tran_cap;
+ 	EGLPNUM_TYPENAME_svector xtmp;
+ 	int ur_freebeg;
+ 	int ur_space;
+--- a/qsopt_ex/lib.c
++++ b/qsopt_ex/lib.c
+@@ -188,12 +188,6 @@
+ 	itcnt_t*itcnt)
+ {
+ 	int rval = 0;
+-	lp->internal_valid = 0;
+-	lp->internal_valid = 0;
+-	lp->internal_valid = 0;
+-	lp->internal_valid = 0;
+-	lp->internal_valid = 0;
+-	lp->internal_valid = 0;
+ 	int sol_status;
+ 
+ 	if (status)
+@@ -1343,6 +1337,7 @@
+ 		rval = 1;
+ 		ILL_CLEANUP;
+ 	}
++	lp->internal_valid = 0;
+ 
+ 	qslp = lp->O;
+ 	A = &qslp->A;
+@@ -1529,6 +1524,7 @@
+ 		rval = 1;
+ 		ILL_CLEANUP;
+ 	}
++	lp->internal_valid = 0;
+ 
+ 	if (num <= 0)
+ 	{
+@@ -1796,6 +1792,7 @@
+ 		rval = 1;
+ 		ILL_CLEANUP;
+ 	}
++	lp->internal_valid = 0;
+ 
+ 	if (basis_ok)
+ 		*basis_ok = 0;
+@@ -2065,6 +2062,7 @@
+ 		rval = 1;
+ 		ILL_CLEANUP;
+ 	}
++	lp->internal_valid = 0;
+ 
+ 	qslp = lp->O;
+ 	A = &qslp->A;
+@@ -2112,6 +2110,7 @@
+ 	EGLPNUM_TYPENAME_ILLlpdata *qslp = lp->O;
+ 	EGLPNUM_TYPENAME_ILLmatrix *A = &(lp->O->A);
+ 
++	lp->internal_valid = 0;
+ 	for (i = 0; i < num; i++)
+ 	{
+ 		j = qslp->rowmap[rowlist[i]];
+@@ -2315,6 +2314,7 @@
+ 		rval = 1;
+ 		ILL_CLEANUP;
+ 	}
++	lp->internal_valid = 0;
+ 
+ 	qslp = lp->O;
+ 	A = &qslp->A;

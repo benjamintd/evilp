@@ -409,6 +409,27 @@ LabInterval lab_interval_multiply(LabInterval a, LabInterval b) {
     if (fegetround() != FE_TONEAREST || isnan(a.lower) || isnan(a.upper) ||
         isnan(b.lower) || isnan(b.upper) || a.lower > a.upper || b.lower > b.upper)
         return whole_interval();
+    /* A singleton scales the interval monotonically. For an exact unit
+     * coefficient both endpoints are representable even in the subnormal range. */
+    if (b.lower == b.upper && a.lower != a.upper) {
+        LabInterval swap = a;
+        a = b;
+        b = swap;
+    }
+    if (a.lower == a.upper) {
+        double scale = a.lower;
+        if (scale == 0)
+            return (LabInterval){0, 0};
+        if (scale == 1)
+            return b;
+        if (scale == -1)
+            return (LabInterval){-b.upper, -b.lower};
+        LabInterval lo = scalar_product_interval(scale, scale > 0 ? b.lower : b.upper);
+        if (b.lower == b.upper)
+            return lo;
+        LabInterval hi = scalar_product_interval(scale, scale > 0 ? b.upper : b.lower);
+        return (LabInterval){lo.lower, hi.upper};
+    }
     LabInterval result = {INFINITY, -INFINITY};
     double av[] = {a.lower, a.upper}, bv[] = {b.lower, b.upper};
     for (size_t i = 0; i < 2; i++)
@@ -434,6 +455,8 @@ LabInterval lab_interval_divide(LabInterval a, LabInterval b) {
     if (isnan(b.lower) || isnan(b.upper) || b.lower > b.upper ||
         (b.lower <= 0 && b.upper >= 0))
         return whole_interval();
+    if (b.lower == b.upper && (b.lower == 1 || b.lower == -1))
+        return lab_interval_multiply(b, a);
     LabInterval lo = reciprocal_interval(b.upper), hi = reciprocal_interval(b.lower);
     return lab_interval_multiply(a, (LabInterval){lo.lower, hi.upper});
 }

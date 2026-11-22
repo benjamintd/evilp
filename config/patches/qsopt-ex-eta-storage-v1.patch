@@ -1,0 +1,155 @@
+--- a/qsopt_ex/basis.c
++++ b/qsopt_ex/basis.c
+@@ -1376,7 +1376,7 @@
+ 	{
+ 		if (lp->f)
+ 		{
+-			EGLPNUM_TYPENAME_ILLfactor_free_factor_work (lp->f);
++			EGLPNUM_TYPENAME_ILLfactor_reset_factor_work (lp->f);
+ 		}
+ 		else
+ 		{
+--- a/qsopt_ex/factor.h
++++ b/qsopt_ex/factor.h
+@@ -145,7 +145,8 @@
+ 	int lr_freebeg;
+ 	int lr_space;
+ 	int er_freebeg;
+-	int er_space;
++	int er_space;       /* logical limit for update entries */
++	int er_capacity;    /* retained index and coefficient slots */
+ 
+ 	int *p_nsing;
+ 	int **p_singr;
+@@ -159,6 +160,8 @@
+ EGLPNUM_TYPENAME_factor_work;
+ 
+ void EGLPNUM_TYPENAME_ILLfactor_init_factor_work (
++	EGLPNUM_TYPENAME_factor_work * f),
++  EGLPNUM_TYPENAME_ILLfactor_reset_factor_work (
+ 	EGLPNUM_TYPENAME_factor_work * f),
+   EGLPNUM_TYPENAME_ILLfactor_free_factor_work (
+ 	EGLPNUM_TYPENAME_factor_work * f),
+--- a/qsopt_ex/factor.c
++++ b/qsopt_ex/factor.c
+@@ -129,6 +129,7 @@
+ 	f->lrcoef = 0;
+ 	f->erindx = 0;
+ 	f->ercoef = 0;
++	f->er_capacity = 0;
+ 	f->rperm = 0;
+ 	f->rrank = 0;
+ 	f->cperm = 0;
+@@ -137,7 +138,7 @@
+ 	EGLPNUM_TYPENAME_ILLsvector_init (&f->xtmp);
+ }
+ 
+-void EGLPNUM_TYPENAME_ILLfactor_free_factor_work (
++void EGLPNUM_TYPENAME_ILLfactor_reset_factor_work (
+ 	EGLPNUM_TYPENAME_factor_work * f)
+ {
+ #ifdef UPDATE_STUDY
+@@ -178,9 +179,6 @@
+ 	ILL_IFFREE(f->lrindx);
+ 
+ 	EGLPNUM_TYPENAME_EGlpNumFreeArray (f->lrcoef);
+-	ILL_IFFREE(f->erindx);
+-
+-	EGLPNUM_TYPENAME_EGlpNumFreeArray (f->ercoef);
+ 	ILL_IFFREE(f->rperm);
+ 	ILL_IFFREE(f->rrank);
+ 	ILL_IFFREE(f->cperm);
+@@ -188,6 +186,17 @@
+ 
+ 	EGLPNUM_TYPENAME_EGlpNumFreeArray (f->dmat);
+ 	EGLPNUM_TYPENAME_ILLsvector_free (&f->xtmp);
++}
++
++/* Eta entries are overwritten before use after each reset. Only the final
++ * destructor releases their storage. Numerical objects stay initialized. */
++void EGLPNUM_TYPENAME_ILLfactor_free_factor_work (
++	EGLPNUM_TYPENAME_factor_work * f)
++{
++	EGLPNUM_TYPENAME_ILLfactor_reset_factor_work (f);
++	ILL_IFFREE(f->erindx);
++	EGLPNUM_TYPENAME_EGlpNumFreeArray (f->ercoef);
++	f->er_capacity = 0;
+ }
+ 
+ int EGLPNUM_TYPENAME_ILLfactor_set_factor_iparam (
+@@ -2160,9 +2169,6 @@
+ 
+ 	er_space = f->er_space_mul * f->etamax;
+ 	ILL_SAFE_MALLOC (f->er_inf, f->etamax, EGLPNUM_TYPENAME_er_info);
+-	ILL_SAFE_MALLOC (f->erindx, er_space, int);
+-
+-	f->ercoef = EGLPNUM_TYPENAME_EGlpNumAllocArray (er_space);
+ 	f->etacnt = 0;
+ 	f->er_freebeg = 0;
+ 	f->er_space = er_space;
+@@ -4994,6 +5000,25 @@
+ 	rrank[row_p] = rank_r;
+ }
+ 
++/* Grow on the first actual write. er_space still determines exactly when
++ * both update algorithms request a refactorization. */
++static int grow_eta_entries (EGLPNUM_TYPENAME_factor_work *f)
++{
++	int capacity = f->er_capacity;
++	int next = capacity == 0 ? 256 :
++		(capacity > f->er_space / 2 ? f->er_space : 2 * capacity);
++	int *indices;
++	if (next > f->er_space)
++		next = f->er_space;
++	indices = ILLutil_reallocrus (f->erindx, (size_t)next * sizeof(*indices));
++	if (!indices)
++		return E_UPDATE_NOSPACE;
++	f->erindx = indices;
++	EGLPNUM_TYPENAME_EGlpNumReallocArray (&f->ercoef, next);
++	f->er_capacity = next;
++	return 0;
++}
++
+ static int eliminate_row (
+ 	EGLPNUM_TYPENAME_factor_work * f,
+ 	int rank_p,
+@@ -5004,8 +5029,6 @@
+ 	int *cperm = f->cperm;
+ 	int *urindx = f->urindx;
+ 	EGLPNUM_TYPE *urcoef = f->urcoef;
+-	int *erindx = f->erindx;
+-	EGLPNUM_TYPE *ercoef = f->ercoef;
+ 	EGLPNUM_TYPE *work_coef = f->work_coef;
+ 	int er_freebeg = f->er_freebeg;
+ 	int er_space = f->er_space;
+@@ -5040,7 +5063,8 @@
+ 			{
+ 				EGLPNUM_TYPENAME_EGlpNumSubInnProdTo (work_coef[urindx[beg + j]], pivot_mul, urcoef[beg + j]);	/* 0.85 */
+ 			}
+-			if (er_freebeg >= er_space)
++			if (er_freebeg >= er_space ||
++				(er_freebeg >= f->er_capacity && grow_eta_entries (f)))
+ 			{
+ 				/* QSlog("no space in eliminate_row"); */
+ #ifdef TRACK_FACTOR
+@@ -5049,8 +5073,8 @@
+ 				EGLPNUM_TYPENAME_EGlpNumClearVar (pivot_mul);
+ 				return E_UPDATE_NOSPACE;
+ 			}
+-			erindx[er_freebeg] = r;
+-			EGLPNUM_TYPENAME_EGlpNumCopy (ercoef[er_freebeg], pivot_mul);
++			f->erindx[er_freebeg] = r;
++			EGLPNUM_TYPENAME_EGlpNumCopy (f->ercoef[er_freebeg], pivot_mul);
+ #ifdef TRACK_FACTOR
+ 			EGLPNUM_TYPENAME_EGlpNumSetToMaxAbs (max, pivot_mul);
+ #endif /* TRACK_FACTOR */
+@@ -5207,7 +5231,8 @@
+ 																						 * if (v > fzero_tol || v < -fzero_tol) */
+ 		{
+ 			/* stash v in eta */
+-			if (f->er_freebeg >= f->er_space)
++			if (f->er_freebeg >= f->er_space ||
++				(f->er_freebeg >= f->er_capacity && grow_eta_entries (f)))
+ 			{
+ 				/* QSlog("no space in eliminate_row"); */
+ 				EGLPNUM_TYPENAME_EGlpNumClearVar (v);

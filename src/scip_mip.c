@@ -1,15 +1,31 @@
 #include "scip_mip.h"
 #include "scip_feasjump.h"
+#include "scip_presol_coefftight.h"
 #include "scip_presol_parallel.h"
 #include "common.h"
 #include "exact.h"
 #include "scip/scip.h"
 #include "scip/scipdefplugins.h"
+#include <errno.h>
 #include <limits.h>
 #include <math.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+
+static double subscip_fraction(void) {
+    const char *value = getenv("LAB_SUBSCIP_FRAC");
+    if (!value)
+        return 0.25;
+    char *end;
+    errno = 0;
+    double fraction = strtod(value, &end);
+    if (end != value && !*end && !errno && isfinite(fraction) &&
+        fraction >= 0.0 && fraction <= 1.0)
+        return fraction;
+    fprintf(stderr, "Invalid LAB_SUBSCIP_FRAC, using the default of 0.25\n");
+    return 0.25;
+}
 
 static int extract_verified(const LabModel *m, const double *lower, const double *upper,
                             SCIP *s, SCIP_VAR *const *vars, double *point, double *out_obj) {
@@ -108,6 +124,11 @@ int lab_scip_mip(const LabModel *m, const double *lower, const double *upper,
     if (SCIPincludeDefaultPlugins(s) != SCIP_OKAY ||
         lab_scip_include_feasjump(s) != SCIP_OKAY ||
         lab_scip_include_presol_parallel(s) != SCIP_OKAY ||
+        lab_scip_include_presol_coefftight(s) != SCIP_OKAY ||
+        SCIPaddRealParam(s, "heuristics/subsciptimefrac",
+                         "maximal fraction of the remaining time given to a heuristic sub-SCIP",
+                         NULL, FALSE, 0.25, 0.0, 1.0, NULL, NULL) != SCIP_OKAY ||
+        SCIPsetRealParam(s, "heuristics/subsciptimefrac", subscip_fraction()) != SCIP_OKAY ||
         SCIPcreateProbBasic(s, "milp_lab") != SCIP_OKAY ||
         SCIPsetIntParam(s, "timing/clocktype", 2) != SCIP_OKAY ||
         SCIPsetIntParam(s, "parallel/maxnthreads", 1) != SCIP_OKAY ||
@@ -137,6 +158,9 @@ int lab_scip_mip(const LabModel *m, const double *lower, const double *upper,
         SCIPsetIntParam(s, "heuristics/rins/freq", 15) != SCIP_OKAY ||
         SCIPsetIntParam(s, "heuristics/farkasdiving/freq", -1) != SCIP_OKAY ||
         SCIPsetIntParam(s, "heuristics/conflictdiving/freq", 20) != SCIP_OKAY)
+        goto done;
+    if (SCIPgetParam(s, "heuristics/locks/maxlpiters") != NULL &&
+        SCIPsetIntParam(s, "heuristics/locks/maxlpiters", 5000) != SCIP_OKAY)
         goto done;
     if ((m->rows >= 2000 || m->nnz >= 100000) &&
         SCIPsetBoolParam(s, "constraints/knapsack/disaggregation", FALSE) != SCIP_OKAY)
@@ -237,6 +261,10 @@ int lab_scip_mip(const LabModel *m, const double *lower, const double *upper,
                 (void)SCIPfreeSol(s, &init_sol);
         }
     }
+
+    /* Experiment hook: overlay a SCIP parameter file (unset in benchmark configurations). */
+    if (getenv("LAB_SCIP_SET") && SCIPreadParams(s, getenv("LAB_SCIP_SET")) != SCIP_OKAY)
+        goto done;
 
     double remaining = deadline - lab_now();
     if (remaining <= 0.01) {

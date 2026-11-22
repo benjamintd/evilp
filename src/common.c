@@ -1,4 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
+#ifdef __APPLE__
+#define _DARWIN_C_SOURCE
+#endif
 #include "common.h"
 #include <limits.h>
 #include <stdint.h>
@@ -38,7 +41,13 @@ void lab_json_string(FILE *f, const char *s) {
 }
 double lab_now(void) {
     struct timespec t;
-    if (clock_gettime(CLOCK_MONOTONIC, &t))
+    /* Solver deadlines and process watchdogs count wall time while awake. */
+#ifdef __APPLE__
+    const clockid_t clockid = CLOCK_UPTIME_RAW;
+#else
+    const clockid_t clockid = CLOCK_MONOTONIC;
+#endif
+    if (clock_gettime(clockid, &t))
         abort();
     return (double)t.tv_sec + (double)t.tv_nsec / 1e9;
 }

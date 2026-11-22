@@ -1,0 +1,11 @@
+--- a/src/lpi/lpi_qso.c
++++ b/src/lpi/lpi_qso.c
+@@ -866,7 +866,7 @@
+    }
+    else
+    {
+-      for( i = 0; i < nrows -1; ++i )
++      for( i = 0; i < nrows; ++i )
+       {
+          lpi->ircnt[i] = 0;
+          lpi->irbeg[i] = 0;

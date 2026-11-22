@@ -11,7 +11,7 @@ import tarfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_LOCK = ROOT / 'config/scip-integer-v8.lock.json'
+DEFAULT_LOCK = ROOT / 'config/scip-integer-v15.lock.json'
 
 
 def sha(path):
@@ -99,10 +99,16 @@ def main():
     scip_spec, qs_spec = config['sources']
     scip = unpack(args.scip_archive, scip_spec['sha256'], out/'upstream-scip')
     qs = unpack(args.qsopt_archive, qs_spec['sha256'], out/'upstream-qsopt')
-    scip_patch = next(p for p in config['patches'] if 'scip-9.2.4' in p and p.endswith('.patch'))
-    qs_patch = next(p for p in config['patches'] if 'qsopt-ex' in p and p.endswith('.patch'))
-    for tree, patch in [(scip, scip_patch), (qs, qs_patch)]:
-        subprocess.run(['patch','-p1','-i',ROOT/patch], cwd=tree, check=True)
+    overlays = config.get('overlays', {})
+    overlay_paths = {p for paths in overlays.values() for p in paths}
+    base_patches = [p for p in config['patches'] if p.endswith('.patch') and p not in overlay_paths]
+    scip_patch, = [p for p in base_patches if 'scip-9.2.4' in p]
+    qs_patch, = [p for p in base_patches if 'qsopt-ex' in p]
+    for tree, spec, base in [(scip, scip_spec, scip_patch), (qs, qs_spec, qs_patch)]:
+        for patch in [base, *overlays.get(spec['name'], [])]:
+            if patch not in config['patches']:
+                raise ValueError(f'Overlay missing digest: {patch}')
+            subprocess.run(['patch', '-p1', '-i', ROOT/patch], cwd=tree, check=True)
     # The disabled PaPILO and symmetry implementations consist entirely of C.
     for base in ['scip/presol_milp','symmetry/compute_symmetry_none']:
         shutil.copy2(scip/'src'/(base+'.cpp'), scip/'src'/(base+'.c'))

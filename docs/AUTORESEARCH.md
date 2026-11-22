@@ -47,7 +47,7 @@ feasible witnesses, numerical statuses and independently checked proofs remain
 distinct; individual LP certificates do not constitute a complete MILP tree proof.
 Any budget change creates a fresh declared campaign, preserving earlier results.
 
-The gate is currently **not complete**. The latest frozen
+The gate is currently **not complete**. The [pair assignment checkpoint](PAIR-ASSIGNMENT.md) includes a full two-second coverage comparison and a separate serial development panel. The frozen
 [ten-second full inventory](../results/miplib-candidate-10s-v2/inventory.json)
 contains one attempt for every locked instance: 239 `time_limit`, one
 `numerical_failure`, zero `watchdog_timeout`, 15 independently checked

@@ -200,6 +200,64 @@ class ScipGeneralMip(unittest.TestCase):
             v, _, _ = self.run_model(Path(tmp), integer_mps(m_inf))
             self.assertEqual(v['status'], 'infeasible', v)
 
+    def test_big_m_coefftight_presolver(self):
+        # Mixed-integer model with deliberately loose big-M coefficients on both
+        # <= and >= rows (positive and negative binary coefficients) so
+        # scip_presol_coefftight.c fires in SCIP_STAGE_PRESOLVING without errors
+        # and preserves exact optimality.
+        n_bin = 18
+        n_cont = 18
+        n = n_bin + n_cont
+        costs = [5 + (i % 4) for i in range(n_bin)] + [-2 - (i % 3) for i in range(n_cont)]
+        bounds = [(0, 1)] * n_bin + [(0, 3)] * n_cont
+        integer = [True] * n_bin + [False] * n_cont
+        rows = []
+        # 1) sum_{k} y_k - 1000 * x_i <= 0 (loose negative big-M on <= row)
+        for i in range(0, n_bin, 2):
+            a = [0] * n
+            a[i] = -1000
+            a[n_bin + i] = 1
+            a[n_bin + i + 1] = 1
+            rows.append((a, None, 0))
+        # 2) 1000 * x_i + y_i + y_{i+1} <= 1003 (loose positive big-M on <= row)
+        for i in range(1, n_bin, 2):
+            a = [0] * n
+            a[i] = 1000
+            a[n_bin + i] = 1
+            a[n_bin + (i - 1)] = 1
+            rows.append((a, None, 1003))
+        # 3) 1000 * x_i + y_i >= 2 (loose positive big-M on >= row)
+        for i in range(0, n_bin, 3):
+            a = [0] * n
+            a[i] = 1000
+            a[n_bin + i] = 1
+            rows.append((a, 2, None))
+        # 4) -1000 * x_i + y_i >= -998 (loose negative big-M on >= row)
+        for i in range(1, n_bin, 3):
+            a = [0] * n
+            a[i] = -1000
+            a[n_bin + i] = 1
+            rows.append((a, -998, None))
+        # Budget row
+        rows.append(([1] * n_bin + [0] * n_cont, 3, 8))
+        m = dict(cost=costs, bounds=bounds, integer=integer, rows=rows, offset=0, maximize=False)
+        with tempfile.TemporaryDirectory() as tmp:
+            text = integer_mps(m)
+            v, model, sol = self.run_model(Path(tmp), text)
+            self.assertEqual(v['status'], 'optimal', v)
+            self.assertIn('SCIP branch-and-cut', v['message'])
+            chk = subprocess.run([CHECKER, '--model', model, '--solution', sol],
+                                 capture_output=True, text=True, timeout=15)
+            self.assertEqual(chk.returncode, 0, (chk.stdout, chk.stderr))
+            c = json.loads(chk.stdout)
+            self.assertTrue(c['checked_feasible'], c)
+            # Cross-check objective against native B&B (--no-root-diving disables SCIP).
+            nat_dir = Path(tmp) / 'nat'
+            nat_dir.mkdir()
+            v_nat, _, _ = self.run_model(nat_dir, text, ['--no-root-diving'])
+            if v_nat['status'] == 'optimal':
+                self.assertAlmostEqual(float(F(c['objective'])), v_nat['objective'], places=5)
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -1,0 +1,695 @@
+diff --color -ruN scip-v9-orig/CMakeLists.txt scip-v9-mod/CMakeLists.txt
+--- a/CMakeLists.txt	2025-10-21 11:41:30
++++ b/CMakeLists.txt	2026-11-20 10:14:21
+@@ -185,7 +185,7 @@
+     endif()
+ elseif(SYM STREQUAL "none")
+     message(STATUS "Support SYM: OFF")
+-    set(sym symmetry/compute_symmetry_none.cpp)
++    set(sym symmetry/compute_symmetry_none.c)
+ else()
+     message(FATAL_ERROR "option SYM has wrong value")
+ endif()
+@@ -312,10 +312,10 @@
+    file(STRINGS \${DST} GITHASH_OLD)
+    string(REGEX REPLACE \"#define SCIP_GITHASH \\\"(.*)\\\"\" \"\\\\1\" GITHASH_OLD \"\${GITHASH_OLD}\")
+ endif()
+-if((GIT) AND (EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/.git))
++if((GIT) AND (EXISTS \"${CMAKE_CURRENT_SOURCE_DIR}/.git\"))
+    execute_process(
+       COMMAND \${GIT} describe --always --dirty
+-      WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
++      WORKING_DIRECTORY \"${CMAKE_CURRENT_SOURCE_DIR}\"
+       OUTPUT_VARIABLE GITHASH OUTPUT_STRIP_TRAILING_WHITESPACE)
+    string(REGEX REPLACE \"^.*-g\" \"\" GITHASH \"\${GITHASH}\")
+    if(NOT \${GITHASH} STREQUAL \"\${GITHASH_OLD}\")
+diff --color -ruN scip-v9-orig/cmake/Modules/FindGMP.cmake scip-v9-mod/cmake/Modules/FindGMP.cmake
+--- a/cmake/Modules/FindGMP.cmake	2025-10-21 11:41:30
++++ b/cmake/Modules/FindGMP.cmake	2026-11-20 10:14:21
+@@ -36,7 +36,7 @@
+         PATH_SUFFIXES lib)
+ endif()
+ 
+-SET(GMP_LIBRARIES ${GMP_LIBRARY} ${GMPXX_LIBRARY})
++SET(GMP_LIBRARIES ${GMP_LIBRARY})
+ 
+ # look for mpir library and include files when gmp could not be found
+ if(NOT GMP_LIBRARIES)
+diff --color -ruN scip-v9-orig/src/CMakeLists.txt scip-v9-mod/src/CMakeLists.txt
+--- a/src/CMakeLists.txt	2025-10-21 11:41:30
++++ b/src/CMakeLists.txt	2026-11-20 10:14:21
+@@ -8,7 +8,7 @@
+         OUTPUT_NAME ${outputname})
+ endfunction(setLibProperties)
+ 
+-set(CMAKE_C_STANDARD 99)
++set(CMAKE_C_STANDARD 17)
+ set(CMAKE_C_STANDARD_REQUIRED on)
+ set(CMAKE_C_EXTENSIONS OFF)
+ 
+@@ -183,7 +183,7 @@
+     scip/nodesel_hybridestim.c
+     scip/nodesel_restartdfs.c
+     scip/nodesel_uct.c
+-    scip/presol_milp.cpp
++    scip/presol_milp.c
+     scip/presol_boundshift.c
+     scip/presol_convertinttobin.c
+     scip/presol_domcol.c
+@@ -1019,7 +1019,7 @@
+ 
+ # all source files should be compiled with a c++ compiler
+ if(CXXONLY)
+-    set_source_files_properties(main.c ${scipsources} ${objscipsources} ${lpisources} ${tpisources} ${symsources} PROPERTIES LANGUAGE CXX)
++    set_source_files_properties(main.c ${scipsources}  ${lpisources} ${tpisources} ${symsources} PROPERTIES LANGUAGE CXX)
+ 
+     # for the clang compiler this suppresses the warnings about treating 'c' input as 'c++' when CXXONLY is enabled
+     if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+@@ -1037,7 +1037,7 @@
+     scip/message.c)
+ setLibProperties(liblpi "lpi")
+ 
+-add_library(libscip ${scipsources} ${objscipsources} ${lpisources} ${tpisources} ${symsources})
++add_library(libscip ${scipsources}  ${lpisources} ${tpisources} ${symsources})
+ 
+ if(MSVC)
+    # msvc otherwise is not smart enough and tries to link the scip.exe binary as a library
+@@ -1066,7 +1066,7 @@
+ set(ZIMPL_NEEDED 0)
+ if(SHARED)
+     target_link_libraries(libscip PRIVATE ${ZIMPL_PIC_LIBRARIES} ${LPS_PIC_LIBRARIES} ${SYM_PIC_LIBRARIES})
+-    add_executable(scip main.c ${scipsources} ${objscipsources} ${lpisources} ${tpisources} ${symsources})
++    add_executable(scip main.c ${scipsources}  ${lpisources} ${tpisources} ${symsources})
+ else()
+     if(SOPLEX_FOUND)
+         set(SOPLEX_NEEDED 1)
+diff --color -ruN scip-v9-orig/src/lpi/lpi_qso.c scip-v9-mod/src/lpi/lpi_qso.c
+--- a/src/lpi/lpi_qso.c	2025-10-21 11:41:30
++++ b/src/lpi/lpi_qso.c	2026-11-20 10:51:19
+@@ -72,6 +72,9 @@
+    double*               itab;               /**< array of length tbsz */
+    char*                 ibas;               /**< array of length tbsz */
+    int                   pricing;            /**< SCIP pricing option */
++   SCIP_Bool             sbactive;           /**< inside StartStrongbranch..EndStrongbranch session */
++   SCIP_Bool             sbused;             /**< strongbranch called during current session */
++   SCIP_Real             sbobjval;           /**< parent LP objective at StartStrongbranch */
+    SCIP_MESSAGEHDLR*     messagehdlr;        /**< messagehdlr handler to printing messages, or NULL */
+ };
+ 
+@@ -352,9 +355,10 @@
+          lpi->irng[i] = 0;
+          break;
+       default:
+-         SCIPerrorMessage("Error, constraint %d has no bounds!", i);
+-         SCIPABORT();
+-         return SCIP_INVALIDDATA; /*lint !e527*/
++         lpi->isen[i] = 'N';
++         lpi->irhs[i] = 0.0;
++         lpi->irng[i] = 0.0;
++         break;
+       }
+    }
+    return SCIP_OKAY;
+@@ -477,6 +481,7 @@
+    SCIP_ALLOC( BMSallocMemory(lpi) );
+    memset(*lpi, 0, sizeof(struct SCIP_LPi));
+ 
++   QSexactStart();
+    (*lpi)->prob = QScreate_prob(name, (int) objsen);
+    if ( (*lpi)->prob == NULL )
+    {
+@@ -1900,6 +1905,10 @@
+          lhss[i] = lrhs[i];
+          rhss[i] = QS_MAXDOUBLE;
+          break;
++      case 'N':
++         lhss[i] = -QS_MAXDOUBLE;
++         rhss[i] = QS_MAXDOUBLE;
++         break;
+       default:
+          SCIPerrorMessage("Unknown sense %c from QSopt", lsense[i]);
+          SCIPABORT();
+@@ -2000,11 +2009,20 @@
+ SCIP_RETCODE SCIPlpiStartStrongbranch(
+    SCIP_LPI*             lpi                 /**< LP interface structure */
+    )
+-{  /*lint --e{715}*/
++{
+    assert(lpi != NULL);
+    assert(lpi->prob != NULL);
+ 
+-   /* currently do nothing */
++   lpi->sbactive = FALSE;
++   lpi->sbused = FALSE;
++   if( lpi->solstat == QS_LP_OPTIMAL )
++   {
++      if( QSget_objval(lpi->prob, &lpi->sbobjval) == 0 &&
++          QSopt_strongbranch(lpi->prob, 0, NULL, NULL, NULL, NULL, 0, QS_MAXDOUBLE) == 0 )
++      {
++         lpi->sbactive = TRUE;
++      }
++   }
+    return SCIP_OKAY;
+ }
+ 
+@@ -2012,11 +2030,23 @@
+ SCIP_RETCODE SCIPlpiEndStrongbranch(
+    SCIP_LPI*             lpi                 /**< LP interface structure */
+    )
+-{  /*lint --e{715}*/
++{
+    assert(lpi != NULL);
+    assert(lpi->prob != NULL);
+ 
+-   /* currently do nothing */
++   if( lpi->sbactive )
++   {
++      SCIP_Bool used = lpi->sbused;
++      lpi->sbactive = FALSE;
++      lpi->sbused = FALSE;
++      if( used )
++      {
++         int nit;
++         QS_CONDRET( QSopt_dual(lpi->prob, &(lpi->solstat)) );
++         QS_CONDRET( QSget_itcnt(lpi->prob, 0, 0, 0, 0, &nit) );
++         lpi->previt = nit;
++      }
++   }
+    return SCIP_OKAY;
+ }
+ 
+@@ -2036,6 +2066,7 @@
+    )
+ {
+    int nit;
++   int objsen = QS_MIN;
+ 
+    assert(lpi != NULL);
+    assert(lpi->prob != NULL);
+@@ -2046,15 +2077,50 @@
+ 
+    SCIPdebugMessage("calling QSopt strong branching on variable %d with fractional value (%d it lim)\n", col, itlim);
+ 
+-   /* results of QSopt are valid in any case */
+    *downvalid = TRUE;
+    *upvalid = TRUE;
+ 
+    assert( ! EPSISINT(psol, FEASTOL) );
+ 
+-   /* call QSopt */
+-   QS_CONDRET( QSopt_strongbranch(lpi->prob, 1, &col, &psol, down, up, itlim, QS_MAXDOUBLE) );
++   /* call QSopt (negative ncand uses cached basis without per-candidate restore) */
++   if( lpi->sbactive )
++   {
++      lpi->sbused = TRUE;
++      QS_CONDRET( QSopt_strongbranch(lpi->prob, -1, &col, &psol, down, up, itlim, QS_MAXDOUBLE) );
++   }
++   else
++   {
++      QS_CONDRET( QSopt_strongbranch(lpi->prob, 1, &col, &psol, down, up, itlim, QS_MAXDOUBLE) );
++   }
+ 
++   (void)QSget_objsense(lpi->prob, &objsen);
++   if( objsen == QS_MAX )
++   {
++      if( *down >= 0.5 * QS_MAXDOUBLE )
++      {
++         *downvalid = FALSE;
++         *down = lpi->sbobjval;
++      }
++      if( *up >= 0.5 * QS_MAXDOUBLE )
++      {
++         *upvalid = FALSE;
++         *up = lpi->sbobjval;
++      }
++   }
++   else
++   {
++      if( *down <= -0.5 * QS_MAXDOUBLE )
++      {
++         *downvalid = FALSE;
++         *down = lpi->sbobjval;
++      }
++      if( *up <= -0.5 * QS_MAXDOUBLE )
++      {
++         *upvalid = FALSE;
++         *up = lpi->sbobjval;
++      }
++   }
++
+    QS_CONDRET( QSget_itcnt(lpi->prob, 0, 0, 0, 0, &nit) );
+ 
+    if( iter )
+@@ -2075,13 +2141,14 @@
+    SCIP_Real*            up,                 /**< stores dual bounds after branching columns up */
+    SCIP_Bool*            downvalid,          /**< stores whether the returned down values are valid dual bounds;
+                                               *   otherwise, they can only be used as an estimate values */
+-   SCIP_Bool*            upvalid,            /**< stores whether the returned up values are a valid dual bounds;
++   SCIP_Bool*            upvalid,            /**< stores whether the returned up values are valid dual bounds;
+                                               *   otherwise, they can only be used as an estimate values */
+    int*                  iter                /**< stores total number of strong branching iterations, or -1; may be NULL */
+    )
+ {
+    int nit;
+    int j;
++   int objsen = QS_MIN;
+ 
+    assert(lpi != NULL);
+    assert(lpi->prob != NULL);
+@@ -2094,7 +2161,6 @@
+ 
+    SCIPdebugMessage("calling QSopt strong branching on %d variables with fractional value (%d it lim)\n", ncols, itlim);
+ 
+-   /* results of QSopt are valid in any case */
+    for( j = 0; j < ncols; ++j )
+    {
+       downvalid[j] = TRUE;
+@@ -2103,8 +2169,47 @@
+    }
+ 
+    /* call QSopt */
+-   QS_CONDRET( QSopt_strongbranch(lpi->prob, ncols, cols, psols, down, up, itlim, QS_MAXDOUBLE) );
++   if( lpi->sbactive )
++   {
++      lpi->sbused = TRUE;
++      QS_CONDRET( QSopt_strongbranch(lpi->prob, -ncols, cols, psols, down, up, itlim, QS_MAXDOUBLE) );
++   }
++   else
++   {
++      QS_CONDRET( QSopt_strongbranch(lpi->prob, ncols, cols, psols, down, up, itlim, QS_MAXDOUBLE) );
++   }
+ 
++   (void)QSget_objsense(lpi->prob, &objsen);
++   for( j = 0; j < ncols; ++j )
++   {
++      if( objsen == QS_MAX )
++      {
++         if( down[j] >= 0.5 * QS_MAXDOUBLE )
++         {
++            downvalid[j] = FALSE;
++            down[j] = lpi->sbobjval;
++         }
++         if( up[j] >= 0.5 * QS_MAXDOUBLE )
++         {
++            upvalid[j] = FALSE;
++            up[j] = lpi->sbobjval;
++         }
++      }
++      else
++      {
++         if( down[j] <= -0.5 * QS_MAXDOUBLE )
++         {
++            downvalid[j] = FALSE;
++            down[j] = lpi->sbobjval;
++         }
++         if( up[j] <= -0.5 * QS_MAXDOUBLE )
++         {
++            upvalid[j] = FALSE;
++            up[j] = lpi->sbobjval;
++         }
++      }
++   }
++
+    QS_CONDRET( QSget_itcnt(lpi->prob, 0, 0, 0, 0, &nit) );
+ 
+    if( iter )
+@@ -2573,6 +2678,7 @@
+             activity[i] = lpi->irhs[i] + lpi->irng[i];
+             break;
+          case 'L':
++         case 'N':
+             activity[i] = lpi->irhs[i] - lpi->irng[i];
+             break;
+          default:
+@@ -2839,7 +2945,7 @@
+ 
+    SCIPdebugMessage("loading basis %p/%p into QSopt\n", (void*)cstat, (void*)rstat);
+ 
+-   SCIP_CALL( ensureTabMem(lpi, ncols) );
++   SCIP_CALL( ensureTabMem(lpi, ncols + nrows) );
+    SCIP_CALL( ensureRowMem(lpi, nrows) );
+ 
+    /* get senses */
+@@ -3127,16 +3233,16 @@
+    assert(ncols >= 0);
+    assert(nrows >= 0);
+ 
+-   /* allocate lpistate data */
+-   SCIP_CALL( lpistateCreate(lpistate, blkmem, ncols, nrows));
+-   SCIPdebugMessage("storing QSopt LPI state in %p (%d cols, %d rows)\n", (void*)*lpistate, ncols, nrows);
++   *lpistate = NULL;
+ 
+-   /* get unpacked basis information from QSopt */
++   /* get unpacked basis information from QSopt before allocating lpistate */
+    SCIP_CALL( ensureColMem(lpi, ncols) );
+    SCIP_CALL( ensureRowMem(lpi, nrows) );
+    SCIP_CALL( SCIPlpiGetBase(lpi, lpi->iccnt, lpi->ircnt) );
+ 
+-   /* pack LPi state data */
++   /* allocate and pack lpistate data */
++   SCIP_CALL( lpistateCreate(lpistate, blkmem, ncols, nrows) );
++   SCIPdebugMessage("storing QSopt LPI state in %p (%d cols, %d rows)\n", (void*)*lpistate, ncols, nrows);
+    (*lpistate)->ncols = ncols;
+    (*lpistate)->nrows = nrows;
+    lpistatePack(*lpistate, lpi->iccnt, lpi->ircnt);
+@@ -3649,11 +3755,15 @@
+    case SCIP_LPPAR_LPTILIM:
+       QS_CONDRET( QSget_param_double(lpi->prob, QS_PARAM_SIMPLEX_MAX_TIME, dval) );
+       break;
++   case SCIP_LPPAR_FEASTOL:
++      QS_CONDRET( QSget_param_double(lpi->prob, QS_PARAM_SIMPLEX_PFEAS_TOL, dval) );
++      break;
++   case SCIP_LPPAR_DUALFEASTOL:
++      QS_CONDRET( QSget_param_double(lpi->prob, QS_PARAM_SIMPLEX_DFEAS_TOL, dval) );
++      break;
+    default:
+    case SCIP_LPPAR_MARKOWITZ:
+    case SCIP_LPPAR_BARRIERCONVTOL:
+-   case SCIP_LPPAR_DUALFEASTOL:
+-   case SCIP_LPPAR_FEASTOL:
+       return SCIP_PARAMETERUNKNOWN;
+    }  /*lint !e788*/
+ 
+@@ -3698,7 +3808,14 @@
+       break;
+    }
+    case SCIP_LPPAR_FEASTOL:
++      assert( dval > 0.0 );
++      /* QSopt's simplex tolerances are absolute; never loosen beyond its built-in 1e-6 default */
++      QS_CONDRET( QSset_param_double(lpi->prob, QS_PARAM_SIMPLEX_PFEAS_TOL, MIN(dval, 1e-6)) );
++      break;
+    case SCIP_LPPAR_DUALFEASTOL:
++      assert( dval > 0.0 );
++      QS_CONDRET( QSset_param_double(lpi->prob, QS_PARAM_SIMPLEX_DFEAS_TOL, MIN(dval, 1e-6)) );
++      break;
+    case SCIP_LPPAR_BARRIERCONVTOL:
+    case SCIP_LPPAR_MARKOWITZ:
+    default:
+diff --color -ruN scip-v9-orig/src/scip/heur_clique.c scip-v9-mod/src/scip/heur_clique.c
+--- a/src/scip/heur_clique.c	2025-10-21 11:41:30
++++ b/src/scip/heur_clique.c	2026-11-20 16:37:09
+@@ -913,7 +913,7 @@
+ #endif
+ 
+       /* set limits for the subproblem */
+-      SCIP_CALL( SCIPcopyLimits(scip, subscip) );
++      SCIP_CALL( SCIPcopyLimitsHeur(scip, subscip) );
+       SCIP_CALL( SCIPsetLongintParam(subscip, "limits/stallnodes", nstallnodes) );
+       SCIP_CALL( SCIPsetLongintParam(subscip, "limits/nodes", heurdata->maxnodes) );
+ 
+diff --color -ruN scip-v9-orig/src/scip/heur_completesol.c scip-v9-mod/src/scip/heur_completesol.c
+--- a/src/scip/heur_completesol.c	2025-10-21 11:41:30
++++ b/src/scip/heur_completesol.c	2026-11-20 16:37:09
+@@ -790,7 +790,7 @@
+ #endif
+ 
+    /* set limits for the subproblem */
+-   SCIP_CALL( SCIPcopyLimits(scip, subscip) );
++   SCIP_CALL( SCIPcopyLimitsHeur(scip, subscip) );
+    heurdata->nodelimit = heurdata->maxnodes;
+    SCIP_CALL( SCIPsetLongintParam(subscip, "limits/stallnodes", nstallnodes) );
+    SCIP_CALL( SCIPsetLongintParam(subscip, "limits/nodes", heurdata->maxnodes) );
+diff --color -ruN scip-v9-orig/src/scip/heur_crossover.c scip-v9-mod/src/scip/heur_crossover.c
+--- a/src/scip/heur_crossover.c	2025-10-21 11:41:30
++++ b/src/scip/heur_crossover.c	2026-11-20 16:37:09
+@@ -652,7 +652,7 @@
+    SCIP_CALL( SCIPsetIntParam(subscip, "limits/bestsol", heurdata->bestsollimit) );
+ 
+    /* set limits for the subproblem */
+-   SCIP_CALL( SCIPcopyLimits(scip, subscip) );
++   SCIP_CALL( SCIPcopyLimitsHeur(scip, subscip) );
+    heurdata->nodelimit = nstallnodes;
+    SCIP_CALL( SCIPsetLongintParam(subscip, "limits/nodes", nstallnodes) );
+ 
+diff --color -ruN scip-v9-orig/src/scip/heur_dins.c scip-v9-mod/src/scip/heur_dins.c
+--- a/src/scip/heur_dins.c	2025-10-21 11:41:30
++++ b/src/scip/heur_dins.c	2026-11-20 16:37:09
+@@ -539,7 +539,7 @@
+ #endif
+ 
+    /* set limits for the subproblem */
+-   SCIP_CALL( SCIPcopyLimits(scip, subscip) );
++   SCIP_CALL( SCIPcopyLimitsHeur(scip, subscip) );
+    heurdata->nodelimit = nsubnodes;
+    SCIP_CALL( SCIPsetLongintParam(subscip, "limits/nodes", nsubnodes) );
+    SCIP_CALL( SCIPsetLongintParam(subscip, "limits/stallnodes", MAX(10, nsubnodes/10)) );
+diff --color -ruN scip-v9-orig/src/scip/heur_dps.c scip-v9-mod/src/scip/heur_dps.c
+--- a/src/scip/heur_dps.c	2025-10-21 11:41:30
++++ b/src/scip/heur_dps.c	2026-11-20 16:37:09
+@@ -232,7 +232,7 @@
+    SCIP_CALL( SCIPgetRealParam(scip, "numerics/infinity", &infvalue) );
+    SCIP_CALL( SCIPsetRealParam(*subscip, "numerics/infinity", infvalue) );
+ 
+-   SCIP_CALL( SCIPcopyLimits(scip, *subscip) );
++   SCIP_CALL( SCIPcopyLimitsHeur(scip, *subscip) );
+ 
+    /* avoid recursive calls */
+    SCIP_CALL( SCIPsetSubscipsOff(*subscip, TRUE) );
+@@ -1596,7 +1596,7 @@
+       SCIP_CALL( SCIPsetRealParam(subscip, "numerics/infinity", infvalue) );
+ 
+       /* set limits; do not use more time in each subproblem than the heuristic has already used for first solution */
+-      SCIP_CALL( SCIPcopyLimits(scip, subscip) );
++      SCIP_CALL( SCIPcopyLimitsHeur(scip, subscip) );
+       if( limits )
+       {
+          SCIP_CALL( SCIPsetLongintParam(subscip, "limits/nodes", 1LL) );
+@@ -2004,7 +2004,7 @@
+          subscip = blockproblem[b]->blockscip;
+ 
+          /* update time and memory limit of subproblem */
+-         SCIP_CALL( SCIPcopyLimits(scip, subscip) );
++         SCIP_CALL( SCIPcopyLimitsHeur(scip, subscip) );
+ 
+          /* create event handler for LP events */
+          if( k == 0 )
+diff --color -ruN scip-v9-orig/src/scip/heur_feaspump.c scip-v9-mod/src/scip/heur_feaspump.c
+--- a/src/scip/heur_feaspump.c	2025-10-21 11:41:30
++++ b/src/scip/heur_feaspump.c	2026-11-20 16:37:09
+@@ -227,7 +227,7 @@
+    SCIP_CALL( SCIPsetIntParam(probingscip, "display/verblevel", 0) );
+ #endif
+    /* set limits for the subproblem */
+-   SCIP_CALL( SCIPcopyLimits(scip, probingscip) );
++   SCIP_CALL( SCIPcopyLimitsHeur(scip, probingscip) );
+    SCIP_CALL( SCIPsetLongintParam(probingscip, "limits/nodes", 1000LL) );
+    SCIP_CALL( SCIPsetLongintParam(probingscip, "limits/stallnodes", 100LL) );
+ 
+diff --color -ruN scip-v9-orig/src/scip/heur_gins.c scip-v9-mod/src/scip/heur_gins.c
+--- a/src/scip/heur_gins.c	2025-10-21 11:41:30
++++ b/src/scip/heur_gins.c	2026-11-20 16:37:09
+@@ -2112,7 +2112,7 @@
+    assert(subscip != NULL);
+    assert(solvelimits != NULL);
+ 
+-   SCIP_CALL( SCIPcopyLimits(sourcescip, subscip) );
++   SCIP_CALL( SCIPcopyLimitsHeur(sourcescip, subscip) );
+ 
+    SCIP_CALL( SCIPsetLongintParam(subscip, "limits/nodes", solvelimits->nodelimit) );
+    SCIP_CALL( SCIPsetLongintParam(subscip, "limits/stallnodes", solvelimits->stallnodelimit) );
+diff --color -ruN scip-v9-orig/src/scip/heur_locks.c scip-v9-mod/src/scip/heur_locks.c
+--- a/src/scip/heur_locks.c	2025-10-21 11:41:30
++++ b/src/scip/heur_locks.c	2026-11-20 16:37:09
+@@ -938,7 +938,7 @@
+ #endif
+ 
+       /* set limits for the subproblem */
+-      SCIP_CALL( SCIPcopyLimits(scip, subscip) );
++      SCIP_CALL( SCIPcopyLimitsHeur(scip, subscip) );
+       SCIP_CALL( SCIPsetLongintParam(subscip, "limits/stallnodes", nstallnodes) );
+       SCIP_CALL( SCIPsetLongintParam(subscip, "limits/nodes", heurdata->maxnodes) );
+ 
+diff --color -ruN scip-v9-orig/src/scip/heur_mutation.c scip-v9-mod/src/scip/heur_mutation.c
+--- a/src/scip/heur_mutation.c	2025-10-21 11:41:30
++++ b/src/scip/heur_mutation.c	2026-11-20 16:37:09
+@@ -254,7 +254,7 @@
+ #endif
+ 
+    /* set limits for the subproblem */
+-   SCIP_CALL( SCIPcopyLimits(scip, subscip) );
++   SCIP_CALL( SCIPcopyLimitsHeur(scip, subscip) );
+    SCIP_CALL( SCIPsetLongintParam(subscip, "limits/nodes", nsubnodes) );
+    SCIP_CALL( SCIPsetIntParam(subscip, "limits/bestsol", heurdata->bestsollimit) );
+ 
+diff --color -ruN scip-v9-orig/src/scip/heur_nlpdiving.c scip-v9-mod/src/scip/heur_nlpdiving.c
+--- a/src/scip/heur_nlpdiving.c	2025-10-21 11:41:30
++++ b/src/scip/heur_nlpdiving.c	2026-11-20 16:37:09
+@@ -1323,7 +1323,7 @@
+ #endif
+ 
+    /* set limits for the subproblem */
+-   SCIP_CALL( SCIPcopyLimits(scip, subscip) );
++   SCIP_CALL( SCIPcopyLimitsHeur(scip, subscip) );
+    SCIP_CALL( SCIPsetLongintParam(subscip, "limits/stallnodes", (SCIP_Longint)100) );
+    SCIP_CALL( SCIPsetLongintParam(subscip, "limits/nodes", (SCIP_Longint)500) );
+ 
+diff --color -ruN scip-v9-orig/src/scip/heur_ofins.c scip-v9-mod/src/scip/heur_ofins.c
+--- a/src/scip/heur_ofins.c	2025-10-21 11:41:30
++++ b/src/scip/heur_ofins.c	2026-11-20 16:37:09
+@@ -247,7 +247,7 @@
+ #endif
+ 
+    /* set limits for the subproblem */
+-   SCIP_CALL( SCIPcopyLimits(scip, subscip) );
++   SCIP_CALL( SCIPcopyLimitsHeur(scip, subscip) );
+    heurdata->nodelimit = heurdata->maxnodes;
+    SCIP_CALL( SCIPsetLongintParam(subscip, "limits/stallnodes", nstallnodes) );
+    SCIP_CALL( SCIPsetLongintParam(subscip, "limits/nodes", heurdata->maxnodes) );
+diff --color -ruN scip-v9-orig/src/scip/heur_oneopt.c scip-v9-mod/src/scip/heur_oneopt.c
+--- a/src/scip/heur_oneopt.c	2025-10-21 11:41:30
++++ b/src/scip/heur_oneopt.c	2026-11-20 16:37:09
+@@ -307,7 +307,7 @@
+    SCIP_CALL( SCIPsetSeparating(subscip, SCIP_PARAMSETTING_OFF, TRUE) );
+ 
+    /* set limits for the subproblem */
+-   SCIP_CALL( SCIPcopyLimits(scip, subscip) );
++   SCIP_CALL( SCIPcopyLimitsHeur(scip, subscip) );
+    SCIP_CALL( SCIPsetLongintParam(subscip, "limits/nodes", 1LL) );
+ 
+    SCIP_CALL( SCIPsetBoolParam(subscip, "misc/catchctrlc", FALSE) );
+diff --color -ruN scip-v9-orig/src/scip/heur_padm.c scip-v9-mod/src/scip/heur_padm.c
+--- a/src/scip/heur_padm.c	2025-10-21 11:41:30
++++ b/src/scip/heur_padm.c	2026-11-20 16:37:09
+@@ -337,7 +337,7 @@
+    SCIP_CALL( SCIPgetRealParam(scip, "numerics/infinity", &infvalue) );
+    SCIP_CALL( SCIPsetRealParam(*subscip, "numerics/infinity", infvalue) );
+ 
+-   SCIP_CALL( SCIPcopyLimits(scip, *subscip) );
++   SCIP_CALL( SCIPcopyLimitsHeur(scip, *subscip) );
+ 
+    /* avoid recursive calls */
+    SCIP_CALL( SCIPsetSubscipsOff(*subscip, TRUE) );
+@@ -818,7 +818,7 @@
+    }
+ 
+    /* set limits; do not use more time than the heuristic has already used */
+-   SCIP_CALL( SCIPcopyLimits(scip, scipcopy) );
++   SCIP_CALL( SCIPcopyLimitsHeur(scip, scipcopy) );
+    SCIP_CALL( SCIPsetLongintParam(scipcopy, "limits/nodes", 1LL) );
+    SCIP_CALL( SCIPgetRealParam(scipcopy, "limits/time", &time) );
+    if( SCIPheurGetTime(heur) < time - 1.0 )
+@@ -1592,7 +1592,7 @@
+                SCIP_CALL( reuseSolution((problem->blocks[b]).subscip, &problem->blocks[b]) );
+ 
+                /* update time and memory limit of subproblem */
+-               SCIP_CALL( SCIPcopyLimits(scip, (problem->blocks[b]).subscip) );
++               SCIP_CALL( SCIPcopyLimitsHeur(scip, (problem->blocks[b]).subscip) );
+ 
+                /* stop if there are not enough nodes left */
+                if( nodesleft < heurdata->minnodes )
+diff --color -ruN scip-v9-orig/src/scip/heur_proximity.c scip-v9-mod/src/scip/heur_proximity.c
+--- a/src/scip/heur_proximity.c	2025-10-21 11:41:30
++++ b/src/scip/heur_proximity.c	2026-11-20 16:37:09
+@@ -927,7 +927,7 @@
+    }
+ 
+    /* set limits for the subproblem */
+-   SCIP_CALL( SCIPcopyLimits(scip, subscip) );
++   SCIP_CALL( SCIPcopyLimitsHeur(scip, subscip) );
+    SCIP_CALL( SCIPsetLongintParam(subscip, "limits/nodes", nnodes) );
+    SCIP_CALL( SCIPsetIntParam(subscip, "limits/solutions", 1) );
+ 
+diff --color -ruN scip-v9-orig/src/scip/heur_rens.c scip-v9-mod/src/scip/heur_rens.c
+--- a/src/scip/heur_rens.c	2025-10-21 11:41:30
++++ b/src/scip/heur_rens.c	2026-11-20 16:37:09
+@@ -428,7 +428,7 @@
+ #endif
+ 
+    /* set limits for the subproblem */
+-   SCIP_CALL( SCIPcopyLimits(scip, subscip) );
++   SCIP_CALL( SCIPcopyLimitsHeur(scip, subscip) );
+    heurdata->nodelimit = maxnodes;
+    SCIP_CALL( SCIPsetLongintParam(subscip, "limits/stallnodes", nstallnodes) );
+    SCIP_CALL( SCIPsetLongintParam(subscip, "limits/nodes", maxnodes) );
+diff --color -ruN scip-v9-orig/src/scip/heur_rins.c scip-v9-mod/src/scip/heur_rins.c
+--- a/src/scip/heur_rins.c	2025-10-21 11:41:30
++++ b/src/scip/heur_rins.c	2026-11-20 16:37:09
+@@ -265,7 +265,7 @@
+ #endif
+ 
+    /* set limits for the subproblem */
+-   SCIP_CALL( SCIPcopyLimits(scip, subscip) );
++   SCIP_CALL( SCIPcopyLimitsHeur(scip, subscip) );
+    heurdata->nodelimit = nnodes;
+    SCIP_CALL( SCIPsetLongintParam(subscip, "limits/nodes", nnodes) );
+    SCIP_CALL( SCIPsetLongintParam(subscip, "limits/stallnodes", MAX(10, nnodes/10)) );
+diff --color -ruN scip-v9-orig/src/scip/heur_vbounds.c scip-v9-mod/src/scip/heur_vbounds.c
+--- a/src/scip/heur_vbounds.c	2025-10-21 11:41:30
++++ b/src/scip/heur_vbounds.c	2026-11-20 16:37:09
+@@ -790,7 +790,7 @@
+ #endif
+ 
+    /* set limits for the subproblem */
+-   SCIP_CALL( SCIPcopyLimits(scip, subscip) );
++   SCIP_CALL( SCIPcopyLimitsHeur(scip, subscip) );
+    SCIP_CALL( SCIPsetLongintParam(subscip, "limits/stallnodes", nstallnodes) );
+    SCIP_CALL( SCIPsetLongintParam(subscip, "limits/nodes", heurdata->maxnodes) );
+ 
+diff --color -ruN scip-v9-orig/src/scip/heur_zeroobj.c scip-v9-mod/src/scip/heur_zeroobj.c
+--- a/src/scip/heur_zeroobj.c	2025-10-21 11:41:30
++++ b/src/scip/heur_zeroobj.c	2026-11-20 16:37:09
+@@ -355,7 +355,7 @@
+ #endif
+ 
+    /* set limits for the subproblem */
+-   SCIP_CALL( SCIPcopyLimits(scip, subscip) );
++   SCIP_CALL( SCIPcopyLimitsHeur(scip, subscip) );
+    SCIP_CALL( SCIPsetLongintParam(subscip, "limits/nodes", nnodes) );
+    SCIP_CALL( SCIPsetIntParam(subscip, "limits/solutions", 1) );
+ 
+diff --color -ruN scip-v9-orig/src/scip/scip_copy.c scip-v9-mod/src/scip/scip_copy.c
+--- a/src/scip/scip_copy.c	2025-10-21 11:41:30
++++ b/src/scip/scip_copy.c	2026-11-20 16:37:09
+@@ -3334,6 +3334,32 @@
+    return SCIP_OKAY;
+ }
+ 
++/** copies limits to a primal heuristic sub-SCIP, optionally capping its time limit */
++SCIP_RETCODE SCIPcopyLimitsHeur(
++   SCIP*                 sourcescip,         /**< source SCIP data structure */
++   SCIP*                 targetscip          /**< target SCIP data structure */
++   )
++{
++   SCIP_Real frac;
++   SCIP_Real timelimit;
++
++   SCIP_CALL( SCIPcopyLimits(sourcescip, targetscip) );
++
++   if( SCIPgetParam(sourcescip, "heuristics/subsciptimefrac") == NULL )
++      return SCIP_OKAY;
++   SCIP_CALL( SCIPgetRealParam(sourcescip, "heuristics/subsciptimefrac", &frac) );
++   if( frac >= 1.0 )
++      return SCIP_OKAY;
++
++   SCIP_CALL( SCIPgetRealParam(targetscip, "limits/time", &timelimit) );
++   if( SCIPisInfinity(targetscip, timelimit) )
++      return SCIP_OKAY;
++   timelimit *= MAX(frac, 0.0);
++   SCIP_CALL( SCIPsetRealParam(targetscip, "limits/time", timelimit) );
++
++   return SCIP_OKAY;
++}
++
+ /** sets the working limits as well as common search parameters for the auxiliary problem
+  *
+  *  @note memory and time limits are not affected, and must be set using SCIPcopyLimits() instead
+diff --color -ruN scip-v9-orig/src/scip/scip_copy.h scip-v9-mod/src/scip/scip_copy.h
+--- a/src/scip/scip_copy.h	2025-10-21 11:41:30
++++ b/src/scip/scip_copy.h	2026-11-20 16:37:09
+@@ -1262,6 +1262,16 @@
+  *
+  *  See \ref SCIP_Stage "SCIP_STAGE" for a complete list of all possible solving stages.
+  */
++/** like SCIPcopyLimits(), but for primal heuristic sub-SCIPs: if the (optional) real parameter
++ *  "heuristics/subsciptimefrac" exists in the source SCIP, the sub-SCIP time limit is additionally capped
++ *  at that fraction of the remaining time; without the parameter this equals SCIPcopyLimits()
++ */
++SCIP_EXPORT
++SCIP_RETCODE SCIPcopyLimitsHeur(
++   SCIP*                 sourcescip,         /**< source SCIP data structure */
++   SCIP*                 targetscip          /**< target SCIP data structure */
++   );
++
+ SCIP_EXPORT
+ SCIP_RETCODE SCIPcopyLimits(
+    SCIP*                 sourcescip,         /**< source SCIP data structure */

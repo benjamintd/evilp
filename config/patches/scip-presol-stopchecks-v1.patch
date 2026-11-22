@@ -1,0 +1,56 @@
+--- a/src/scip/cons_knapsack.c
++++ b/src/scip/cons_knapsack.c
+@@ -11522,6 +11522,9 @@
+    for( c = nconss - 1; c >= 0; --c )
+    {
+       SCIP_CONS* cons0;
++
++      if( (c & 63) == 0 && SCIPisStopped(scip) )
++         break;
+       SCIP_CONS* cons1;
+       SCIP_CONSDATA* consdata0;
+ 
+--- a/src/scip/cons_logicor.c
++++ b/src/scip/cons_logicor.c
+@@ -2061,6 +2061,9 @@
+    for( c = 0; c < nconss; ++c )
+    {
+       SCIP_CONS* cons0;
++
++      if( (c & 63) == 0 && SCIPisStopped(scip) )
++         break;
+       SCIP_CONS* cons1;
+       SCIP_CONSDATA* consdata0;
+ 
+@@ -2820,6 +2823,9 @@
+ 
+    for( c = 0; c < nconss; ++c )
+    {
++      if( (c & 63) == 0 && SCIPisStopped(scip) )
++         break;
++
+       cons = conss[c];
+       assert(cons != NULL);
+       assert(!SCIPconsIsModifiable(cons));
+@@ -3144,6 +3150,9 @@
+    /* remove covered constraints and left over constraints to the column representation */
+    while( c >= 0 )
+    {
++      if( (c & 63) == 0 && SCIPisStopped(scip) )
++         break;
++
+       cons = myconss[c];
+       assert(cons != NULL);
+       assert(SCIPconsIsActive(cons));
+@@ -3192,7 +3201,10 @@
+     *     => delete c1; c2: x1 + x2 >= 1
+     *
+     */
+-   SCIP_CALL( strengthenConss(scip, myconss, nmyconss, varstopos, occurlist, noccurlistentries, occurlistlength, eventhdlr, ndelconss, nchgcoefs) );
++   if( !SCIPisStopped(scip) )
++   {
++      SCIP_CALL( strengthenConss(scip, myconss, nmyconss, varstopos, occurlist, noccurlistentries, occurlistlength, eventhdlr, ndelconss, nchgcoefs) );
++   }
+ 
+    /* delete temporary memory in occurlist */
+    for( --occurlistsize ; occurlistsize >= 0; --occurlistsize )

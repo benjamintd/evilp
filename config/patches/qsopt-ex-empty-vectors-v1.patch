@@ -1,0 +1,51 @@
+--- a/qsopt_ex/lib.c
++++ b/qsopt_ex/lib.c
+@@ -1245,17 +1245,12 @@
+ 			EGLPNUM_TYPENAME_EGlpNumCopy (rng, range[i]);
+ 		else
+ 			EGLPNUM_TYPENAME_EGlpNumZero (rng);
+-		if (names)
+-		{
+-			rval = EGLPNUM_TYPENAME_ILLlib_addrow (lp, B, rmatcnt[i], rmatind + rmatbeg[i],
+-														rmatval + rmatbeg[i], rhs[i], sense[i], rng,
+-														names[i]);
+-		}
+-		else
+-		{
+-			rval = EGLPNUM_TYPENAME_ILLlib_addrow (lp, B, rmatcnt[i], rmatind + rmatbeg[i],
+-														rmatval + rmatbeg[i], rhs[i], sense[i], rng, 0);
+-		}
++		/* Empty sparse vectors may omit both arrays. */
++		int cnt = rmatcnt[i];
++		int *ind = cnt ? rmatind + rmatbeg[i] : NULL;
++		EGLPNUM_TYPE *val = cnt ? rmatval + rmatbeg[i] : NULL;
++		rval = EGLPNUM_TYPENAME_ILLlib_addrow (lp, B, cnt, ind, val,
++			rhs[i], sense[i], rng, names ? names[i] : NULL);
+ 		CHECKRVALG (rval, CLEANUP);
+ 	}
+ 
+@@ -2277,18 +2272,12 @@
+ 
+ 	for (i = 0; i < num; i++)
+ 	{
+-		if (names)
+-		{
+-			rval = EGLPNUM_TYPENAME_ILLlib_addcol (lp, B, cmatcnt[i], cmatind + cmatbeg[i],
+-														cmatval + cmatbeg[i], obj[i], lower[i],
+-														upper[i], names[i], factorok);
+-		}
+-		else
+-		{
+-			rval = EGLPNUM_TYPENAME_ILLlib_addcol (lp, B, cmatcnt[i], cmatind + cmatbeg[i],
+-														cmatval + cmatbeg[i], obj[i], lower[i],
+-														upper[i], 0, factorok);
+-		}
++		/* Empty sparse vectors may omit both arrays. */
++		int cnt = cmatcnt[i];
++		int *ind = cnt ? cmatind + cmatbeg[i] : NULL;
++		EGLPNUM_TYPE *val = cnt ? cmatval + cmatbeg[i] : NULL;
++		rval = EGLPNUM_TYPENAME_ILLlib_addcol (lp, B, cnt, ind, val,
++			obj[i], lower[i], upper[i], names ? names[i] : NULL, factorok);
+ 		CHECKRVALG (rval, CLEANUP);
+ 	}
+ 

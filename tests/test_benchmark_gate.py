@@ -64,6 +64,15 @@ class Gate(unittest.TestCase):
         self.assertEqual(result['strict_candidate_wins'], 119)
         self.assertEqual(result['ties'], 121)
 
+    def test_suspension_invalidates_timing_for_either_solver(self):
+        for runs in (self.lab, self.highs):
+            runs[0]['sleep_affected'] = True
+            result = self.gate()
+            self.assertTrue(result['completion_gate_passed'])
+            self.assertFalse(result['timing_comparable'])
+            self.assertFalse(result['speed_gate_passed'])
+            del runs[0]['sleep_affected']
+
     def test_missing_manifest_member_or_attempt_is_not_239_of_239(self):
         self.manifest['instances'].pop()
         self.lab.pop()
@@ -121,6 +130,28 @@ class Gate(unittest.TestCase):
         result = self.gate()
         self.assertTrue(result['completion_gate_passed'])
         self.assertFalse(result['candidate_results']['m000']['independently_certified_infeasibility'])
+
+    def test_header_only_infeasible_solution_is_an_absent_primal(self):
+        model = self.manifest['instances'][0]
+        model.update(reference_status='=inf=', reference_objective='-',
+                     validation_contract='reference_status_agreement', validation_basis='locked v37')
+        checker = dict(status='no_solution', checked_feasible=False, objective=None,
+                       certificate_status='absent', certifies_infeasibility=False,
+                       certifies_optimality=False)
+        self.lab[0].update(reference_status='=inf=', reference_objective='-', claimed_status='infeasible',
+                           checker_exit_code=4, checker=checker)
+        self.assertTrue(self.gate()['completion_gate_passed'])
+        for key, value in [('status', 'invalid'), ('status', 'error'), ('status', 'unsupported'),
+                           ('checked_feasible', True), ('objective', '1'), ('certificate_status', 'invalid')]:
+            with self.subTest(key=key, value=value):
+                self.lab[0]['checker'] = dict(checker, **{key:value})
+                self.assertFalse(self.gate()['completion_gate_passed'])
+        self.lab[0]['checker'] = checker
+        self.lab[0]['checker_exit_code'] = 2
+        self.assertFalse(self.gate()['completion_gate_passed'])
+        self.lab[0]['checker_exit_code'] = 4
+        model['validation_contract'] = 'independent_original_model_infeasibility'
+        self.assertFalse(self.gate()['completion_gate_passed'])
 
     def test_original_model_infeasibility_proof_can_satisfy_declared_contract(self):
         self.manifest['instances'][0].update(reference_status='=inf=', reference_objective='-')

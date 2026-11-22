@@ -1,0 +1,335 @@
+--- a/qsopt_ex/lib.c
++++ b/qsopt_ex/lib.c
+@@ -142,6 +142,7 @@
+ #include "qsopt_EGLPNUM_TYPENAME.h"
+ #include "lp_EGLPNUM_TYPENAME.h"
+ #include "mps_EGLPNUM_TYPENAME.h"
++#include "fct_EGLPNUM_TYPENAME.h"
+ 
+ 
+ static void check_pinf (
+@@ -500,6 +501,160 @@
+ 
+ 	EGLPNUM_TYPENAME_EGlpNumFreeArray (brow);
+ 	EGLPNUM_TYPENAME_EGlpNumFreeArray (trow);
++	EG_RETURN (rval);
++}
++
++int EGLPNUM_TYPENAME_ILLlib_binv_row_sparse (
++	EGLPNUM_TYPENAME_lpinfo * lp,
++	int row,
++	EGLPNUM_TYPE * binv,
++	int *inds,
++	int *ninds)
++{
++	int rval = 0;
++	int i, singular = 0;
++	int nrows = lp->O->nrows;
++
++	if (row < 0 || row >= nrows)
++	{
++		rval = 1;
++		ILL_CLEANUP;
++	}
++	if (lp->basisid == -1)
++	{
++		rval = E_GENERAL_ERROR;
++		ILL_CLEANUP;
++	}
++	if (lp->fbasisid != lp->basisid || lp->f == 0)
++	{
++		rval = EGLPNUM_TYPENAME_ILLbasis_factor (lp, &singular);
++		CHECKRVALG (rval, CLEANUP);
++		if (singular)
++		{
++			rval = E_BASIS_SINGULAR;
++			ILL_CLEANUP;
++		}
++	}
++	if (lp->zz.indx == 0)
++	{
++		rval = EGLPNUM_TYPENAME_ILLsvector_alloc (&(lp->zz), lp->nrows);
++		CHECKRVALG (rval, CLEANUP);
++	}
++	EGLPNUM_TYPENAME_ILLfct_compute_zz (lp, &(lp->zz), row);
++	for (i = 0; i < nrows; i++)
++		EGLPNUM_TYPENAME_EGlpNumZero (binv[i]);
++	for (i = 0; i < lp->zz.nzcnt; i++)
++	{
++		int idx = lp->zz.indx[i];
++		EGLPNUM_TYPENAME_EGlpNumCopy (binv[idx], lp->zz.coef[i]);
++		if (inds)
++			inds[i] = idx;
++	}
++	if (ninds)
++		*ninds = lp->zz.nzcnt;
++
++CLEANUP:
++	EG_RETURN (rval);
++}
++
++int EGLPNUM_TYPENAME_ILLlib_tableau_row_sparse (
++	EGLPNUM_TYPENAME_lpinfo * lp,
++	int row,
++	EGLPNUM_TYPE * tabrow,
++	int *inds,
++	int *ninds)
++{
++	int rval = 0;
++	int i, singular = 0, out_nz = 0;
++	EGLPNUM_TYPENAME_ILLlpdata *qslp = lp->O;
++	int nrows = qslp->nrows;
++	int ncols = qslp->ncols;
++	int nstruct = qslp->nstruct;
++
++	if (row < 0 || row >= nrows)
++	{
++		rval = 1;
++		ILL_CLEANUP;
++	}
++	if (lp->basisid == -1)
++	{
++		rval = E_GENERAL_ERROR;
++		ILL_CLEANUP;
++	}
++	if (lp->fbasisid != lp->basisid || lp->f == 0)
++	{
++		rval = EGLPNUM_TYPENAME_ILLbasis_factor (lp, &singular);
++		CHECKRVALG (rval, CLEANUP);
++		if (singular)
++		{
++			rval = E_BASIS_SINGULAR;
++			ILL_CLEANUP;
++		}
++	}
++	if (!lp->internal_valid || lp->zz.indx == 0 || lp->zA.indx == 0)
++	{
++		/* Fallback to dense path if internal row representation is unavailable. */
++		EGLPNUM_TYPE *full = EGLPNUM_TYPENAME_EGlpNumAllocArray (nstruct + nrows);
++		rval = EGLPNUM_TYPENAME_ILLlib_tableau (lp, row, 0, full);
++		if (!rval)
++		{
++			for (i = 0; i < nstruct; i++)
++				EGLPNUM_TYPENAME_EGlpNumCopy (tabrow[i], full[i]);
++			if (ninds)
++				*ninds = -1;
++		}
++		EGLPNUM_TYPENAME_EGlpNumFreeArray (full);
++		ILL_CLEANUP;
++	}
++	if (!lp->inv_structmap_valid || ncols > lp->inv_structmap_cap)
++	{
++		if (ncols > lp->inv_structmap_cap)
++		{
++			int cap = ncols + (ncols >> 2) + 32;
++			ILL_IFFREE(lp->inv_structmap);
++			lp->inv_structmap_cap = 0;
++			ILL_SAFE_MALLOC (lp->inv_structmap, cap, int);
++			lp->inv_structmap_cap = cap;
++		}
++		for (i = 0; i < ncols; i++)
++			lp->inv_structmap[i] = -1;
++		for (i = 0; i < nstruct; i++)
++			lp->inv_structmap[qslp->structmap[i]] = i;
++		lp->inv_structmap_valid = 1;
++	}
++
++	EGLPNUM_TYPENAME_ILLfct_compute_zz (lp, &(lp->zz), row);
++	rval = EGLPNUM_TYPENAME_ILLfct_compute_zA (lp, &(lp->zz), &(lp->zA));
++	CHECKRVALG (rval, CLEANUP);
++
++	for (i = 0; i < nstruct; i++)
++		EGLPNUM_TYPENAME_EGlpNumZero (tabrow[i]);
++
++	for (i = 0; i < lp->zA.nzcnt; i++)
++	{
++		int ext = lp->inv_structmap[lp->nbaz[lp->zA.indx[i]]];
++		if (ext >= 0)
++		{
++			EGLPNUM_TYPENAME_EGlpNumCopy (tabrow[ext], lp->zA.coef[i]);
++			if (inds)
++				inds[out_nz] = ext;
++			out_nz++;
++		}
++	}
++	{
++		int bext = lp->inv_structmap[lp->baz[row]];
++		if (bext >= 0)
++		{
++			EGLPNUM_TYPENAME_EGlpNumOne (tabrow[bext]);
++			if (inds)
++				inds[out_nz] = bext;
++			out_nz++;
++		}
++	}
++	if (ninds)
++		*ninds = out_nz;
++
++CLEANUP:
+ 	EG_RETURN (rval);
+ }
+ 
+--- a/qsopt_ex/lib.h
++++ b/qsopt_ex/lib.h
+@@ -52,6 +52,8 @@
+ 		EGLPNUM_TYPENAME_ILLlib_get_slack ( EGLPNUM_TYPENAME_lpinfo * lp, EGLPNUM_TYPENAME_ILLlp_cache * C, EGLPNUM_TYPE * slack),
+ 		EGLPNUM_TYPENAME_ILLlib_objval ( EGLPNUM_TYPENAME_lpinfo * lp, EGLPNUM_TYPENAME_ILLlp_cache * C, EGLPNUM_TYPE * val),
+ 		EGLPNUM_TYPENAME_ILLlib_tableau ( EGLPNUM_TYPENAME_lpinfo * lp, int row, EGLPNUM_TYPE * binv, EGLPNUM_TYPE * tabrow),
++		EGLPNUM_TYPENAME_ILLlib_binv_row_sparse ( EGLPNUM_TYPENAME_lpinfo * lp, int row, EGLPNUM_TYPE * binv, int *inds, int *ninds),
++		EGLPNUM_TYPENAME_ILLlib_tableau_row_sparse ( EGLPNUM_TYPENAME_lpinfo * lp, int row, EGLPNUM_TYPE * tabrow, int *inds, int *ninds),
+ 		EGLPNUM_TYPENAME_ILLlib_basis_order ( EGLPNUM_TYPENAME_lpinfo * lp, int *header),
+ 		EGLPNUM_TYPENAME_ILLlib_newrow ( EGLPNUM_TYPENAME_lpinfo * lp, EGLPNUM_TYPENAME_ILLlp_basis * B,const EGLPNUM_TYPE rhs, int sense,
+ 			const EGLPNUM_TYPE range, const char *name),
+--- a/qsopt_ex/lpdefs.h
++++ b/qsopt_ex/lpdefs.h
+@@ -208,6 +208,9 @@
+ 	int cap_upd;
+ 	double custom_pfeas_tol;
+ 	double custom_dfeas_tol;
++	int *inv_structmap;
++	int inv_structmap_cap;
++	int inv_structmap_valid;
+ 	int *rowcnt;									/* row info follows, copy of col info */
+ 	int *rowbeg;
+ 	int *rowind;
+--- a/qsopt_ex/qsopt.c
++++ b/qsopt_ex/qsopt.c
+@@ -2254,6 +2254,45 @@
+ 	EG_RETURN (rval);
+ }
+ 
++EGLPNUM_TYPENAME_QSLIB_INTERFACE int EGLPNUM_TYPENAME_QSget_binv_row_sparse (
++	EGLPNUM_TYPENAME_QSdata * p,
++	int indx,
++	EGLPNUM_TYPE * binvrow,
++	int *inds,
++	int *ninds)
++{
++	int rval = 0;
++
++	rval = check_qsdata_pointer (p);
++	CHECKRVALG (rval, CLEANUP);
++
++	if (p->basis == 0)
++	{
++		QSlog("no active basis in store");
++		rval = 1;
++		goto CLEANUP;
++	}
++	if (0 > indx || indx >= EGLPNUM_TYPENAME_QSget_rowcount(p))
++	{
++		rval = 1;
++		goto CLEANUP;
++	}
++	if (p->cache == 0)
++	{
++		rval = 1;
++		goto CLEANUP;
++	}
++	if (p->factorok && p->lp->f != 0 && p->lp->basisid != -1)
++		p->lp->fbasisid = p->lp->basisid;
++
++	rval = EGLPNUM_TYPENAME_ILLlib_binv_row_sparse (p->lp, indx, binvrow, inds, ninds);
++	CHECKRVALG (rval, CLEANUP);
++
++CLEANUP:
++
++	EG_RETURN (rval);
++}
++
+ EGLPNUM_TYPENAME_QSLIB_INTERFACE int EGLPNUM_TYPENAME_QSget_tableau_row (
+ 	EGLPNUM_TYPENAME_QSdata * p,
+ 	int indx,
+@@ -2272,6 +2311,34 @@
+ 	}
+ 
+ 	rval = EGLPNUM_TYPENAME_ILLlib_tableau (p->lp, indx, 0, tableaurow);
++	CHECKRVALG (rval, CLEANUP);
++
++CLEANUP:
++
++	EG_RETURN (rval);
++}
++
++EGLPNUM_TYPENAME_QSLIB_INTERFACE int EGLPNUM_TYPENAME_QSget_tableau_row_sparse (
++	EGLPNUM_TYPENAME_QSdata * p,
++	int indx,
++	EGLPNUM_TYPE * tableaurow,
++	int *inds,
++	int *ninds)
++{
++	int rval = 0;
++
++	rval = check_qsdata_pointer (p);
++	CHECKRVALG (rval, CLEANUP);
++
++	if (p->cache == 0)
++	{
++		rval = 1;
++		goto CLEANUP;
++	}
++	if (p->factorok && p->lp->f != 0 && p->lp->basisid != -1)
++		p->lp->fbasisid = p->lp->basisid;
++
++	rval = EGLPNUM_TYPENAME_ILLlib_tableau_row_sparse (p->lp, indx, tableaurow, inds, ninds);
+ 	CHECKRVALG (rval, CLEANUP);
+ 
+ CLEANUP:
+--- a/qsopt_ex/qsopt.h
++++ b/qsopt_ex/qsopt.h
+@@ -149,7 +149,9 @@
+ 		EGLPNUM_TYPENAME_QSget_basis_and_row_norms_array ( EGLPNUM_TYPENAME_QSprob p, char *cstat, char *rstat,
+ 			EGLPNUM_TYPE * rownorms),
+ 		EGLPNUM_TYPENAME_QSget_binv_row ( EGLPNUM_TYPENAME_QSprob p, int indx, EGLPNUM_TYPE * binvrow),
++		EGLPNUM_TYPENAME_QSget_binv_row_sparse ( EGLPNUM_TYPENAME_QSprob p, int indx, EGLPNUM_TYPE * binvrow, int *inds, int *ninds),
+ 		EGLPNUM_TYPENAME_QSget_tableau_row ( EGLPNUM_TYPENAME_QSprob p, int indx, EGLPNUM_TYPE * tableaurow),
++		EGLPNUM_TYPENAME_QSget_tableau_row_sparse ( EGLPNUM_TYPENAME_QSprob p, int indx, EGLPNUM_TYPE * tableaurow, int *inds, int *ninds),
+ 		EGLPNUM_TYPENAME_QSget_basis_order ( EGLPNUM_TYPENAME_QSprob p, int *basorder), 
+     EGLPNUM_TYPENAME_QSget_coef (EGLPNUM_TYPENAME_QSprob p, int rowindex, int colindex, EGLPNUM_TYPE*coef),
+ 		EGLPNUM_TYPENAME_QSget_status ( EGLPNUM_TYPENAME_QSprob p, int *status),
+--- a/qsopt_ex/simplex.c
++++ b/qsopt_ex/simplex.c
+@@ -110,6 +110,9 @@
+ {
+ 	lp->custom_pfeas_tol = 0.0;
+ 	lp->custom_dfeas_tol = 0.0;
++	lp->inv_structmap = 0;
++	lp->inv_structmap_cap = 0;
++	lp->inv_structmap_valid = 0;
+ 	EGLPNUM_TYPENAME_ILLbasis_init_basisinfo (lp);
+ 	EGLPNUM_TYPENAME_init_internal_lpinfo (lp);
+ }
+@@ -122,6 +125,9 @@
+ 		EGLPNUM_TYPENAME_EGlpNumFreeArray (lp->lz);
+ 		EGLPNUM_TYPENAME_EGlpNumFreeArray (lp->uz);
+ 		EGLPNUM_TYPENAME_EGlpNumFreeArray (lp->cz);
++		ILL_IFFREE(lp->inv_structmap);
++		lp->inv_structmap_cap = 0;
++		lp->inv_structmap_valid = 0;
+ 		EGLPNUM_TYPENAME_ILLbasis_free_basisinfo (lp);
+ 		EGLPNUM_TYPENAME_free_internal_lpinfo (lp);
+ 	}
+@@ -204,6 +210,7 @@
+ 	lp->nnbasic = 0;
+ 	lp->localrows = 0;
+ 	lp->internal_valid = 0;
++	lp->inv_structmap_valid = 0;
+ 	lp->cap_nrows = 0;
+ 	lp->cap_ncols = 0;
+ 	lp->cap_nnbasic = 0;
+@@ -275,6 +282,7 @@
+ 		lp->localrows = 0;
+ 	}
+ 	lp->internal_valid = 0;
++	lp->inv_structmap_valid = 0;
+ 	lp->cap_nrows = 0;
+ 	lp->cap_ncols = 0;
+ 	lp->cap_nnbasic = 0;
+@@ -467,6 +475,7 @@
+ 	lp->matcnt = A->matcnt;
+ 	lp->matind = A->matind;
+ 	lp->matval = A->matval;
++	lp->inv_structmap_valid = 0;
+ 	fill_local_rows (lp);
+ 	return reuse_internal_lpinfo (lp);
+ }

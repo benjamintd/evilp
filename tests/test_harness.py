@@ -17,6 +17,9 @@ class Harness(unittest.TestCase):
             p=subprocess.run(args,capture_output=True,text=True);self.assertEqual(p.returncode,0,p.stderr)
             lines=(root/'result/runs.jsonl').read_text().splitlines();self.assertEqual(len(lines),1)
             r=json.loads(lines[0]);self.assertTrue(r['checker']['checked_feasible'],r);self.assertEqual(r['claimed_status'],'optimal')
+            if sys.platform == 'darwin' or 'host_suspend_s' in r:
+                self.assertGreaterEqual(r['host_suspend_s'],0)
+                self.assertEqual(r['sleep_affected'],r['host_suspend_s']>5)
             self.assertEqual(r['reported_solver_status'],'optimal')
             self.assertFalse(r['relaxation']);self.assertIsNone(r['dual_file'])
             self.assertFalse(json.loads((root/'result/environment.json').read_text())['relaxation'])
