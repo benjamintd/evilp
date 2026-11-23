@@ -293,6 +293,38 @@ class BinarySAT(unittest.TestCase):
                 self.assertEqual(value, optimum)
                 self.assertEqual(result['status'], 'infeasible' if optimum is None else 'optimal')
 
+    def test_translated_ranged_row_against_enumeration(self):
+        # A signed ranged row selected from the differential oracle. Both
+        # forms have the same 510 possible points and identical row slacks.
+        coeff = [-4, -4, 3]
+        costs = [-4, 6, 6]
+        origin = [-10**9, 10**9 - 40, 10**9 - 40]
+        rhs = 2999999933
+        for shift in (origin, [0, 0, 0]):
+            translation = [a - b for a, b in zip(origin, shift)]
+            side = rhs - sum(a * b for a, b in zip(coeff, translation))
+            data = model(costs, [(coeff, side - 4, side)], maximize=True)
+            data['bounds'] = [(lo, lo + width) for lo, width in zip(shift, [33, 4, 2])]
+            data['offset'] += sum(a * b for a, b in zip(costs, translation))
+            with self.subTest(shift=shift):
+                r, value = self.solve(data)
+                self.assertEqual(value, mip_oracle(data))
+                self.assertEqual((r['search_route'], r['best_bound']), ('binary_sat', value))
+
+    def test_source_rhs_beyond_machine_integer(self):
+        # Both sides of this decimal equality round to the fixed activity in
+        # double precision. The residual quarter-unit determines the optimum.
+        k = 10**9
+        for sign in (1, -1):
+            row = [sign * (k // 4)] * 40 + [sign * F(1, 4), sign * F(1, 2)]
+            rhs = sign * (10 * k * k + F(1, 4))
+            data = model([0] * 40 + [1, 1], [(row, rhs, rhs)])
+            data['bounds'] = [(k, k)] * 40 + [(0, 2)] * 2
+            with self.subTest(sign=sign):
+                r, value = self.solve(data)
+                self.assertEqual(value, mip_oracle(data))
+                self.assertEqual((r['search_route'], r['best_bound']), ('binary_sat', value))
+
     def test_no_backend_on_continuous_columns(self):
         m = model([1, 1], [([1, 1], F(1,2), None)])
         m['integer'][0] = False

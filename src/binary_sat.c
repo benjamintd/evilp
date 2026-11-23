@@ -188,7 +188,7 @@ static int64_t gcd64(int64_t a, int64_t b) {
 
 static int include_row_den(int64_t *scale, mpq_srcptr q) {
     enum { MAX_ROW_DEN = 1000000 };
-    if (!*scale || !mpz_fits_ulong_p(mpq_denref(q)) || !mpz_fits_slong_p(mpq_numref(q))) {
+    if (!*scale || !mpz_fits_ulong_p(mpq_denref(q))) {
         *scale = 0;
         return 0;
     }
@@ -539,6 +539,19 @@ static int pb_totalizer_at_most(Encoder *e, const Term *t, int n, int cap) {
         free(layer[k].lits);
     free(layer);
     return ok && e->clauses <= MAX_CLAUSES;
+}
+
+/* The row LCM includes both sides. Unlike a literal weight, a source RHS
+ * can be large until the column endpoints have been subtracted. */
+static int scaled_rhs(const LabModel *m, size_t row, int upper, int64_t scale,
+                      mpq_t q, mpz_t rhs) {
+    if (lab_source_exact_row_bound(m, row, upper, q))
+        return 0;
+    mpz_mul_ui(rhs, mpq_numref(q), (unsigned long)scale);
+    mpz_divexact(rhs, rhs, mpq_denref(q));
+    if (!upper)
+        mpz_neg(rhs, rhs);
+    return 1;
 }
 
 /* Both factors are limited by the encoder's integer domain. Their sum across
@@ -1446,20 +1459,15 @@ static SatOutcome small_integer_sat(const LabModel *m, const double *lo, const d
             double rhs = upper ? m->row_upper[i] : m->row_lower[i];
             if (!isfinite(rhs))
                 continue;
-            int64_t cap = 0;
-            if (lab_source_exact_row_bound(m, i, upper, q) ||
-                !convert_scaled(q, rhs, row_scale[i], &cap)) {
+            if (!scaled_rhs(m, i, upper, row_scale[i], q, capacity)) {
                 ok = 0;
                 break;
             }
-            if (!upper)
-                cap = -cap;
             /* Collect active (non-fixed) normalized terms. */
             int k_act = 0;
             int act_col[4], act_w[4], act_neg[4];
             int64_t act_coef[4];
             int has_multi = 0, has_bin_enc = 0;
-            mpz_set_si(capacity, (long)cap);
             for (size_t p = start[i]; p < start[i + 1]; ++p) {
                 size_t j = (size_t)terms[p].lit;
                 int64_t a = upper ? terms[p].weight : -terms[p].weight;
@@ -1974,14 +1982,9 @@ static int cheapest_face_general_int(const LabModel *m, const double *lo, const 
                 double rhs = upper ? m->row_upper[i] : m->row_lower[i];
                 if (!isfinite(rhs))
                     continue;
-                int64_t cap = 0;
-                if (lab_source_exact_row_bound(m, i, upper, q) ||
-                    !convert_scaled(q, rhs, row_scale[i], &cap))
+                if (!scaled_rhs(m, i, upper, row_scale[i], q, capacity))
                     continue;
-                if (!upper)
-                    cap = -cap;
                 size_t cnt = 0;
-                mpz_set_si(capacity, (long)cap);
                 for (size_t p = start[i]; p < start[i + 1]; ++p) {
                     size_t j = rcol[p];
                     int64_t w = upper ? rcoef[p] : -rcoef[p];
