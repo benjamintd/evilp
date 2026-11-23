@@ -125,6 +125,16 @@ in `reported_dual_bound`. Replay and reporting compare it with checked
 witnesses under the evaluator's existing policy. A general SCIP attempt that
 hands control back to native search contributes no terminal bound of its own.
 
+The general importer can multiply a row and both finite sides by a power of
+two to preserve small coefficients. It checks the stored sides, coefficient
+values and variable identities. If a finite value would reach SCIP's infinity
+sentinel, it rejects the import. When a rescued term or finite side falls
+within feasibility tolerance in unit-normalized coordinates, a backend time
+or node limit may return a checked point with a null bound. Such points also
+undergo a residual check relative to the source row activities. A purported
+closure on these rows returns control to native search with fallback reason
+`ill_conditioned_row_requires_source_check`.
+
 The MIP JSON, runner ledger, replay and report carry four provenance fields.
 
 | Field | Interpretation |

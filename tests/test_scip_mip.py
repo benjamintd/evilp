@@ -250,6 +250,67 @@ class ScipGeneralMip(unittest.TestCase):
                 self.assertEqual(F(json.loads(checker.stdout)['objective']), 0)
                 self.assertFalse(result['certifies_optimality'])
 
+    def test_strict_import_preserves_tiny_terms_and_row_sides(self):
+        base = (Path(__file__).parent / 'fixtures/small_coefficient_scip.mps').read_text()
+        term = F(1, 2**50)
+        # The lower side needs y=side/term at x=0. Pricing y instead
+        # makes the opposite side of the ranged row binding.
+        cases = [(kind, sign, power, ranged, None)
+                 for kind, sign, ranged in [('G', 1, False), ('L', -1, False), ('E', 1, False),
+                                             ('G', 1, True), ('L', -1, True)]
+                 for power in (49, 12)]
+        cases.extend([('G', 1, 12, False, 'side'), ('G', 1, 12, False, 'coefficient')])
+        for kind, sign, power, price_flow, overflow in cases:
+            side = F(1, 2**power)
+            demand = int(side / term)
+            span = 8*10**19 if overflow == 'side' else side/2 if price_flow else None
+            expected = -3 * demand // 2 if price_flow else 0
+            reason = ('lossy_model_import' if overflow else
+                      'ill_conditioned_row_requires_source_check' if power == 12 else None)
+            text = (base.replace(' G R', f' {kind} R')
+                    .replace('x O 1 R 1', 'x O 1 R ' + decimal(sign * side))
+                    .replace('y R 1e-10', ('y O -1 R ' if price_flow else 'y R ') + decimal(sign * term))
+                    .replace(' b R 1', ' b R ' + decimal(sign * side))
+                    .replace('10000000000', str(2*demand if price_flow else demand)))
+            if span is not None:
+                text = text.replace('BOUNDS', 'RANGES\n rng R ' + decimal(span) + '\nBOUNDS')
+            if overflow == 'coefficient':
+                text = text.replace(' z0 O 0', ' z0 O 0 R -8e19')
+            with self.subTest(kind=kind, span=span, power=power, overflow=overflow), tempfile.TemporaryDirectory() as tmp:
+                result, model, sol = self.run_model(Path(tmp), text)
+                self.assertEqual(result['search_route'], 'native' if reason else 'general_scip')
+                self.assertEqual(result['scip_fallback_reason'], reason)
+                self.assertEqual((result['status'], result['best_bound']), ('optimal', expected))
+                checked = json.loads(subprocess.check_output([CHECKER, '--model', model, '--solution', sol, '--exact']))
+                self.assertEqual(F(checked['objective']), expected)
+
+    def test_whole_small_row_retains_unit_demand(self):
+        base = (Path(__file__).parent / 'fixtures/small_coefficient_scip.mps').read_text()
+        for exponent in (24, 50, 60):
+            unit = decimal(F(1, 2**exponent))
+            text = (base.replace('x O 1 R 1', 'x O 1 R ' + unit)
+                    .replace('y R 1e-10', 'y O 1 R ' + unit)
+                    .replace(' b R 1', ' b R ' + unit)
+                    .replace('10000000000', '1'))
+            with self.subTest(exponent=exponent), tempfile.TemporaryDirectory() as tmp:
+                result, model, sol = self.run_model(Path(tmp), text)
+                self.assertEqual((result['search_route'], result['status'], result['best_bound']),
+                                 ('general_scip', 'optimal', 1))
+                checked = json.loads(subprocess.check_output([CHECKER, '--model', model, '--solution', sol, '--exact']))
+                self.assertEqual(F(checked['objective']), 1)
+
+    def test_ill_conditioned_pricing_needs_source_check(self):
+        # z0 alone meets demand at 1e-16. Dropping that activity or
+        # accepting the all-zero point changes the claimed optimum.
+        text = (Path(__file__).parent / 'fixtures/tiny_row_pricing.mps').read_text()
+        with tempfile.TemporaryDirectory() as tmp:
+            result, model, sol = self.run_model(Path(tmp), text)
+            self.assertEqual((result['status'], result['search_route'], result['scip_fallback_reason']),
+                             ('optimal', 'native', 'ill_conditioned_row_requires_source_check'))
+            checked = json.loads(subprocess.check_output([CHECKER, '--model', model, '--solution', sol, '--exact']))
+            self.assertEqual(F(checked['objective']), F(1, 10**16))
+            self.assertEqual(F(str(result['best_bound'])), F(1, 10**16))
+
     def test_small_objective_over_large_domain(self):
         original = (Path(__file__).parent / 'fixtures/small_coefficient_scip.mps').read_text()
         for exponent in (10, 16):

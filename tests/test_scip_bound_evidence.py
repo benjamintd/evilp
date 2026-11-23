@@ -83,6 +83,21 @@ class BoundEvidence(unittest.TestCase):
             with self.subTest(maximize=maximize, status=status, missing=missing), tempfile.TemporaryDirectory() as tmp:
                 self.check_case(Path(tmp), maximize, status, missing)
 
+    def test_ill_conditioned_limit_has_no_global_bound(self):
+        source = ROOT / 'tests/fixtures/tiny_row_pricing.mps'
+        with tempfile.TemporaryDirectory() as tmp:
+            sol = Path(tmp) / 'point.sol'
+            run = subprocess.run([SOLVE, source, '--mip', '--solution', sol], capture_output=True,
+                                 env={**os.environ, 'TEST_SCIP_STATUS': 'time_limit'})
+            self.assertEqual(run.returncode, 4, run.stderr)
+            result = json.loads(run.stdout)
+            self.assertEqual((result['status'], result['search_route']), ('time_limit', 'general_scip'))
+            self.assertIsNone(result['best_bound'])
+            self.assertEqual((result['bound_origin'], result['bound_scope']), ('none', 'none'))
+            self.assertTrue(result['has_primal'])
+            check = json.loads(subprocess.check_output([CHECK, '--model', source, '--solution', sol, '--exact']))
+            self.assertGreaterEqual(Fraction(check['objective']), Fraction(1, 10**16))
+
 
 if __name__ == '__main__':
     unittest.main()

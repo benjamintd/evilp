@@ -29,8 +29,43 @@ static double subscip_fraction(void) {
     return 0.25;
 }
 
+enum { ROW_ACTIVE = 1, ROW_NEEDS_SOURCE_CHECK = 2 };
+
+/* An absolute residual can accept zero activity on a tiny positive demand.
+ * For rescued ill-conditioned rows also check the violation relative to
+ * the actual source activities, including cancellation between terms. */
+static int respects_rescued_rows(const LabModel *m, const unsigned char *rows, const double *x) {
+    if (!rows)
+        return 1;
+    struct Activity { long double sum, magnitude; };
+    struct Activity *activity = lab_alloc(m->rows, sizeof *activity);
+    for (size_t j = 0; j < m->cols; ++j) {
+        for (size_t k = m->col_start[j]; k < m->col_start[j + 1]; ++k) {
+            size_t i = m->row_index[k];
+            if (rows[i] == ROW_NEEDS_SOURCE_CHECK) {
+                long double term = (long double)m->value[k] * x[j];
+                activity[i].sum += term;
+                activity[i].magnitude += fabsl(term);
+            }
+        }
+    }
+    int ok = 1;
+    for (size_t i = 0; i < m->rows && ok; ++i) {
+        if (rows[i] != ROW_NEEDS_SOURCE_CHECK)
+            continue;
+        long double sum = activity[i].sum, norm = activity[i].magnitude;
+        long double lo = m->row_lower[i], hi = m->row_upper[i];
+        ok = isfinite(sum) && isfinite(norm) &&
+             !(isfinite(lo) && lo - sum > 1e-7L * fmaxl(norm, fabsl(lo))) &&
+             !(isfinite(hi) && sum - hi > 1e-7L * fmaxl(norm, fabsl(hi)));
+    }
+    free(activity);
+    return ok;
+}
+
 static int extract_verified(const LabModel *m, const double *lower, const double *upper,
-                            SCIP *s, SCIP_VAR *const *vars, double *point, double *out_obj) {
+                            SCIP *s, SCIP_VAR *const *vars, const unsigned char *rescued_rows,
+                            double *point, double *out_obj) {
     int nsols = SCIPgetNSols(s);
     if (nsols <= 0)
         return 0;
@@ -72,7 +107,8 @@ static int extract_verified(const LabModel *m, const double *lower, const double
         if (!ok)
             continue;
         double obj = 0, viol = 0;
-        if (!lab_exact_evaluate(&view, cand, &obj, &viol) && viol <= 1e-7) {
+        if (!lab_exact_evaluate(&view, cand, &obj, &viol) && viol <= 1e-7 &&
+            respects_rescued_rows(m, rescued_rows, cand)) {
             memcpy(point, cand, m->cols * sizeof *point);
             *out_obj = obj;
             found = 1;
@@ -271,6 +307,54 @@ static void scale_integer_inequality(const LabModel *m, size_t i, int upper, int
 
 enum { LOSSY_IMPORT = -3 };
 
+/* Below the feasibility tolerance a whole unit of activity can disappear.
+ * Give such a row a unit-sized coefficient. On strict retry also protect
+ * individual terms from the importer's zero threshold. Scaling upward by a
+ * power of two is exact unless the finite range is exceeded. */
+static int preserve_small_row_terms(SCIP *s, double *values, int n, double *lhs, double *rhs, int strict) {
+    double inf = SCIPinfinity(s);
+    double smallest = inf;
+    double largest = 0.0;
+    for (int k = 0; k < n; ++k) {
+        double magnitude = fabs(values[k]);
+        if (magnitude > 0.0 && magnitude < smallest)
+            smallest = magnitude;
+        largest = fmax(largest, magnitude);
+    }
+    if (largest == 0.0)
+        return 1;
+    int shift = SCIPisFeasZero(s, largest) ? -ilogb(largest) : 0;
+    if (strict && SCIPisZero(s, scalbn(smallest, shift))) {
+        shift = ilogb(SCIPepsilon(s)) - ilogb(smallest);
+        if (SCIPisZero(s, scalbn(smallest, shift)))
+            ++shift;
+    }
+    if (!shift)
+        return 1;
+    /* Below feasibility tolerance in unit-normalized coordinates a term or
+     * a finite side can disappear even after successful import. Use this
+     * solve only to find points. Its closure needs source verification. */
+    double smallest_activity = smallest;
+    if (*lhs != -inf && *lhs != 0.0)
+        smallest_activity = fmin(smallest_activity, fabs(*lhs));
+    if (*rhs != inf && *rhs != 0.0)
+        smallest_activity = fmin(smallest_activity, fabs(*rhs));
+    int trust = SCIPisFeasZero(s, smallest_activity / largest) ? ROW_NEEDS_SOURCE_CHECK : ROW_ACTIVE;
+    if (*lhs != -inf)
+        largest = fmax(largest, fabs(*lhs));
+    if (*rhs != inf)
+        largest = fmax(largest, fabs(*rhs));
+    if (scalbn(largest, shift) >= inf)
+        return 0;
+    for (int k = 0; k < n; ++k)
+        values[k] = scalbn(values[k], shift);
+    if (*lhs != -inf)
+        *lhs = scalbn(*lhs, shift);
+    if (*rhs != inf)
+        *rhs = scalbn(*rhs, shift);
+    return trust;
+}
+
 static int compare_cost(const void *left, const void *right) {
     double a = *(const double *)left, b = *(const double *)right;
     return (a > b) - (a < b);
@@ -329,6 +413,7 @@ static int solve_once(const LabModel *m, const double *lower, const double *uppe
     SCIP_Real *rvals = NULL;
     int *source_entry = NULL;
     unsigned char *active = NULL;
+    int needs_source_check = 0;
     int result = 0;
 
     if (SCIPcreate(&s) != SCIP_OKAY)
@@ -477,6 +562,15 @@ static int solve_once(const LabModel *m, const double *lower, const double *uppe
         else if (len && l == -inf && u == m->row_upper[i] && !isfinite(m->row_lower[i]))
             scale_integer_inequality(m, i, 1, len, rvars + rstart[i], source_entry + rstart[i],
                                rvals + rstart[i], &u, deadline);
+        if (len) {
+            int imported = preserve_small_row_terms(s, rvals + rstart[i], len, &l, &u, strict);
+            if (!imported) {
+                result = LOSSY_IMPORT;
+                goto done;
+            }
+            active[i] = (unsigned char)imported;
+            needs_source_check |= imported == ROW_NEEDS_SOURCE_CHECK;
+        }
         if (SCIPcreateConsBasicLinear(s, &cons[i], name, len, len ? &rvars[rstart[i]] : NULL,
                                       len ? &rvals[rstart[i]] : NULL, l, u) != SCIP_OKAY)
             goto done;
@@ -536,8 +630,13 @@ static int solve_once(const LabModel *m, const double *lower, const double *uppe
     stats->lp_solves = (size_t)SCIPgetNLPs(s);
 
     SCIP_STATUS st = SCIPgetStatus(s);
+    if (needs_source_check && st != SCIP_STATUS_TIMELIMIT && st != SCIP_STATUS_NODELIMIT &&
+        st != SCIP_STATUS_TOTALNODELIMIT) {
+        stats->fallback_reason = "ill_conditioned_row_requires_source_check";
+        goto done;
+    }
     double dual = SCIPgetDualbound(s);
-    if (isfinite(dual) && fabs(dual) < 0.5 * inf) {
+    if (!needs_source_check && isfinite(dual) && fabs(dual) < 0.5 * inf) {
         stats->has_bound = 1;
         stats->best_bound = dual;
     }
@@ -549,7 +648,7 @@ static int solve_once(const LabModel *m, const double *lower, const double *uppe
     }
 
     double orig_obj = 0.0;
-    int verified = extract_verified(m, lower, upper, s, vars, point, &orig_obj);
+    int verified = extract_verified(m, lower, upper, s, vars, needs_source_check ? active : NULL, point, &orig_obj);
     if (st == SCIP_STATUS_OPTIMAL && verified) {
         double primal = SCIPgetPrimalbound(s);
         double scale = 1.0 + fabs(orig_obj);
