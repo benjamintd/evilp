@@ -541,27 +541,54 @@ static int pb_totalizer_at_most(Encoder *e, const Term *t, int n, int cap) {
     return ok && e->clauses <= MAX_CLAUSES;
 }
 
+/* Both factors are limited by the encoder's integer domain. Their sum across
+ * a row can exceed int64_t even when the translated right hand side is small. */
+static void shift_rhs(mpz_t rhs, mpz_t term, int64_t weight, int64_t endpoint) {
+    if (!endpoint)
+        return;
+    mpz_set_si(term, (long)weight);
+    if (endpoint > 0)
+        mpz_submul_ui(rhs, term, (unsigned long)endpoint);
+    else
+        mpz_addmul_ui(rhs, term, (unsigned long)-endpoint);
+}
+
+/* All callers have excluded a negative capacity. at_most checks the sum
+ * of positive weights fits int64_t, so any larger capacity is redundant. */
+static int64_t nonnegative_capacity(mpz_srcptr rhs) {
+    if (mpz_sizeinbase(rhs, 2) > 63)
+        return INT64_MAX;
+    uint64_t value = 0;
+    mpz_export(&value, NULL, 1, sizeof value, 0, 0, rhs);
+    return (int64_t)value;
+}
+
 static int at_most(Encoder *e, Term *t, int n, int64_t cap) {
-    int64_t total = 0, minimum = INT64_MAX;
+    int64_t total = 0, negative = 0, minimum = INT64_MAX;
     for (int i = 0; i < n; ++i) {
-        if (t[i].weight < 0) {
-            cap -= t[i].weight;
+        int flip = t[i].weight < 0;
+        if (t[i].weight == INT64_MIN)
+            return 0;
+        if (flip) {
             t[i].weight = -t[i].weight;
             t[i].lit = -t[i].lit;
         }
         if (total > INT64_MAX - t[i].weight)
             return 0;
         total += t[i].weight;
+        if (flip)
+            negative += t[i].weight;
         if (t[i].weight < minimum)
             minimum = t[i].weight;
     }
-    if (cap >= total)
+    if (cap >= total - negative)
         return 1;
-    if (cap < 0) {
+    if (cap < -negative) {
         literal(e, 0);
         ++e->clauses;
         return 1;
     }
+    cap += negative; /* Now in [0, total). */
     if (total - minimum <= cap) {
         for (int i = 0; i < n; ++i)
             literal(e, -t[i].lit);
@@ -1215,13 +1242,13 @@ static SatOutcome small_integer_sat(const LabModel *m, const double *lo, const d
         }
         if (mpq_sgn(q) && lo[j] != hi[j])
             has_obj = 1;
-        int64_t ilo = (int64_t)lo[j], ihi = (int64_t)hi[j];
-        if (llabs(ilo) > MAX_WEIGHT || llabs(ihi) > MAX_WEIGHT || ihi - ilo > MAX_BIN_WIDTH) {
+        if (fabs(lo[j]) > MAX_WEIGHT || fabs(hi[j]) > MAX_WEIGHT ||
+            hi[j] - lo[j] > MAX_BIN_WIDTH) {
             ok = 0;
             break;
         }
-        col_lo[j] = ilo;
-        width[j] = (int)(ihi - ilo);
+        col_lo[j] = (int64_t)lo[j];
+        width[j] = (int)(hi[j] - lo[j]);
         if (width[j] > 0) {
             int nb = width[j];
             if (width[j] > MAX_ORDER_WIDTH) {
@@ -1384,6 +1411,8 @@ static SatOutcome small_integer_sat(const LabModel *m, const double *lo, const d
                  .variables = (int)total_bits,
                  .base_vars = (int)total_bits,
                  .deadline = deadline};
+    mpz_t capacity, product;
+    mpz_inits(capacity, product, NULL);
     Term *expanded = NULL;
     double *bits = NULL;
     SatOutcome result = SAT_NO_RESULT;
@@ -1430,19 +1459,18 @@ static SatOutcome small_integer_sat(const LabModel *m, const double *lo, const d
             int act_col[4], act_w[4], act_neg[4];
             int64_t act_coef[4];
             int has_multi = 0, has_bin_enc = 0;
-            int64_t adj_cap = cap;
+            mpz_set_si(capacity, (long)cap);
             for (size_t p = start[i]; p < start[i + 1]; ++p) {
                 size_t j = (size_t)terms[p].lit;
                 int64_t a = upper ? terms[p].weight : -terms[p].weight;
                 if (!a)
                     continue;
-                if (col_lo[j]) {
-                    if (llabs(col_lo[j]) > INT64_MAX / (llabs(a) + 1)) {
-                        ok = 0;
-                        break;
-                    }
-                    adj_cap -= a * col_lo[j];
-                }
+                /* Reflect negative literals around the largest encoded bit
+                 * pattern. The separate width clauses remove out-of-domain patterns. */
+                int64_t endpoint = col_lo[j];
+                if (a < 0)
+                    endpoint += bin_enc[j] ? (INT64_C(1) << nbits[j]) - 1 : width[j];
+                shift_rhs(capacity, product, a, endpoint);
                 if (!width[j])
                     continue;
                 if (bin_enc[j])
@@ -1455,7 +1483,6 @@ static SatOutcome small_integer_sat(const LabModel *m, const double *lo, const d
                     if (a < 0) {
                         act_neg[k_act] = 1;
                         act_coef[k_act] = -a;
-                        adj_cap += (-a) * width[j];
                     } else {
                         act_neg[k_act] = 0;
                         act_coef[k_act] = a;
@@ -1463,14 +1490,20 @@ static SatOutcome small_integer_sat(const LabModel *m, const double *lo, const d
                 }
                 ++k_act;
             }
-            if (!ok)
-                break;
-            if (k_act == 0) {
-                if (adj_cap < 0) {
-                    literal(&e, 0);
-                    ++e.clauses;
-                }
+            if (mpz_sgn(capacity) < 0) {
+                literal(&e, 0);
+                ++e.clauses;
                 continue;
+            }
+            if (!k_act)
+                continue;
+            int64_t adj_cap = nonnegative_capacity(capacity);
+            if (k_act <= 3 && !has_bin_enc) {
+                int64_t maximum = 0;
+                for (int t = 0; t < k_act; ++t)
+                    maximum += act_coef[t] * act_w[t];
+                if (adj_cap >= maximum)
+                    continue;
             }
             if (k_act == 1 && !has_bin_enc) {
                 int64_t v = adj_cap < 0 ? 0 : (adj_cap / act_coef[0] + 1);
@@ -1533,24 +1566,23 @@ static SatOutcome small_integer_sat(const LabModel *m, const double *lo, const d
             }
             /* General expansion into order-encoded / binary-encoded terms. */
             int exp_n = 0;
-            int64_t exp_cap_rhs = cap;
             for (size_t p = start[i]; p < start[i + 1] && ok; ++p) {
                 size_t j = (size_t)terms[p].lit;
                 int64_t a = upper ? terms[p].weight : -terms[p].weight;
                 if (!a)
                     continue;
-                exp_cap_rhs -= a * col_lo[j];
                 for (int t = 0; t < nbits[j]; ++t) {
                     int64_t bw = bin_enc[j] ? (INT64_C(1) << t) : 1;
                     if (llabs(a) > (INT64_C(1) << 46) / bw) {
                         ok = 0;
                         break;
                     }
-                    expanded[exp_n++] = (Term){base[j] + t, a * bw, terms[p].entry};
+                    int lit = base[j] + t;
+                    expanded[exp_n++] = (Term){a < 0 ? -lit : lit, llabs(a) * bw, terms[p].entry};
                 }
             }
             if (ok)
-                ok = at_most(&e, expanded, exp_n, exp_cap_rhs);
+                ok = at_most(&e, expanded, exp_n, adj_cap);
         }
     }
     if (!ok || stopped(&e))
@@ -1685,6 +1717,7 @@ static SatOutcome small_integer_sat(const LabModel *m, const double *lo, const d
         free(cut_terms);
     }
 done:
+    mpz_clears(capacity, product, NULL);
     free(bits);
     free(expanded);
     if (e.solver)
@@ -1926,6 +1959,8 @@ static int cheapest_face_general_int(const LabModel *m, const double *lo, const 
         Encoder e = {.solver = kissat_init(), .variables = (int)nfree, .base_vars = (int)nfree,
                      .deadline = face_dl};
         kissat_reserve(e.solver, e.variables);
+        mpz_t capacity, product;
+        mpz_inits(capacity, product, NULL);
         Term *row = lab_alloc(max_row + 1, sizeof *row);
         int enc_ok = 1;
         for (size_t i = 0; i < m->rows && enc_ok; ++i) {
@@ -1946,36 +1981,29 @@ static int cheapest_face_general_int(const LabModel *m, const double *lo, const 
                 if (!upper)
                     cap = -cap;
                 size_t cnt = 0;
-                int64_t min_s = 0, max_s = 0;
-                int row_valid = 1;
+                mpz_set_si(capacity, (long)cap);
                 for (size_t p = start[i]; p < start[i + 1]; ++p) {
                     size_t j = rcol[p];
                     int64_t w = upper ? rcoef[p] : -rcoef[p];
                     if (!var_id[j]) {
-                        int64_t fx = (int64_t)clo[j];
-                        if (fx && w && llabs(w) > (INT64_MAX / 4) / llabs(fx)) {
-                            row_valid = 0;
-                            break;
-                        }
-                        cap -= fx * w;
+                        shift_rhs(capacity, product, w, (int64_t)clo[j]);
                     } else if (w) {
-                        row[cnt++] = (Term){var_id[j], w, 0};
                         if (w < 0)
-                            min_s += w;
-                        else
-                            max_s += w;
+                            shift_rhs(capacity, product, w, 1);
+                        row[cnt++] = (Term){w < 0 ? -var_id[j] : var_id[j], llabs(w), 0};
                     }
                 }
-                if (!row_valid)
-                    continue;
-                if (min_s > cap) {
+                if (mpz_sgn(capacity) < 0) {
                     enc_ok = 0;
                     break;
                 }
-                if (max_s > cap && e.clauses < MAX_CLAUSES - 100000)
-                    (void)at_most(&e, row, (int)cnt, cap);
+                /* This feasibility probe may relax a row. Its returned point is
+                 * checked on the original model before the box bound can close. */
+                if (e.clauses < MAX_CLAUSES - 100000)
+                    (void)at_most(&e, row, (int)cnt, nonnegative_capacity(capacity));
             }
         }
+        mpz_clears(capacity, product, NULL);
         free(row);
         if (enc_ok) {
             double *bits = lab_alloc(nfree, sizeof *bits);

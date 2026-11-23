@@ -263,6 +263,36 @@ class BinarySAT(unittest.TestCase):
             self.assertIn(r['status'], ('node_limit','time_limit'))
         self.assertLessEqual(r['sat_calls'],1)
 
+    def test_large_fixed_activities_cancel_in_each_encoding(self):
+        # Ten positive products exceed INT64_MAX before the other ten cancel.
+        k = 10**9
+        fixed = [k] * 10 + [-k] * 10
+        for upper, free in [(1, [1, 1, 0, 0, 0]), (2, [1, 1, 0, 0, 0]),
+                            (2, [1] * 5), (35, [-1, 1, 0, 0, 0])]:
+            for sign in (1, -1):
+                coeff = [sign * c for c in fixed + free]
+                data = model([0] * 20 + [1, 1, 0, 0, 0], [(coeff, sign, sign)])
+                data['bounds'] = [(k, k)] * 20 + [(0, upper)] + [(0, min(upper, 2))] * 4
+                with self.subTest(upper=upper, free=free, sign=sign):
+                    result, point = self.solve(data)
+                    self.assertEqual(point, mip_oracle(data))
+                    self.assertEqual((result['status'], result['search_route']), ('optimal', 'binary_sat'))
+                    self.assertEqual(result['best_bound'], point)
+
+    def test_fixed_activity_beyond_int64(self):
+        k = 10**9
+        # RHS minus the fixed activity lies outside int64_t. The two row
+        # directions are respectively redundant and impossible.
+        for sign in (-1, 1):
+            coeff = [sign * k] * 10 + [1, -1]
+            data = model([0] * 10 + [1, 1], [(coeff, None, 0), ([0] * 10 + [1, 1], 1, None)])
+            data['bounds'] = [(k, k)] * 10 + [(0, 2)] * 2
+            with self.subTest(sign=sign):
+                result, value = self.solve(data)
+                optimum = mip_oracle(data)
+                self.assertEqual(value, optimum)
+                self.assertEqual(result['status'], 'infeasible' if optimum is None else 'optimal')
+
     def test_no_backend_on_continuous_columns(self):
         m = model([1, 1], [([1, 1], F(1,2), None)])
         m['integer'][0] = False
