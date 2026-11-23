@@ -19,7 +19,8 @@ const char *lab_closure_name(LabClosure closure) {
 const char *lab_bound_origin_name(LabBoundOrigin origin) {
     static const char *const names[] = {
         "none", "backend_dual", "search_exhaustion", "structural_bound",
-        "integer_lattice", "open_nodes", "unique_point"
+        "integer_lattice", "open_nodes", "unique_point",
+        "objective_box", "source_equalities", "row_penalty", "sat_cutoff_unsat"
     };
     return names[origin];
 }

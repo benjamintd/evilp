@@ -218,3 +218,13 @@ Before autoresearch, keep evaluation in a separately controlled checkout/service
 Warm caches, laptop power management, thermal state, system load, and one seed
 limit performance interpretation. Multi-seed, longer-budget runs are confirmation
 work, not evidence supplied by this pilot.
+
+The binary SAT route reports the argument that closes its objective bound.
+`objective_box` means a feasible point reaches the best permitted column endpoints.
+`source_equalities` means an exact combination of original equalities fixes the
+objective. `row_penalty` identifies a lower bound on the penalty from satisfying
+the rows. `sat_cutoff_unsat` means the SAT search excluded the remaining better
+objective values. The same origin applies when an earlier unsatisfiable cutoff
+raised the bound and a later witness attained it. A limited probe can supply a
+witness. A subsequent route reports its own bound if it establishes one.
+Independent proof status comes from the checker.

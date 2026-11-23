@@ -1,9 +1,11 @@
 """Check the binary translation against independent enumeration and the original MPS."""
 from fractions import Fraction as F
 from pathlib import Path
+import hashlib
 import itertools
 import json
 import random
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -112,6 +114,7 @@ class BinarySAT(unittest.TestCase):
                 c for j, c in enumerate(costs) if j != 3 and (c > 0 if maximize else c < 0))
             self.assertEqual((r['status'], value), ('optimal', expected))
             self.assertEqual(r['sat_calls'], 1)
+            self.assertEqual(r['bound_origin'], 'objective_box')
 
     def test_relaxed_long_row_cannot_close_the_face(self):
         # The free variables are equal. Their sum cannot be 12 on the
@@ -137,6 +140,7 @@ class BinarySAT(unittest.TestCase):
         r, value = self.solve(model([1] * n, rows))
         self.assertEqual((r['status'], value), ('optimal', F(15, 8) + n // 4))
         self.assertIn(r['sat_calls'], (1, 2))
+        self.assertEqual(r['bound_origin'], 'row_penalty')
 
     def test_signed_row_charges_against_enumeration(self):
         # Three equal copies of six independent bits cross the PB objective
@@ -186,6 +190,62 @@ class BinarySAT(unittest.TestCase):
             result, checked = self.solve(data)
             self.assertGreater(result['sat_calls'], 0)
             self.assertEqual((result['status'], checked), ('optimal', data['offset'] + sign * 10))
+
+    def test_equality_bound_in_binary_and_bounded_integer_encodings(self):
+        for upper in (1, 3):
+            data = model([1] * 5, [([1] * 5, 2, 2)])
+            data['bounds'] = [(0, upper)] * 5
+            with self.subTest(upper=upper):
+                r, value = self.solve(data)
+                self.assertEqual(value, mip_oracle(data))
+                self.assertEqual((r['search_route'], r['bound_origin'], r['best_bound']),
+                                 ('binary_sat', 'source_equalities', value))
+
+    def test_objective_cutoff_and_interrupted_cutoff_in_runner(self):
+        # At most one of the five bits can be set. Two decisions leave an
+        # incumbent and an open native frontier. Four decisions close via SAT.
+        n = 5
+        rows = [([int(k in (i, j)) for k in range(n)], None, 1)
+                for i in range(n) for j in range(i)]
+        data = model([-1] * n, rows)
+        optimum = mip_oracle(data)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / 'clique.mps'
+            source.write_text(integer_mps(data))
+            digest = hashlib.sha256(source.read_bytes()).hexdigest()
+            suite = root / 'suite.tsv'
+            suite.write_text('id\tpath\tsha256\treference_status\treference_objective\n'
+                             f'clique\t{source}\t{digest}\t=opt=\t{float(optimum)}\n')
+            for limit in (2, 4):
+                with self.subTest(limit=limit):
+                    wrapper = root / f'solver-{limit}'
+                    wrapper.write_text(f'#!/bin/sh\nexec {shlex.quote(SOLVER)} "$@" --binary-sat --node-limit {limit}\n')
+                    wrapper.chmod(0o755)
+                    sha = hashlib.sha256(wrapper.read_bytes()).hexdigest()
+                    solvers = root / f'solvers-{limit}.tsv'
+                    solvers.write_text('solver\tbinary\tsha256\tversion\n'
+                                       f'lab\t{wrapper}\t{sha}\ttest\n')
+                    out = root / f'runs-{limit}'
+                    subprocess.run([Path(SOLVER).with_name('milpbench'), '--suite', suite,
+                                    '--solvers', solvers, '--checker', CHECKER, '--mip',
+                                    '--out', out, '--limit', '10'], check=True, capture_output=True)
+                    record = json.loads((out / 'runs.jsonl').read_text())
+                    cli = json.loads((out / 'clique/lab/seed-1/solver.log').read_text())
+                    self.assertEqual(record['claimed_status'], cli['status'])
+                    for field in ('search_route', 'closure_reason', 'bound_origin'):
+                        self.assertEqual(record[field], cli[field])
+                    self.assertTrue(record['checker']['checked_feasible'])
+                    self.assertEqual(F(record['checker']['objective']), optimum)
+                    self.assertFalse(record['checker']['certifies_optimality'])
+                    if limit == 2:
+                        self.assertEqual((cli['status'], cli['search_route'], cli['closure_reason'],
+                                          cli['bound_origin']), ('node_limit', 'native', 'none', 'open_nodes'))
+                        self.assertLess(cli['best_bound'], optimum)
+                    else:
+                        self.assertEqual((cli['status'], cli['search_route'], cli['closure_reason'],
+                                          cli['bound_origin']), ('optimal', 'binary_sat', 'matching_bound', 'sat_cutoff_unsat'))
+                        self.assertEqual(cli['best_bound'], optimum)
 
     def test_short_budget(self):
         n = 7

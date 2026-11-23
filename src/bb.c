@@ -1237,7 +1237,7 @@ void lab_bb_solve(const LabModel *model, const LabBbOptions *options, LabBbResul
                 result->objective = objective;
                 s.incumbent = score(&s,result->primal);
                 if (sat.status == LAB_MIP_OPTIMAL) {
-                    close_at_incumbent(&s, sat.route, sat.closure, LAB_BOUND_STRUCTURAL, "Exact binary constraint search closed; original witness checked");
+                    publish(&s, sat, "Exact binary constraint search closed; original witness checked");
                     trace(&s, node, "binary_sat_optimum", SIZE_MAX, objective, 1);
                     release(node);
                     goto cleanup;

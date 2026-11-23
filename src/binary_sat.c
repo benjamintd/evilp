@@ -1168,7 +1168,13 @@ static int order_lit(int base, int width, int neg, int v) {
  * non-binary variables all have finite integer domains (order-encoded for
  * width <= 32, binary-encoded for 32 < width <= 1048576). Handles exact
  * feasibility, infeasibility, constant-objective optimality, and PB optimization. */
-static int small_integer_sat(const LabModel *m, const double *lo, const double *hi, double deadline,
+/* An optimal outcome records the argument that excluded all better points. */
+typedef enum {
+    SAT_NO_RESULT, SAT_POINT, SAT_UNSAT, SAT_BOX_OPTIMUM, SAT_EQUALITY_OPTIMUM,
+    SAT_ROW_OPTIMUM, SAT_CUTOFF_OPTIMUM
+} SatOutcome;
+
+static SatOutcome small_integer_sat(const LabModel *m, const double *lo, const double *hi, double deadline,
                              size_t budget, double *point, size_t *calls) {
     enum {
         MAX_ORDER_WIDTH = 32,
@@ -1240,7 +1246,7 @@ static int small_integer_sat(const LabModel *m, const double *lo, const double *
         free(nbits);
         free(bin_enc);
         free(base);
-        return 0;
+        return SAT_NO_RESULT;
     }
     int const_obj = !has_obj || constant_objective_via_equalities(m, fmin(deadline, lab_now() + .5));
 
@@ -1380,7 +1386,8 @@ static int small_integer_sat(const LabModel *m, const double *lo, const double *
                  .deadline = deadline};
     Term *expanded = NULL;
     double *bits = NULL;
-    int result = 0, incumbent = 0;
+    SatOutcome result = SAT_NO_RESULT;
+    int incumbent = 0;
     if (!ok)
         goto done;
     if (e.solver)
@@ -1556,7 +1563,7 @@ static int small_integer_sat(const LabModel *m, const double *lo, const double *
         ++*calls;
         int status = bounded_solve(&e, total_bits, bits);
         if (status == 20) {
-            result = -1;
+            result = SAT_UNSAT;
         } else if (status == 10) {
             for (size_t j = 0; j < m->cols; ++j) {
                 int64_t val = col_lo[j];
@@ -1565,7 +1572,10 @@ static int small_integer_sat(const LabModel *m, const double *lo, const double *
                         val += bin_enc[j] ? (INT64_C(1) << t) : 1;
                 point[j] = (double)val;
             }
-            result = const_obj ? 1 : 2;
+            if (!has_obj)
+                result = SAT_BOX_OPTIMUM;
+            else
+                result = const_obj ? SAT_EQUALITY_OPTIMUM : SAT_POINT;
         }
     } else {
         int64_t pb_lo = 0, pb_hi = obj_total / obj_gcd;
@@ -1582,7 +1592,7 @@ static int small_integer_sat(const LabModel *m, const double *lo, const double *
             int64_t pb_probe = -1;
             if (incumbent) {
                 if (pb_lo >= pb_hi) {
-                    result = 1;
+                    result = pb_lo > 0 ? SAT_CUTOFF_OPTIMUM : SAT_BOX_OPTIMUM;
                     break;
                 }
                 if (pb_hi - pb_lo <= 1)
@@ -1653,19 +1663,19 @@ static int small_integer_sat(const LabModel *m, const double *lo, const double *
                 incumbent = 1;
                 pb_hi = new_hi;
                 if (pb_hi <= pb_lo) {
-                    result = 1;
+                    result = pb_lo > 0 ? SAT_CUTOFF_OPTIMUM : SAT_BOX_OPTIMUM;
                     break;
                 }
             } else if (status == 20) {
                 if (!incumbent) {
-                    result = -1;
+                    result = SAT_UNSAT;
                     break;
                 }
                 pb_lo = pb_probe + 1;
                 pb_step = 1;
                 pb_sat_streak = 0;
                 if (pb_lo >= pb_hi) {
-                    result = 1;
+                    result = pb_lo > 0 ? SAT_CUTOFF_OPTIMUM : SAT_BOX_OPTIMUM;
                     break;
                 }
             } else {
@@ -1693,7 +1703,7 @@ done:
     mpq_clear(q);
     if (result && lab_now() < deadline)
         return result;
-    return incumbent ? 2 : 0;
+    return incumbent ? SAT_POINT : SAT_NO_RESULT;
 }
 
 /* Fix all priced integer variables to their cheapest finite box endpoint,
@@ -1999,12 +2009,12 @@ static int cheapest_face_general_int(const LabModel *m, const double *lo, const 
     return solved && lab_now() < deadline;
 }
 
-static int solve_binary_sat(const LabModel *m, const double *lo, const double *hi, double deadline,
+static SatOutcome solve_binary_sat(const LabModel *m, const double *lo, const double *hi, double deadline,
                    size_t budget, double *point, size_t *calls) {
     *calls = 0;
     if (!m->cols || m->cols > MAX_TERMS || m->rows > MAX_TERMS || m->nnz > MAX_TERMS || !budget ||
         lab_now() >= deadline)
-        return 0;
+        return SAT_NO_RESULT;
     int all_int = 1, has_nonbinary = 0;
     for (size_t j = 0; j < m->cols; ++j) {
         if (!m->integer[j]) {
@@ -2017,10 +2027,10 @@ static int solve_binary_sat(const LabModel *m, const double *lo, const double *h
             has_nonbinary = 1;
     }
     if (!all_int)
-        return 0;
+        return SAT_NO_RESULT;
     if (has_nonbinary) {
         if (cheapest_face_general_int(m, lo, hi, deadline, budget, point, calls))
-            return 1;
+            return SAT_BOX_OPTIMUM;
         return small_integer_sat(m, lo, hi, deadline, budget, point, calls);
     }
     Objective cost = {0};
@@ -2034,7 +2044,8 @@ static int solve_binary_sat(const LabModel *m, const double *lo, const double *h
     unsigned char *interior = NULL;
     double *trial = NULL;
     Region *regions = NULL;
-    int result = 0, incumbent = 0, face_only = 0, try_face = 0;
+    SatOutcome result = SAT_NO_RESULT;
+    int incumbent = 0, face_only = 0, try_face = 0;
     signed char *fixed = lab_alloc(m->cols, sizeof *fixed);
     int const_obj = constant_objective_via_equalities(m, fmin(deadline, lab_now() + .5));
     for (size_t j = 0; j < m->cols; ++j) {
@@ -2139,17 +2150,20 @@ static int solve_binary_sat(const LabModel *m, const double *lo, const double *h
     int64_t pb_lo = pb_mode ? row_penalty_bound(m, lo, hi, start, terms, row_scale, &cost,
                                                fmin(deadline, lab_now() + .1)) : 0;
     /* A positive bound already excludes every cheapest-face assignment. */
+    SatOutcome lower_origin = pb_lo > 0 ? SAT_ROW_OPTIMUM : SAT_BOX_OPTIMUM;
     if ((try_face || face_only) && !pb_lo) {
         double face_dl = face_only
                              ? fmin(orig_deadline, lab_now() + fmin(10.0, .40 * (orig_deadline - lab_now())))
                              : fmin(orig_deadline, lab_now() + fmin(0.8, .12 * (orig_deadline - lab_now())));
         int faced = cheapest_face(m, start, terms, row_scale, row, fixed, face_dl, budget, point, calls);
         if (faced > 0) {
-            result = 1;
+            result = SAT_BOX_OPTIMUM;
             goto done;
         }
-        if (faced < 0 && pb_mode)
+        if (faced < 0 && pb_mode) {
             pb_lo = 1;
+            lower_origin = SAT_CUTOFF_OPTIMUM;
+        }
         if (face_only) {
             /* Before giving up on a large-objective pure-binary model, run one
              * fast feasibility check; UNSAT on a relaxation proves infeasibility. */
@@ -2170,7 +2184,7 @@ static int solve_binary_sat(const LabModel *m, const double *lo, const double *h
                     ++*calls;
                     int st = bounded_solve(&ef, m->cols, NULL);
                     if (st == 20)
-                        result = -1;
+                        result = SAT_UNSAT;
                 }
                 kissat_release(ef.solver);
             }
@@ -2230,7 +2244,7 @@ static int solve_binary_sat(const LabModel *m, const double *lo, const double *h
         if (pb_mode && incumbent) {
             if (pb_lo >= pb_hi) {
                 kissat_release(e.solver);
-                result = 1;
+                result = lower_origin;
                 break;
             }
             if (pb_hi - pb_lo <= 1)
@@ -2336,13 +2350,13 @@ static int solve_binary_sat(const LabModel *m, const double *lo, const double *h
                 incumbent = 1;
                 pb_hi = new_hi;
                 if (pb_hi <= pb_lo)
-                    result = 1;
+                    result = lower_origin;
             } else {
                 incumbent = 1;
                 seed = 0;
                 local_deadline = lab_now() + .6 * (deadline - lab_now());
                 if (!mpq_sgn(cost.cutoff))
-                    result = 1;
+                    result = const_obj ? SAT_EQUALITY_OPTIMUM : SAT_BOX_OPTIMUM;
                 else if (cost.n > 1 && m->cols > 512 && !regions) {
                     regions = lab_alloc(4096, sizeof *regions);
                     regions_count =
@@ -2352,12 +2366,13 @@ static int solve_binary_sat(const LabModel *m, const double *lo, const double *h
         } else if (status == 20) {
             if (pb_mode && incumbent) {
                 pb_lo = pb_probe + 1;
+                lower_origin = SAT_CUTOFF_OPTIMUM;
                 pb_step = 1;
                 pb_sat_streak = 0;
                 if (pb_lo >= pb_hi)
-                    result = 1;
+                    result = lower_origin;
             } else {
-                result = incumbent ? 1 : -1;
+                result = incumbent ? SAT_CUTOFF_OPTIMUM : SAT_UNSAT;
             }
         }
         kissat_release(e.solver);
@@ -2381,22 +2396,42 @@ done:
     free(row);
     if (result && lab_now() < deadline)
         return result;
-    return incumbent ? 2 : 0;
+    return incumbent ? SAT_POINT : SAT_NO_RESULT;
 }
 
 LabSearchResult lab_binary_sat(const LabModel *m, const double *lo, const double *hi, double deadline,
                    size_t budget, double *point, size_t *calls) {
-    int found = solve_binary_sat(m, lo, hi, deadline, budget, point, calls);
+    SatOutcome found = solve_binary_sat(m, lo, hi, deadline, budget, point, calls);
     LabSearchResult r = {.route = "binary_sat"};
-    if (found < 0) {
+    switch (found) {
+    case SAT_NO_RESULT:
+        return r;
+    case SAT_UNSAT:
         r.status = LAB_MIP_INFEASIBLE;
         r.closure = LAB_CLOSE_UNSAT;
-    } else if (found > 0) {
+        return r;
+    case SAT_POINT:
         r.point = point;
-        if (found == 1) {
-            r.status = LAB_MIP_OPTIMAL;
-            r.closure = LAB_CLOSE_MATCHING_BOUND;
-        }
+        return r;
+    case SAT_EQUALITY_OPTIMUM:
+        r.bound.origin = LAB_BOUND_SOURCE_EQUALITIES;
+        break;
+    case SAT_BOX_OPTIMUM:
+        r.bound.origin = LAB_BOUND_OBJECTIVE_BOX;
+        break;
+    case SAT_ROW_OPTIMUM:
+        r.bound.origin = LAB_BOUND_ROW_PENALTY;
+        break;
+    case SAT_CUTOFF_OPTIMUM:
+        r.bound.origin = LAB_BOUND_SAT_CUTOFF;
+        break;
     }
+    r.point = point;
+    if (lab_source_objective_value(m, point, &r.bound.value)) {
+        r.bound = (LabSearchBound){0};
+        return r;
+    }
+    r.status = LAB_MIP_OPTIMAL;
+    r.closure = LAB_CLOSE_MATCHING_BOUND;
     return r;
 }
