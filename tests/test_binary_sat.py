@@ -1,6 +1,7 @@
 """Check the binary translation against independent enumeration and the original MPS."""
 from fractions import Fraction as F
 from pathlib import Path
+import itertools
 import json
 import random
 import subprocess
@@ -75,6 +76,14 @@ class BinarySAT(unittest.TestCase):
             self.assertEqual(value, mip_oracle(m))
             self.assertGreater(r['sat_calls'],0)
 
+    def test_minimum_int64_coefficient_uses_exact_fallback(self):
+        n = 24
+        data = model([1] * n, [([1] * n, 5, None),
+                               ([-(1 << 63), 1] + [0] * (n - 2), None, 0)])
+        result, checked = self.solve(data)
+        self.assertGreater(result['sat_calls'], 0)
+        self.assertEqual((result['status'], checked), ('optimal', data['offset'] + 5))
+
     def test_large_relaxations_keep_the_full_witness(self):
         n = 540
         def row(entries, lo, hi):
@@ -116,6 +125,67 @@ class BinarySAT(unittest.TestCase):
         m = model([1] * 17 + [0] * 24, rows)
         r, value = self.solve(m)
         self.assertEqual((r['status'], value), ('optimal', m['offset'] + 1))
+
+    def test_disjoint_and_overlapping_cover_bound(self):
+        n = 64
+        rows = []
+        for start in range(0, n, 2):
+            a = [0] * n
+            for k in range(4):
+                a[(start + k) % n] = 1
+            rows.append((a, 1, None))
+        r, value = self.solve(model([1] * n, rows))
+        self.assertEqual((r['status'], value), ('optimal', F(15, 8) + n // 4))
+        self.assertIn(r['sat_calls'], (1, 2))
+
+    def test_signed_row_charges_against_enumeration(self):
+        # Three equal copies of six independent bits cross the PB objective
+        # threshold while retaining a small exact oracle. The final two
+        # variables have a fixed priced value and a free zero-cost value.
+        rng = random.Random(34019)
+        for case in range(16):
+            cost = [F(rng.choice([-4, -2, 1, 3]), 2) for _ in range(18)] + [2, 0]
+            planted = [rng.randrange(2) for _ in range(6)] * 3 + [1, 1]
+            rows = []
+            for i in range(8):
+                a = [F(rng.randint(-3, 3), 10) for _ in cost]
+                b = sum(x * c for x, c in zip(planted, a))
+                lo = b - F(rng.randrange(4), 10) if i % 3 != 0 else None
+                hi = b + F(rng.randrange(4), 10) if i % 3 != 1 else None
+                rows.append((a, lo, hi))
+            for j in range(6, 18):
+                a = [0] * len(cost)
+                a[j], a[j % 6] = 1, -1
+                rows.append((a, 0, 0))
+            m = model(cost, rows, maximize=bool(case % 2))
+            m['bounds'][-2] = (1, 1)
+            attainable = []
+            for bits in itertools.product((0, 1), repeat=7):
+                x = bits[:6] * 3 + (1, bits[6])
+                acts = [sum(c * v for c, v in zip(a, x)) for a, _, _ in rows[:8]]
+                if all((lo is None or lo <= y) and (hi is None or y <= hi)
+                       for y, (_, lo, hi) in zip(acts, rows)):
+                    attainable.append(m['offset'] + sum(c * v for c, v in zip(cost, x)))
+            expected = (max if m['maximize'] else min)(attainable)
+            with self.subTest(case=case):
+                result, checked = self.solve(m)
+                self.assertEqual((result['status'], checked), ('optimal', expected))
+
+    def test_fractional_cost_per_unit_on_overlapping_weighted_rows(self):
+        # Five units of penalty buy eight units of activity (5 + 3).
+        # At the cheapest ratio 3/5, a block needs ceil(8 * 3/5) = 5.
+        # The third row crosses both blocks and reuses their priced bits.
+        gains = [5, 1, 3] * 10
+        left = gains + [0] * 30
+        right = [0] * 30 + gains
+        overlap = gains[:15] + [0] * 30 + gains[15:]
+        for maximize in (False, True):
+            sign = -1 if maximize else 1
+            cost = [sign * w for w in [3, 1, 2] * 20]
+            data = model(cost, [(a, 8, None) for a in (left, right, overlap)], maximize)
+            result, checked = self.solve(data)
+            self.assertGreater(result['sat_calls'], 0)
+            self.assertEqual((result['status'], checked), ('optimal', data['offset'] + sign * 10))
 
     def test_short_budget(self):
         n = 7
@@ -209,8 +279,8 @@ class BinarySAT(unittest.TestCase):
         r, v = self.solve(m)
         self.assertEqual(r['status'], 'optimal', r)
         self.assertGreater(r['sat_calls'], 0)
-        # Verify exact optimality against native B&B (--no-binary-sat --no-root-diving)
-        r_nat, v_nat = self.solve(m, ['--no-binary-sat', '--no-root-diving'])
+        # Verify exact optimality against native B&B (--no-binary-sat --no-scip)
+        r_nat, v_nat = self.solve(m, ['--no-binary-sat', '--no-scip'])
         self.assertEqual(r_nat['status'], 'optimal', r_nat)
         self.assertEqual(v, v_nat)
 

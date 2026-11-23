@@ -86,7 +86,7 @@ int main(int argc, char **argv) {
              "          [--no-primal-repair] [--no-updates] [--bland-pricing] [--adaptive-pricing|--legacy-pricing] [--fast-residual|--full-residual] [--crash-basis] [--glpk-basis|--no-glpk-basis] [--packing-bounds|--no-packing-bounds] [--keep-bound-rows]\n"
              "          LP: [--dual NEW_FILE] [--farkas NEW_FILE] [--basis NEW_FILE] [--read-basis FILE]\n"
              "          MILP: [--node-limit N] [--cold] [--trace NEW_FILE]\n"
-             "                [--no-presolve] [--first-fractional] [--no-root-cuts] [--no-root-diving] [--no-objective-lattice]\n"
+             "                [--no-scip] [--no-presolve] [--first-fractional] [--no-root-cuts] [--no-root-diving] [--no-objective-lattice]\n"
 #ifdef LAB_KISSAT
              "                [--binary-sat|--no-binary-sat]\n"
 #endif
@@ -98,7 +98,7 @@ int main(int argc, char **argv) {
     const char *path = NULL, *solution = NULL, *dual = NULL, *trace_path = NULL, *farkas = NULL;
     int relax = 0, mip = 0, cold = 0, node_limit_set = 0, dimension_limit_set = 0;
     int binary_sat = 0, no_objective_lattice = 0;
-    int no_presolve = 0, first_fractional = 0, no_root_cuts = 0, no_root_diving = 0;
+    int no_scip = 0, no_presolve = 0, first_fractional = 0, no_root_cuts = 0, no_root_diving = 0;
     int basis_initializer_set = 0, pricing_set = 0, residual_set = 0, packing_set = 0;
     size_t node_limit = 10000000;
     LabLpOptions options = {.time_limit = 60, .iteration_limit = 100000,
@@ -156,6 +156,8 @@ int main(int argc, char **argv) {
         } else if (!strcmp(a, "--binary-sat") || !strcmp(a, "--no-binary-sat")) {
             binary_sat = !strcmp(a, "--binary-sat") ? 1 : -1;
 #endif
+        } else if (!strcmp(a, "--no-scip")) {
+            no_scip = 1;
         } else if (!strcmp(a, "--no-presolve")) {
             no_presolve = 1;
         } else if (!strcmp(a, "--first-fractional")) {
@@ -225,7 +227,7 @@ int main(int argc, char **argv) {
         return error("input_error",
                      "Dual/basis files are LP-only; MILP tree proofs are not implemented", 2);
     if (!mip && (binary_sat || cold || node_limit_set || trace_path || no_presolve || first_fractional ||
-                 no_root_cuts || no_objective_lattice))
+                 no_scip || no_root_diving || no_root_cuts || no_objective_lattice))
         return error("input_error", "Cold search, node limits and traces require --mip", 2);
     if (options.dense && !dimension_limit_set)
         options.max_dimension = LAB_LP_DENSE_DIMENSION_LIMIT;
@@ -268,6 +270,7 @@ int main(int argc, char **argv) {
                                    .node_limit = node_limit,
                                    .sat_decision_limit = node_limit_set ? node_limit : 200000000,
                                    .cold = cold,
+                                   .no_scip = no_scip,
                                    .no_presolve = no_presolve,
                                    .binary_sat = binary_sat,
                                    .no_objective_lattice = no_objective_lattice,
@@ -288,6 +291,21 @@ int main(int argc, char **argv) {
         lab_json_string(stdout, r.status);
         printf(",\"message\":");
         lab_json_string(stdout, r.message);
+        printf(",\"search_route\":");
+        lab_json_string(stdout, r.search.route);
+        printf(",\"closure_reason\":");
+        lab_json_string(stdout, lab_closure_name(r.search.closure));
+        printf(",\"bound_origin\":");
+        lab_json_string(stdout, lab_bound_origin_name(r.search.bound.origin));
+        printf(",\"bound_scope\":\"%s\"", r.has_bound ? "original_mip" : "none");
+        printf(",\"scip_path_cliques\":%zu", r.scip_path_cliques);
+        fputs(",\"scip_route\":", stdout);
+        lab_json_string(stdout, r.scip_route);
+        fputs(",\"scip_fallback_reason\":", stdout);
+        if (r.scip_fallback_reason)
+            lab_json_string(stdout, r.scip_fallback_reason);
+        else
+            fputs("null", stdout);
         printf(",\"relaxation\":false,\"certifies_optimality\":false,\"bound_certified\":false,"
                "\"solver_status_is_claim\":true,\"model_sha256\":");
         lab_json_string(stdout, hash);

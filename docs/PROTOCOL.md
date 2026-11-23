@@ -96,6 +96,15 @@ solver logs, solutions, or timings. Report these with report.py --runs
 revalidated.jsonl --prefix validated. Freeze the original evaluator from its
 Git tag and record the revalidation evaluator separately.
 
+Each new run records the checker argument vector and SHA-256 digests for
+the primal and dual files it retains. Replay verifies those digests and the
+model hash, substitutes the selected checker, and resolves evidence paths in
+the current run directory. For older records it reconstructs the original
+adapter format and relaxation mode from the run metadata. A dual-only run can
+reproduce a certified LP bound. A checker invocation failure or a missing or
+changed recorded artifact produces an error row and a nonzero revalidation
+exit. Runs that produced no evidence appear separately in the summary.
+
 The Cbc adapter explicitly passes the MPS objective sense, because Cbc's reader
 ignores OBJSENSE. Maximization regression tests guard this behavior. The pinned
 MIPLIB benchmark models use minimization; this adapter correction does not
@@ -107,6 +116,89 @@ MILP adapters; native LP crosschecks provide continuous MPS models in a separate
 run directory. MIP mode permits the lab alongside HiGHS, SCIP and Cbc and checks
 integrality normally. Lab MILP best_bound values remain uncertified numerical
 claims; no complete branch-and-bound proof is logged.
+
+On the general SCIP route, a terminal optimal, gap-limit, time-limit or
+node-limit result publishes SCIP's finite dual bound in original objective
+units, or null when unavailable. A checked incumbent can differ from that
+bound even when the solver reports optimality. The runner retains the number
+in `reported_dual_bound`. Replay and reporting compare it with checked
+witnesses under the evaluator's existing policy. A general SCIP attempt that
+hands control back to native search contributes no terminal bound of its own.
+
+The MIP JSON, runner ledger, replay and report carry four provenance fields.
+
+| Field | Interpretation |
+| --- | --- |
+| `search_route` | Search that supplied the final verdict. An abandoned SCIP attempt can precede a native verdict. |
+| `closure_reason` | How that route closed, such as a backend status, exhaustion or a matching structural bound. A limit has no closure. |
+| `bound_origin` | How the route obtained its bound, such as the backend dual, an open frontier or exhaustion. |
+| `bound_scope` | `original_mip` for a published original-objective MIP bound and `none` when no bound is available. |
+
+Missing provenance in older records stays null. The evaluator reports a relative
+gap only when a checked objective and a compatible bound have usable signs, a
+clean process result and consistent evidence. Equal values give zero. For two
+nonzero values of the same sign, the gap is the directed difference divided by
+the smaller absolute value. The gap is descriptive and carries no proof credit.
+
+## Verifying a candidate and replaying fleet controls
+
+The default optional SCIP build and feature CI use the lock named in
+[`candidate-scip-lock.txt`](../config/candidate-scip-lock.txt). Configure a Release
+build with that dependency, GLPK and Kissat, build all targets, then run:
+
+```sh
+python3 scripts/verify_candidate.py --build "$BUILD" --out "$OUT/release.json"
+python3 scripts/check_fleet_release.py --build "$BUILD" \
+  --verification "$OUT/release.json" --out "$OUT/fleet"
+```
+
+Use fresh output paths. Verification binds the tested executables and dependency
+archives to the CTest results. The fleet check rechecks the historical controls
+on the original models, runs the six locked snapshots at 60 seconds each, and
+scores the results against the archived witnesses. Its `release-check.json`
+lists the outcome of every attempt. A checked schedule from a timeout can
+disprove another solver's claim while the timed-out search remains unresolved.
+The archives are available only on hosts holding the private fleet inputs.
+
+## Generating matched runs and development panels
+
+Use a suite TSV with locked model hashes and references, and a solver TSV
+with the paths and digests of the Lab and HiGHS executables. Use a fresh
+directory for each invocation. The runner alternates solver order by instance
+and records the campaign, budget, host, engine configurations and evaluator
+hashes before launching the first pair. It keeps both solvers' witnesses.
+The timed interval covers the solver process. Checking and file hashing happen
+outside that interval.
+
+```sh
+milpbench --mip --paired --suite "$SUITE" --solvers "$SOLVERS" \
+  --checker "$CHECKER" --limit 60 --grace 5 --out "$OUT"
+python3 scripts/benchmark_gate.py --runs "$OUT/runs.jsonl" \
+  --baseline-runs "$OUT/runs.jsonl" --campaign "$OUT/campaign.json" \
+  --panel-suite "$SUITE" --out "$OUT/panel-score.json"
+```
+
+This command records a development panel. The score lists checked feasibility,
+reference agreement, completion and timeouts for each engine. A complete panel
+ledger means every selected model has one attempt per solver. For a formal run,
+use the full locked suite, add `--quiescent` only on a reserved idle host, and
+omit `--panel-suite` when scoring. The operator attests that the host is idle.
+The gate also requires matching run identities and usable suspension readings.
+A standalone candidate completion inventory passes
+`--candidate-config "$OUT/lab-config.json"` to the gate.
+
+Lab configuration records capture `LAB_SUBSCIP_FRAC`, phase tracing and the
+contents of `LAB_SCIP_SET` when provided. The runner executes against the
+saved parameter file. Paired runs use the built-in SCIP parameter profile
+and require phase tracing to be off. The configuration digest binds the
+runner's adapter defaults to the solver binary and the chosen budget.
+
+For solver diagnostics, `milpsolve --mip --no-scip` opts out of both SCIP
+routes. The MIP JSON field `scip_route` records dispatch and `scip_fallback_reason` identifies why general search returned
+control to the native solver. Enabling `--trace`
+records the general SCIP boundary and native events. The trace does not
+contain an independent SCIP tree certificate. The `--no-root-cuts` and
+`--no-root-diving` switches control the native heuristics.
 
 ## Reproducibility boundaries
 

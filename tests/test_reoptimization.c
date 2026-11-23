@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 /* These tests build original models independently of the optimizer reader.
  * Every warm result is checked against both a cold solve and a known optimum. */
@@ -144,6 +145,47 @@ static void bounded_sequence(int dense) {
     require(original_lo[0] == 0 && original_lo[1] == 0 && original_hi[0] == 5 &&
                 original_hi[1] == 5,
             "session overlays must not mutate original model bounds");
+    /* Start from the root again. Roll back multiple edits to the same
+     * column and a conflicting bound, then attach an owned sparse cut. */
+    set_bounds(s, 0, lo, hi, 0, 5);
+    set_bounds(s, 1, lo, hi, 0, 5);
+    compare(s, &m, &opt, lo, hi, "optimal", 13, -1, 0);
+    require(!lab_lp_session_set_tolerances(s, 1e-12, 1e-12), "tighten native LP policy in place");
+    compare(s, &m, &opt, lo, hi, "optimal", 13, 1, 0);
+    size_t column = 1;
+    double coefficient = 1;
+    LabSparseRow cut = {"limit_y", 1, &column, &coefficient, -INFINITY, 2};
+    LabAugmentLimits limits = {16, 32, 4};
+    require(lab_lp_session_begin_probe(s) == 0 && lab_lp_session_begin_probe(s) != 0,
+            "probe is exclusive");
+    require(lab_lp_session_append_rows(s, 1, &cut, &limits) == LAB_AUGMENT_INVALID,
+            "structural edits cannot leak from tentative bounds");
+    set_bounds(s, 0, lo, hi, 2, 5);
+    compare(s, &m, &opt, lo, hi, "optimal", 12, 1, 1);
+    set_bounds(s, 0, lo, hi, 4, 2);
+    compare(s, &m, &opt, lo, hi, "infeasible", 0, -1, 0);
+    require(lab_lp_session_rollback_probe(s) == 0 && lab_lp_session_rollback_probe(s) != 0,
+            "probe restores the parent exactly once");
+    lo[0] = 0;
+    hi[0] = 5;
+    compare(s, &m, &opt, lo, hi, "optimal", 13, 1, 0);
+    set_bounds(s, 0, lo, hi, 0, 2);
+    compare(s, &m, &opt, lo, hi, "optimal", 13, 1, 0);
+    require(lab_lp_session_append_rows(s, 1, &cut, &limits) == LAB_AUGMENT_OK,
+            "append a sparse cut on an edited domain");
+    const LabModel *domain = lab_lp_session_domain(s);
+    coefficient = 99;
+    require(domain->cols == 2 && domain->rows == 2 && domain->col_upper[0] == 5 && m.rows == 1,
+            "matrix copy has immutable parent bounds and owns cut storage");
+    compare(s, domain, &opt, lo, hi, "optimal", 10, 1, 1);
+    require(lab_lp_session_append_rows(s, 1, &cut, &limits) == LAB_AUGMENT_INVALID &&
+            lab_lp_session_domain(s) == domain, "rejected duplicate preserves the live matrix");
+    set_bounds(s, 0, lo, hi, 0, 5);
+    compare(s, domain, &opt, lo, hi, "optimal", 11.5, 1, 0);
+    LabSparseRow impossible = {"zero_equals_one", 0, NULL, NULL, 1, 1};
+    require(lab_lp_session_append_rows(s, 1, &impossible, &limits) == LAB_AUGMENT_OK,
+            "empty sparse row represents a constant constraint");
+    compare(s, lab_lp_session_domain(s), &opt, lo, hi, "infeasible", 0, -1, 0);
     lab_lp_session_free(s);
 }
 static void free_and_redundant(int dense) {
@@ -231,6 +273,12 @@ static void basis_identity_is_required_before_io(int dense) {
                   .integer = integer,
                   .col_start = start};
     LabLpOptions opt = options(dense);
+    opt.primal_tolerance = 1e-2;
+    require(!lab_lp_session_create(&m, &opt), "loose primal policy rejected");
+    opt.primal_tolerance = 1e-12;
+    opt.dual_relative_tolerance = NAN;
+    require(!lab_lp_session_create(&m, &opt), "nonfinite dual policy rejected");
+    opt.dual_relative_tolerance = 1e-12;
     opt.model_sha256 = NULL;
     opt.basis_in = "must-not-be-opened.bas";
     require(lab_lp_session_create(&m, &opt) == NULL,
@@ -358,9 +406,45 @@ static void warm_rhs_must_not_underflow_to_zero(int dense) {
     lab_lp_result_free(&restored);
     lab_lp_session_free(s);
 }
+/* No binary64 point satisfies 3*x=1 exactly. Tightening the live primal
+ * policy below its representable residual must withdraw the old answer. */
+static void tighten_source_policy(int dense) {
+    char filename[] = "/tmp/milp-session-policy-XXXXXX";
+    int fd = mkstemp(filename);
+    require(fd >= 0, "create source policy fixture");
+    FILE *file = fdopen(fd, "w");
+    require(file != NULL, "open source policy fixture");
+    fputs("NAME THIRDS\nROWS\n N OBJ\n E EQ\nCOLUMNS\n x OBJ 1 EQ 3\n"
+          "RHS\n b EQ 1\nENDATA\n", file);
+    require(fclose(file) == 0, "write source policy fixture");
+    LabModel model = {0};
+    int failed = lab_model_read(&model, filename);
+    unlink(filename);
+    require(!failed && model.exact, "retain exact source coefficients");
+    LabLpOptions opt = options(dense);
+    opt.no_exact = 1;
+    LabLpSession *s = lab_lp_session_create(&model, &opt);
+    LabLpResult result;
+    lab_lp_session_solve(s, &result);
+    require(!strcmp(result.status, "optimal") && result.primal_residual > 1e-20,
+            "default tolerance accepts the representable third");
+    lab_lp_result_free(&result);
+    require(!lab_lp_session_set_tolerances(s, 1e-20, 1e-12), "tightened policy accepted");
+    lab_lp_session_solve(s, &result);
+    require(!strcmp(result.status, "numerical_failure") && !result.has_primal,
+            "source residual rejects the previous warm and cold candidate");
+    lab_lp_result_free(&result);
+    require(!lab_lp_session_set_tolerances(s, 0, 0), "restore default policy");
+    lab_lp_session_solve(s, &result);
+    require(!strcmp(result.status, "optimal") && result.has_primal, "same session recovers");
+    lab_lp_result_free(&result);
+    lab_lp_session_free(s);
+    lab_model_free(&model);
+}
 int main(void) {
     for (int dense = 0; dense <= 1; dense++) {
         bounded_sequence(dense);
+        tighten_source_policy(dense);
         free_and_redundant(dense);
         generated_bound_sequences(dense);
         cumulative_deadline(dense);

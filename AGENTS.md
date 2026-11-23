@@ -1,5 +1,7 @@
 # Working on MILP Lab
 
+Start with the first open item in the [solver correctness plan](docs/SOLVER-CORRECTNESS-PLAN.md) before taking on new solver performance work.
+
 - Keep the numerical engine, independent checker, and process runner in C17.
   Python is for setup, test oracles and reporting, not optimization inside a run.
 - The checker must not link an optimization solver or reuse solver feasibility
@@ -18,3 +20,6 @@
   numerical failures and unchecked or invalid witnesses are not benchmark passes.
 - Keep fetched datasets, binaries and build trees outside the tracked source set.
   Imported artifacts retain their own licenses; do not relabel them as MIT.
+
+- See [the evaluator and LP session work plan](docs/ARCHITECTURE-WORK.md)
+  when changing run classification or the native reoptimization interface.

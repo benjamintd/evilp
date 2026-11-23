@@ -9,3 +9,38 @@ jobs:
       - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DLAB_SANITIZE=ON
       - run: cmake --build build -j 2
       - run: ctest --test-dir build --output-on-failure
+  feature-contracts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - run: sudo apt-get update && sudo apt-get install -y libgmp-dev zlib1g-dev
+      - name: Build the locked SCIP, GLPK and Kissat profile
+        shell: bash
+        run: |
+          set -euo pipefail
+          deps="$RUNNER_TEMP/milp-deps"
+          mkdir "$deps"
+          for name in glpk kissat; do
+            lock="config/${name}-source-v1.lock.json"
+            if [[ "$name" == kissat ]]; then lock=config/kissat-source-v2.lock.json; fi
+            archive="$deps/$name.tar.gz"
+            curl -fsSL --retry 3 "$(jq -r .source_url "$lock")" -o "$archive"
+            echo "$(jq -r .archive_sha256 "$lock")  $archive" | sha256sum --check
+            mkdir "$deps/$name"
+            tar xzf "$archive" -C "$deps/$name" --strip-components=1
+          done
+          patch_path=$(jq -r '.upstream_changes[0].path' config/kissat-source-v2.lock.json)
+          echo "$(jq -r '.upstream_changes[0].sha256' config/kissat-source-v2.lock.json)  $patch_path" | sha256sum --check
+          patch -d "$deps/kissat" -p1 < "$patch_path"
+          (cd "$deps/kissat" && ./configure --safe --quiet && make -j2)
+          (cd "$deps/glpk" && ./configure --disable-shared --enable-static && make -j2)
+          lock=$(cat config/candidate-scip-lock.txt)
+          curl -fsSL --retry 3 "$(jq -r '.sources[0].url' "$lock")" -o "$deps/scip.tar.gz"
+          curl -fsSL --retry 3 "$(jq -r '.sources[1].url' "$lock")" -o "$deps/qsopt.tar.gz"
+          python3 scripts/build_scip_integer.py --lock "$lock" --scip-archive "$deps/scip.tar.gz" \
+            --qsopt-archive "$deps/qsopt.tar.gz" --out "$deps/engine" --jobs 2
+          cmake -S . -B build-feature -C "$deps/engine/lab-cache.cmake" -DCMAKE_BUILD_TYPE=Release \
+            -DLAB_GLPK_BASIS=ON -DGLPK_INCLUDE_DIR="$deps/glpk/src" -DGLPK_LIBRARY="$deps/glpk/src/.libs/libglpk.a" \
+            -DLAB_KISSAT=ON -DKISSAT_INCLUDE_DIR="$deps/kissat/src" -DKISSAT_LIBRARY="$deps/kissat/build/libkissat.a"
+      - run: cmake --build build-feature -j2
+      - run: python3 scripts/verify_candidate.py --build build-feature --out "$RUNNER_TEMP/candidate-verification.json"

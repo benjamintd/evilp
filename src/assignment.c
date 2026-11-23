@@ -464,6 +464,29 @@ done:
     mpq_clears(sum, q, NULL);
     return ok;
 }
+static Assignment assignment_graph(const LabModel *m, double deadline) {
+    Assignment g = {.m = m, .deadline = deadline};
+    g.offset = lab_alloc(m->rows + 1, sizeof *g.offset);
+    g.cover = lab_alloc(m->rows, sizeof *g.cover);
+    g.left = lab_alloc(m->cols, sizeof *g.left);
+    g.right = lab_alloc(m->cols, sizeof *g.right);
+    g.potential = lab_alloc(m->cols, sizeof *g.potential);
+    g.entry = lab_alloc(m->nnz, sizeof *g.entry);
+    g.column = lab_alloc(m->nnz, sizeof *g.column);
+    return g;
+}
+
+static void free_assignment_graph(Assignment *g) {
+    free(g->offset);
+    free(g->cover);
+    free(g->left);
+    free(g->right);
+    free(g->potential);
+    free(g->entry);
+    free(g->column);
+    free(g->edge);
+}
+
 int lab_assignment_solve(const LabModel *m, const double *lower, const double *upper,
                          double deadline, size_t limit, double *point, char ***decimal,
                          size_t *trials) {
@@ -489,14 +512,7 @@ int lab_assignment_solve(const LabModel *m, const double *lower, const double *u
     }
     if (!ni || m->cols - ni > MAX_POTENTIALS || m->nnz < 2 * ni)
         return 0;
-    Assignment g = {.m = m, .deadline = deadline};
-    g.offset = lab_alloc(m->rows + 1, sizeof *g.offset);
-    g.cover = lab_alloc(m->rows, sizeof *g.cover);
-    g.left = lab_alloc(m->cols, sizeof *g.left);
-    g.right = lab_alloc(m->cols, sizeof *g.right);
-    g.potential = lab_alloc(m->cols, sizeof *g.potential);
-    g.entry = lab_alloc(m->nnz, sizeof *g.entry);
-    g.column = lab_alloc(m->nnz, sizeof *g.column);
+    Assignment g = assignment_graph(m, deadline);
     int ok = 0;
     if (recognize(&g, upper)) {
         double *penalty = lab_alloc(m->cols, sizeof *penalty);
@@ -531,13 +547,10 @@ int lab_assignment_solve(const LabModel *m, const double *lower, const double *u
         free(penalty);
         free(arcs);
     }
-    free(g.offset);
-    free(g.cover);
-    free(g.left);
-    free(g.right);
-    free(g.potential);
-    free(g.entry);
-    free(g.column);
-    free(g.edge);
+    free_assignment_graph(&g);
     return ok;
 }
+
+#ifdef LAB_SCIP_INTEGER
+#include "assignment_quotient.inc"
+#endif

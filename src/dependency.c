@@ -65,3 +65,70 @@ int lab_source_row_dependency(const LabModel *m, const double *y, double deadlin
     mpq_clears(sum, a, b, q, term, NULL);
     return valid;
 }
+
+/* A nonsingular equality matrix fixes every participating variable. A
+ * disconnected zero-cost column can take zero if its source bounds allow it.
+ * Keep the original CSC entries and remove only empty column pointers. */
+int lab_recover_square_equalities(const LabModel *m, double *point, double *objective,
+                                  double deadline) {
+    const LabExactModel *e = m->exact;
+    size_t n = m->rows;
+    if (!e || !n || n > LAB_RATIONAL_MAX_DIMENSION || lab_now() >= deadline)
+        return 0;
+    for (size_t i = 0; i < n; ++i)
+        if (!isfinite(m->row_lower[i]) || !isfinite(m->row_upper[i]) ||
+            mpq_cmp(e->row_lower[i], e->row_upper[i]))
+            return 0;
+
+    size_t start[LAB_RATIONAL_MAX_DIMENSION + 1], column[LAB_RATIONAL_MAX_DIMENSION];
+    size_t count = 0;
+    for (size_t j = 0; j < m->cols; ++j) {
+        if (m->col_start[j] == m->col_start[j + 1]) {
+            if (mpq_sgn(e->objective[j]) ||
+                (isfinite(m->col_lower[j]) && mpq_sgn(e->col_lower[j]) > 0) ||
+                (isfinite(m->col_upper[j]) && mpq_sgn(e->col_upper[j]) < 0))
+                return 0;
+            point[j] = 0;
+        } else {
+            if (count == n)
+                return 0;
+            start[count] = m->col_start[j];
+            column[count++] = j;
+        }
+    }
+    if (count != n)
+        return 0;
+    start[n] = m->nnz;
+    mpq_t *x = lab_alloc(n, sizeof *x);
+    for (size_t i = 0; i < n; ++i)
+        mpq_init(x[i]);
+    int feasible = !lab_rational_sparse_solve(n, start, m->row_index, e->value,
+                                               e->row_lower, x, deadline);
+    int representable = 1;
+    mpq_t binary;
+    mpq_init(binary);
+    for (size_t i = 0; i < n && feasible; ++i) {
+        size_t j = column[i];
+        if ((m->integer[j] && mpz_cmp_ui(mpq_denref(x[i]), 1)) ||
+            (isfinite(m->col_lower[j]) && mpq_cmp(x[i], e->col_lower[j]) < 0) ||
+            (isfinite(m->col_upper[j]) && mpq_cmp(x[i], e->col_upper[j]) > 0))
+            feasible = 0;
+        if (lab_exact_nearest(x[i], &point[j])) {
+            representable = 0;
+        } else {
+            mpq_set_d(binary, point[j]);
+            if (mpq_cmp(binary, x[i]))
+                representable = 0;
+        }
+    }
+    mpq_clear(binary);
+    for (size_t i = 0; i < n; ++i)
+        mpq_clear(x[i]);
+    free(x);
+    if (!feasible)
+        return 0;
+    double residual;
+    if (!representable || lab_exact_evaluate(m, point, objective, &residual) || residual != 0)
+        return -1;
+    return 1;
+}

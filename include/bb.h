@@ -1,5 +1,6 @@
 #ifndef LAB_BB_H
 #define LAB_BB_H
+#include "search_result.h"
 #include "lp.h"
 
 /* Minimal numerical branch-and-bound. Outcomes and bounds are solver claims;
@@ -8,14 +9,18 @@ typedef struct {
     LabLpOptions lp;
     double time_limit;
     size_t node_limit, sat_decision_limit;
+    int no_scip;
     int binary_sat; /* -1 off, 0 automatic, 1 force eligibility check */
     int cold, no_presolve, first_fractional, no_root_cuts, no_root_diving, no_objective_lattice;
     const char *trace_path;
 } LabBbOptions;
 
 typedef struct {
+    LabSearchResult search;
     const char *status;
     char message[256];
+    const char *scip_route, *scip_fallback_reason;
+    size_t scip_path_cliques;
     double *primal;
     char **primal_decimal;
     size_t primal_columns;

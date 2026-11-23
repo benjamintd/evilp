@@ -57,7 +57,8 @@ class Assignment(unittest.TestCase):
                 expected=(max if maximize else min)(sum(c[i][v] for i,v in enumerate(p))
                             for p in itertools.permutations(range(n)))
                 data,obj=self.solve(m)
-                self.assertIn('exact matching bound',data['message'],data)
+                self.assertEqual((data['search_route'],data['bound_origin']),('assignment','structural_bound'))
+                self.assertEqual(F(str(data['best_bound'])),expected+m['offset'])
                 self.assertEqual(obj,expected+m['offset'])
 
     def test_decimal_potentials(self):
@@ -98,6 +99,55 @@ class Assignment(unittest.TestCase):
         data,obj=self.solve(modified)
         self.assertNotIn('exact matching bound',data['message'])
         self.assertEqual(obj,F(1,8))
+
+    def quotient_model(self, maximize=False, reverse=False):
+        edges = list(itertools.product(range(4), repeat=2))
+        costs = [[int((a < 2) != (b < 2)) * (-1 if maximize else 1)
+                  for b in range(4)] for a in range(4)]
+        m = model(costs, maximize)
+        m['integer'] += [False, False]
+        m['bounds'] += [(0, 1), (0, 1)]
+        m['cost'] += [0, 0]
+        for row, _, _ in m['rows']:
+            row.extend([0, 0])
+        flags = [int(a < 2 and b < 2) for a, b in edges] + [0, 0]
+        m['rows'].append(([-v for v in flags], -1, None) if reverse else (flags, None, 1))
+        m['rows'].append(([0]*16 + [-1, 1], F(1, 10), None))
+        return m
+
+    def test_interchangeable_vertices_with_infeasible_cheapest_matching(self):
+        for maximize, reverse in itertools.product((False, True), repeat=2):
+            m = self.quotient_model(maximize, reverse)
+            if reverse:
+                m['rows'].reverse()
+            objectives = [m['offset'] + sum(m['cost'][4*a+b] for a,b in enumerate(p))
+                          for p in itertools.permutations(range(4))
+                          if sum(a < 2 and b < 2 for a,b in enumerate(p)) <= 1]
+            with self.subTest(maximize=maximize, reverse=reverse):
+                result, value = self.solve(m, '--time-limit', '10')
+                self.assertEqual(result['status'], 'optimal')
+                self.assertEqual(value, (max if maximize else min)(objectives))
+                if result['scip_route'] != 'unavailable':
+                    self.assertEqual(result['scip_route'], 'assignment_quotient')
+                self.assertFalse(result['certifies_optimality'])
+
+    def test_sub_binary64_side_signatures_remain_distinct(self):
+        m = self.quotient_model()
+        # All sixteen side coefficients round to the same binary64 value.
+        # No two assignment vertices have the same original side column.
+        coeff = [1 + F(k, 10**20) for k in range(16)] + [0, 0]
+        m['rows'].append((coeff, None, 10))
+        result, value = self.solve(m, '--time-limit', '10')
+        self.assertEqual((result['status'], value), ('optimal', m['offset']+2))
+        self.assertNotEqual(result['scip_route'], 'assignment_quotient')
+
+    def test_quotient_respects_node_limit(self):
+        m = self.quotient_model()
+        result, value = self.solve(m, '--node-limit', '2')
+        self.assertLessEqual(result['nodes'], 2)
+        self.assertNotEqual(result['scip_route'], 'assignment_quotient')
+        if result['status'] == 'optimal':
+            self.assertEqual(value, m['offset']+2)
 
     def test_inconsistent_cycle_never_returns_a_matching(self):
         m=model([[0,0],[0,0]])

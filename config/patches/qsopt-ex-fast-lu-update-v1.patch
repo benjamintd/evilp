@@ -1,0 +1,338 @@
+--- a/qsopt_ex/factor.h
++++ b/qsopt_ex/factor.h
+@@ -158,6 +158,7 @@
+ 	int pf_mark_cap;
+ 	EGLPNUM_TYPENAME_svector pf_tmp;
+ 	EGLPNUM_TYPENAME_svector xtmp;
++	EGLPNUM_TYPENAME_svector newr;
+ 	int ur_freebeg;
+ 	int ur_space;
+ 	int uc_freebeg;
+--- a/qsopt_ex/factor.c
++++ b/qsopt_ex/factor.c
+@@ -156,6 +156,7 @@
+ 	EGLPNUM_TYPENAME_ILLsvector_init (&f->pf_tmp);
+ 	f->dmat = 0;
+ 	EGLPNUM_TYPENAME_ILLsvector_init (&f->xtmp);
++	EGLPNUM_TYPENAME_ILLsvector_init (&f->newr);
+ }
+ 
+ void EGLPNUM_TYPENAME_ILLfactor_reset_factor_work (
+@@ -206,6 +207,7 @@
+ 
+ 	EGLPNUM_TYPENAME_EGlpNumFreeArray (f->dmat);
+ 	EGLPNUM_TYPENAME_ILLsvector_free (&f->xtmp);
++	EGLPNUM_TYPENAME_ILLsvector_free (&f->newr);
+ 	f->pf_mode = 0;
+ 	f->pf_cnt = 0;
+ 	f->pf_freebeg = 0;
+@@ -367,6 +369,8 @@
+ 
+ 	rval = EGLPNUM_TYPENAME_ILLsvector_alloc (&f->xtmp, dim);
+ 	CHECKRVALG (rval, CLEANUP);
++	rval = EGLPNUM_TYPENAME_ILLsvector_alloc (&f->newr, dim);
++	CHECKRVALG (rval, CLEANUP);
+ 
+ 	rval = 0;
+ 
+@@ -827,9 +831,14 @@
+ 	for (i = 0; i < dim; i++)
+ 		nzcnt += ur_inf[i].nzcnt;
+ 	old_nzcnt = nzcnt;
+-	while (nzcnt * 2 >= minspace)
+-	{
+-		minspace = 1 + minspace * f->grow_mul;
++	{
++		int target = urcind ? (nzcnt * 3) : (nzcnt * 2);
++		while (target >= minspace)
++		{
++			int grown = (int) (1 + minspace * f->grow_mul);
++			int step = minspace + (minspace >> 1) + 64;
++			minspace = (urcind && step > grown) ? step : grown;
++		}
+ 	}
+ 
+ #ifdef GROWTH_STATS
+@@ -875,10 +884,8 @@
+ 		}
+ 	}
+ 
+-	for (i = new_nzcnt; i < minspace; i++)
+-	{
+-		new_urindx[i] = -1;
+-	}
++	if (minspace > new_nzcnt)
++		memset (new_urindx + new_nzcnt, 0xff, (size_t) (minspace - new_nzcnt) * sizeof (int));
+ 	new_urindx[minspace] = 0;
+ 	EGLPNUM_TYPENAME_EGlpNumFreeArray (f->urcoef);
+ 	f->urcoef = new_urcoef;
+@@ -935,10 +942,16 @@
+ 
+ 	minspace = f->uc_space;
+ 	nzcnt = space;
+-	for( i = 0 ; i < dim ; i++) nzcnt += uc_inf[i].nzcnt;
+-	while(nzcnt*2 >= minspace)
+-	{
+-		minspace = 10 + (f->grow_mul * minspace);
++	for (i = 0; i < dim; i++)
++		nzcnt += uc_inf[i].nzcnt;
++	{
++		int target = ucrind ? (nzcnt * 3) : (nzcnt * 2);
++		while (target >= minspace)
++		{
++			int grown = (int) (10 + (f->grow_mul * minspace));
++			int step = minspace + (minspace >> 1) + 64;
++			minspace = (ucrind && step > grown) ? step : grown;
++		}
+ 	}
+ 
+ #ifdef GROWTH_STATS
+@@ -990,10 +1003,8 @@
+ 		}
+ 	}
+ 
+-	for (i = new_nzcnt; i < minspace; i++)
+-	{
+-		new_ucindx[i] = -1;
+-	}
++	if (minspace > new_nzcnt)
++		memset (new_ucindx + new_nzcnt, 0xff, (size_t) (minspace - new_nzcnt) * sizeof (int));
+ 	new_ucindx[minspace] = 0;
+ 
+ 	EGLPNUM_TYPENAME_EGlpNumFreeArray (f->uccoef);
+@@ -2180,28 +2191,39 @@
+ 	f->nzcnt_factor = nzcnt;
+ #endif /* TRACK_FACTOR */
+ 
+-	EGLPNUM_TYPENAME_EGlpNumFreeArray (f->uccoef);
+-	uccoef = EGLPNUM_TYPENAME_EGlpNumAllocArray (nzcnt);
+-	f->uccoef = uccoef;
+-
+-	ILL_IFFREE(f->ucrind);
+-	ILL_SAFE_MALLOC (ucrind, nzcnt, int);
+-
+-	f->ucrind = ucrind;
+-
+-	ILL_IFFREE(f->urcind);
+-	ILL_SAFE_MALLOC (urcind, f->ur_space, int);
+-
+-	f->urcind = urcind;
+-
+-	if (uc_space < nzcnt)
+-	{
+-		ILL_IFFREE(f->ucindx);
+-		ILL_SAFE_MALLOC (f->ucindx, nzcnt + 1, int);
+-	}
+-	f->uc_space = nzcnt;
+-	uc_space = nzcnt;
+-	ucindx = f->ucindx;
++	{
++		int extra_u = (nzcnt >> 1) + dim * 2 + 64;
++		int uc_target = nzcnt + extra_u;
++
++		ILL_IFFREE(f->urcind);
++		if (f->ur_freebeg + extra_u >= f->ur_space)
++		{
++			rval = make_ur_space (f, extra_u);
++			CHECKRVALG (rval, CLEANUP);
++			urindx = f->urindx;
++			urcoef = f->urcoef;
++		}
++
++		EGLPNUM_TYPENAME_EGlpNumFreeArray (f->uccoef);
++		uccoef = EGLPNUM_TYPENAME_EGlpNumAllocArray (uc_target);
++		f->uccoef = uccoef;
++
++		ILL_IFFREE(f->ucrind);
++		ILL_SAFE_MALLOC (ucrind, uc_target, int);
++		f->ucrind = ucrind;
++
++		ILL_SAFE_MALLOC (urcind, f->ur_space, int);
++		f->urcind = urcind;
++
++		if (uc_space < uc_target)
++		{
++			ILL_IFFREE(f->ucindx);
++			ILL_SAFE_MALLOC (f->ucindx, uc_target + 1, int);
++		}
++		f->uc_space = uc_target;
++		uc_space = uc_target;
++		ucindx = f->ucindx;
++	}
+ 
+ 	for (i = 0; i < dim; i++)
+ 	{
+@@ -2229,10 +2251,8 @@
+ 	}
+ 
+ 	f->uc_freebeg = nzcnt;
+-	for (i = nzcnt; i < uc_space; i++)
+-	{
+-		ucindx[i] = -1;
+-	}
++	if (uc_space > nzcnt)
++		memset (ucindx + nzcnt, 0xff, (size_t) (uc_space - nzcnt) * sizeof (int));
+ 	ucindx[uc_space] = 0;
+ 
+ 	for (i = 0; i < dim; i++)
+@@ -4790,27 +4810,32 @@
+ 	int i;
+ 	int rval = 0;
+ 
+-	if (uc_freebeg + nzcnt + 1 >= f->uc_space)
+-	{
+-		rval = make_uc_space (f, nzcnt + 1);
+-		CHECKRVALG (rval, CLEANUP);
+-		uc_freebeg = f->uc_freebeg;
+-	}
+-	cbeg = uc_inf->cbeg;
+-	uccoef = f->uccoef;
+-	ucindx = f->ucindx;
+-	ucrind = f->ucrind;
+-
+-	for (i = 0; i < nzcnt; i++)
+-	{
+-		EGLPNUM_TYPENAME_EGlpNumCopy (uccoef[uc_freebeg + i], uccoef[cbeg + i]);
+-		ucindx[uc_freebeg + i] = ucindx[cbeg + i];
+-		ucrind[uc_freebeg + i] = ucrind[cbeg + i];
+-		ucindx[cbeg + i] = -1;
+-	}
+-
+-	uc_inf->cbeg = uc_freebeg;
+-	f->uc_freebeg = uc_freebeg + nzcnt;
++	{
++		int extra = (nzcnt >> 2) + 2;
++		if (extra > 32)
++			extra = 32;
++		if (uc_freebeg + nzcnt + extra >= f->uc_space)
++		{
++			rval = make_uc_space (f, nzcnt + extra);
++			CHECKRVALG (rval, CLEANUP);
++			uc_freebeg = f->uc_freebeg;
++		}
++		cbeg = uc_inf->cbeg;
++		uccoef = f->uccoef;
++		ucindx = f->ucindx;
++		ucrind = f->ucrind;
++
++		for (i = 0; i < nzcnt; i++)
++		{
++			EGLPNUM_TYPENAME_EGlpNumCopy (uccoef[uc_freebeg + i], uccoef[cbeg + i]);
++			ucindx[uc_freebeg + i] = ucindx[cbeg + i];
++			ucrind[uc_freebeg + i] = ucrind[cbeg + i];
++			ucindx[cbeg + i] = -1;
++		}
++
++		uc_inf->cbeg = uc_freebeg;
++		f->uc_freebeg = uc_freebeg + nzcnt + extra;
++	}
+ CLEANUP:
+ 	EG_RETURN (rval);
+ }
+@@ -4829,27 +4854,32 @@
+ 	int i;
+ 	int rval = 0;
+ 
+-	if (ur_freebeg + nzcnt + 1 >= f->ur_space)
+-	{
+-		rval = make_ur_space (f, nzcnt + 1);
+-		CHECKRVALG (rval, CLEANUP);
+-		ur_freebeg = f->ur_freebeg;
+-	}
+-	rbeg = ur_inf->rbeg;
+-	urcoef = f->urcoef;
+-	urindx = f->urindx;
+-	urcind = f->urcind;
+-
+-	for (i = 0; i < nzcnt; i++)
+-	{
+-		EGLPNUM_TYPENAME_EGlpNumCopy (urcoef[ur_freebeg + i], urcoef[rbeg + i]);
+-		urindx[ur_freebeg + i] = urindx[rbeg + i];
+-		urcind[ur_freebeg + i] = urcind[rbeg + i];
+-		urindx[rbeg + i] = -1;
+-	}
+-
+-	ur_inf->rbeg = ur_freebeg;
+-	f->ur_freebeg = ur_freebeg + nzcnt;
++	{
++		int extra = (nzcnt >> 2) + 2;
++		if (extra > 32)
++			extra = 32;
++		if (ur_freebeg + nzcnt + extra >= f->ur_space)
++		{
++			rval = make_ur_space (f, nzcnt + extra);
++			CHECKRVALG (rval, CLEANUP);
++			ur_freebeg = f->ur_freebeg;
++		}
++		rbeg = ur_inf->rbeg;
++		urcoef = f->urcoef;
++		urindx = f->urindx;
++		urcind = f->urcind;
++
++		for (i = 0; i < nzcnt; i++)
++		{
++			EGLPNUM_TYPENAME_EGlpNumCopy (urcoef[ur_freebeg + i], urcoef[rbeg + i]);
++			urindx[ur_freebeg + i] = urindx[rbeg + i];
++			urcind[ur_freebeg + i] = urcind[rbeg + i];
++			urindx[rbeg + i] = -1;
++		}
++
++		ur_inf->rbeg = ur_freebeg;
++		f->ur_freebeg = ur_freebeg + nzcnt + extra;
++	}
+ CLEANUP:
+ 	EG_RETURN (rval);
+ }
+@@ -5417,10 +5447,7 @@
+ 	int i;
+ 	int j;
+ 	int rval = 0;
+-	EGLPNUM_TYPENAME_svector newr;
+-
+-	newr.indx = 0;
+-	newr.coef = 0;
++	EGLPNUM_TYPENAME_svector *newr = &f->newr;
+ 
+ 	for (i = 0; i < xnzcnt; i++)
+ 	{
+@@ -5432,34 +5459,29 @@
+ 		EGLPNUM_TYPENAME_EGlpNumCopy (work[j], xcoef[i]);
+ 	}
+ 
+-	newr.nzcnt = 0;
+-	ILL_SAFE_MALLOC (newr.indx, f->dim, int);
+-
+-	newr.coef = EGLPNUM_TYPENAME_EGlpNumAllocArray (f->dim);
++	newr->nzcnt = 0;
+ 
+ 	for (i = 0; i < xnzcnt; i++)
+ 	{
+ 		j = xindx[i];
+ 		if (--ur_inf[j].delay == 0)
+ 		{
+-			rval = serow_process (f, j, &newr, rank_r);
++			rval = serow_process (f, j, newr, rank_r);
+ 			CHECKRVALG (rval, CLEANUP);
+ 		}
+ 	}
+ 
+-	for (i = 0; i < newr.nzcnt; i++)
+-	{
+-		rval = add_nonzero (f, row_p, newr.indx[i], newr.coef[i]);
++	for (i = 0; i < newr->nzcnt; i++)
++	{
++		rval = add_nonzero (f, row_p, newr->indx[i], newr->coef[i]);
+ 		CHECKRVALG (rval, CLEANUP);
+ 	}
+ 
+ #ifdef TRACK_FACTOR
+-	f->nzcnt_cur += newr.nzcnt;
++	f->nzcnt_cur += newr->nzcnt;
+ #endif /* TRACK_FACTOR */
+ 
+ CLEANUP:
+-	EGLPNUM_TYPENAME_EGlpNumFreeArray (newr.coef);
+-	ILL_IFFREE(newr.indx);
+ 
+ 	/* Bico 031210 - chg from ILL_RETURN */
+ 	EG_RETURN (rval);

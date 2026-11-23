@@ -1,6 +1,6 @@
 #ifndef LAB_LP_H
 #define LAB_LP_H
-#include "model.h"
+#include "augment.h"
 #define LAB_LP_SPARSE_DIMENSION_LIMIT 16000000
 #define LAB_LP_DENSE_DIMENSION_LIMIT 4096
 typedef struct {
@@ -19,6 +19,9 @@ typedef struct {
     int verify_glpk_point; /* standalone solves may verify a proposal before lifting its basis */
     int packing_bounds;
     int keep_bound_rows; /* retain explicit rows for transformed implicit bounds */
+    /* Zero selects the established defaults (1e-7 absolute source primal,
+     * 1e-10 relative reduced cost). Positive values can only tighten them. */
+    double primal_tolerance, dual_relative_tolerance;
 } LabLpOptions;
 typedef struct {
     const char *status;
@@ -65,7 +68,24 @@ typedef struct LabLpSession LabLpSession;
 /* The original model must outlive the session and stay immutable. Limits use
  * one cumulative deadline. Bounds can be restored within the original domain. */
 LabLpSession *lab_lp_session_create(const LabModel *m, const LabLpOptions *options);
+/* Update policy on a live session and recheck the basis on its next solve.
+ * Zero restores the default for that quantity. An open probe rejects changes. */
+int lab_lp_session_set_tolerances(LabLpSession *s, double primal, double dual_relative);
 int lab_lp_session_set_bounds(LabLpSession *s, size_t column, double lower, double upper);
+/* One reversible bound probe at a time. Rollback restores the parent domain
+ * and, when the standard form survives, its saved basis. Deadlines never rewind. */
+int lab_lp_session_begin_probe(LabLpSession *s);
+int lab_lp_session_rollback_probe(LabLpSession *s);
+/* Permanently append a batch to the LP domain. The session owns the new
+ * sparse matrix and its exact source metadata. Active bound overlays survive.
+ * A structural edit invalidates the old standard form and disk basis identity. */
+LabAugmentStatus lab_lp_session_append_rows(LabLpSession *s, size_t count,
+    const LabSparseRow *rows, const LabAugmentLimits *limits);
+/* Same transaction for cuts already produced as dense coefficient vectors. */
+LabAugmentStatus lab_lp_session_append_dense_rows(LabLpSession *s, size_t count,
+    const LabAddedRow *rows, const LabAugmentLimits *limits);
+/* Borrowed immutable domain, valid until the next structural edit or free. */
+const LabModel *lab_lp_session_domain(const LabLpSession *s);
 void lab_lp_session_solve(LabLpSession *s, LabLpResult *result);
 void lab_lp_session_free(LabLpSession *s);
 #endif

@@ -2,34 +2,50 @@
 """Summarize C runner artifacts. Claimed optimality is never certified here."""
 import argparse,collections,fractions,html,json,pathlib,statistics
 F=fractions.Fraction
-def report(root,runs_file='runs.jsonl',prefix='summary'):
-    root=pathlib.Path(root);rows=[json.loads(x) for x in (root/runs_file).read_text().splitlines() if x.strip()]
+
+from run_evaluation import EVALUATION_SHA256, assess_evidence, checker_outcome, strict_json, read_witness_ledgers, witness_index
+
+def report(root,runs_file='runs.jsonl',prefix='summary',witness_paths=()):
+    root=pathlib.Path(root);rows=[strict_json(x) for x in (root/runs_file).read_text().splitlines() if x.strip()]
+    evidence, ledgers = read_witness_ledgers(witness_paths)
+    witnesses = witness_index([*rows, *evidence])
+    environment = strict_json((root / 'environment.json').read_text())
     groups=collections.defaultdict(list);details=[];contradictions=[]
     for r in rows:
-        c=r['checker'];valid=c.get('checked_feasible',False) and c.get('status')=='valid'
-        objective=F(c['objective']) if valid else None
-        ref=F(r['reference_objective']) if r['reference_objective']!='-' else None
-        tol=F('0.0001')+F('0.000000001')*abs(ref or 0)
-        match=valid and ref is not None and r['reference_status']=='=opt=' and abs(objective-ref)<=tol
-        better=valid and ref is not None and r['reference_status']=='=opt=' and not match and (objective<ref if c.get('objective_sense')=='min' else objective>ref)
-        contradiction=(r['claimed_status']=='infeasible' and r['reference_status'] in ('=opt=','=best=')) or (valid and r['reference_status']=='=inf=') or (r['claimed_status']=='optimal' and valid and ref is not None and r['reference_status']=='=opt=' and not match) or better
-        d={**r,'validated_objective_decimal':float(objective) if objective is not None else None,'reached_reference':bool(match),'reference_contradiction':contradiction}
+        facts = assess_evidence(r, r, relaxation=environment.get('relaxation', False), witnesses=witnesses)
+        objective = facts['checked_objective']
+        contradiction = facts['reference_contradiction'] or facts['witness_conflicts']
+        d = {**r, **facts, 'validated_objective_decimal': float(F(objective)) if objective is not None else None,
+             'reached_reference': facts['reference_objective_agreement'] and r['reference_status'] == '=opt='}
         groups[r['solver']].append(d);details.append(d)
-        if contradiction:contradictions.append({'instance':r['instance'],'solver':r['solver'],'claimed_status':r['claimed_status']})
+        if contradiction:contradictions.append({'instance':r['instance'],'solver':r['solver'],'claimed_status':r['claimed_status'],'witness_conflicts':facts['witness_conflicts'],'contradicting_witness':facts['contradicting_witness']})
     summary={}
     for name,runs in sorted(groups.items()):
+        outcomes = collections.Counter(x['checker_outcome'] for x in runs)
         summary[name]={'attempts':len(runs),'claimed_statuses':dict(collections.Counter(x['claimed_status'] for x in runs)),
-          'checked_feasible':sum(x['checker'].get('checked_feasible',False) and x['checker'].get('status')=='valid' for x in runs),
-          'invalid_candidates':sum(x['checker'].get('status')=='invalid' for x in runs),
-          'checker_errors':sum(x['checker'].get('status') in ('error','unsupported') for x in runs),
-          'certified_lp_bounds':sum(x['checker'].get('bound_status')=='valid' for x in runs),
-          'certified_optima':sum(x['checker'].get('certifies_optimality',False) for x in runs),
+          'checked_feasible':sum(x['checked_feasible'] for x in runs),
+          'invalid_candidates':outcomes['invalid'],
+          'checker_errors':outcomes['error'] + outcomes['unsupported'],
+          'absent_evidence':outcomes['absent'],
+          'certified_lp_bounds':sum(x['certified_bound'] is not None for x in runs),
+          'certified_infeasibilities':sum(x['independently_certified_infeasibility'] for x in runs),
+          'certified_optima':sum(x['independently_certified_optimality'] for x in runs),
           'reached_reference':sum(x['reached_reference'] for x in runs),
+          'witness_contradictions':sum(bool(x['witness_conflicts']) for x in runs),
           'reference_contradictions':sum(x['reference_contradiction'] for x in runs),
           'total_solver_wall_s':sum(x['wall_s'] for x in runs),'total_checker_wall_s':sum(x['checker_wall_s'] for x in runs),
           'median_solver_wall_s':statistics.median(x['wall_s'] for x in runs)}
     data={'schema':1,'kind':'short-budget pipeline baseline; not a solver ranking','reference_match_policy':'absolute 1e-4 + relative 1e-9 against pinned =opt= reference; not an optimality proof',
-          'summary':summary,'contradictions':contradictions,'attempts':len(rows),'instances':len({r['instance'] for r in rows}),'environment':json.loads((root/'environment.json').read_text())}
+          'summary':summary,'contradictions':contradictions,'attempts':len(rows),'instances':len({r['instance'] for r in rows}),'environment':environment}
+    data['witness_ledgers'] = ledgers
+    data['evaluation_sha256'] = EVALUATION_SHA256
+    data['attempt_results'] = [
+        {key: r[key] for key in ('instance', 'solver', 'seed', 'claimed_status', 'reported_bound',
+                                 'search_route', 'closure_reason', 'bound_origin', 'bound_scope', 'reported_relative_gap',
+                                 'evidence_scope', 'checker_outcome', 'checked_objective', 'checked_feasible',
+                                 'reference_objective_agreement', 'reference_contradiction', 'witness_conflicts', 'contradicting_witness', 'certified_bound',
+                                 'independently_certified_optimality', 'independently_certified_infeasibility')}
+        for r in details]
     data['run_records']=runs_file
     data['relaxation']=bool(data['environment'].get('relaxation',False))
     if data['relaxation']:data['kind']='LP relaxation correctness baseline; not a solver ranking'
@@ -42,17 +58,17 @@ def report(root,runs_file='runs.jsonl',prefix='summary'):
     if data['relaxation']:parts.append('<p><strong>Continuous LP relaxations: integrality is explicitly ignored and suite reference objectives must be LP values.</strong></p>')
     parts.append('<p><strong>This short-budget run validates the laboratory. It does not establish a performance ranking.</strong> A checked feasible solution satisfies the model under the recorded tolerances. Reference agreement is a comparison with versioned metadata, not a proof. Only an exact matching primal/dual certificate can independently certify optimality.</p>')
     parts.append('<p>The checker requires absolute row/bound tolerance 1e-4, integer tolerance 1e-5, and claimed-objective consistency 1e-4. A rejection can involve feasibility or objective consistency. With large coefficients, a point accepted under solver scaling/tolerances can fail this absolute policy. Such a failure alone does not establish a solver bug.</p>')
-    if 'revalidation' in data:parts.append('<p>Independent validation was rerun from retained solution files. Original solver timings and raw run records are unchanged. Each row links to the newer validation record.</p>')
-    parts.append('<table><tr><th>Solver</th><th>Attempts</th><th>Passed checker</th><th>Reached reference</th><th>Certified LP bounds</th><th>Certified optima</th><th>Invalid candidates</th><th>Checker errors</th><th>Claimed statuses</th><th>Solver wall seconds</th></tr>')
-    for name,s in summary.items():parts.append('<tr>'+''.join(f'<td>{E(x)}</td>' for x in [name,s['attempts'],s['checked_feasible'],s['reached_reference'],s['certified_lp_bounds'],s['certified_optima'],s['invalid_candidates'],s['checker_errors'],s['claimed_statuses'],round(s['total_solver_wall_s'],2)])+'</tr>')
+    if 'revalidation' in data:parts.append('<p>Independent validation was rerun from retained primal and dual evidence. Original solver timings and raw run records are unchanged. Each row links to the newer validation record.</p>')
+    parts.append('<table><tr><th>Solver</th><th>Attempts</th><th>Passed checker</th><th>Reached reference</th><th>Certified LP bounds</th><th>Certified optima</th><th>Infeasibility proofs</th><th>Invalid candidates</th><th>Checker errors</th><th>Absent evidence</th><th>Claimed statuses</th><th>Solver wall seconds</th></tr>')
+    for name,s in summary.items():parts.append('<tr>'+''.join(f'<td>{E(x)}</td>' for x in [name,s['attempts'],s['checked_feasible'],s['reached_reference'],s['certified_lp_bounds'],s['certified_optima'],s['certified_infeasibilities'],s['invalid_candidates'],s['checker_errors'],s['absent_evidence'],s['claimed_statuses'],round(s['total_solver_wall_s'],2)])+'</tr>')
     parts.append('</table><p>Reference matching: absolute 1e-4 + relative 1e-9, for pinned =opt= records only. No comparisons use a solver unvalidated dual bound as truth. All failures and missing candidates remain in the table.</p>')
-    parts.append('<h2>Individual runs</h2><p>Run status includes process outcomes and explicit terminal solution-header refinements. Solver report preserves the parsed log status and any separate solution status. Raw claims, exits and signals remain in each record.</p><table><tr><th>Instance</th><th>Solver</th><th>Run status</th><th>Solver report</th><th>Checker</th><th>Checked objective</th><th>Certified LP bound</th><th>Reference reached</th><th>Wall seconds</th><th>Evidence</th></tr>')
+    parts.append('<h2>Individual runs</h2><p>Run status includes process outcomes and explicit terminal solution-header refinements. Solver report preserves the parsed log status and any separate solution status. Raw claims, exits and signals remain in each record.</p><table><tr><th>Instance</th><th>Solver</th><th>Run status</th><th>Solver report</th><th>Conflicts</th><th>Checker</th><th>Checked objective</th><th>Certified LP bound</th><th>Reference reached</th><th>Wall seconds</th><th>Evidence</th></tr>')
     for r in details:
         relative_run=f'{r["instance"]}/{r["solver"]}/seed-{r["seed"]}'
-        bound=r['checker'].get('certified_bound') if r['checker'].get('bound_status')=='valid' else None
+        bound=r['certified_bound']
         reported=r.get('reported_solver_status')
         if r.get('reported_solution_status'):reported=str(reported)+' / solution: '+r['reported_solution_status']
-        values=[r['instance'],r['solver'],r['claimed_status'],reported,r['checker']['status'],r['validated_objective_decimal'],bound,r['reached_reference'],round(r['wall_s'],4)]
+        values=[r['instance'],r['solver'],r['claimed_status'],reported,', '.join((['reference_contradiction'] if r['reference_contradiction'] else []) + r['witness_conflicts']),r['checker_outcome'],r['validated_objective_decimal'],bound,r['reached_reference'],round(r['wall_s'],4)]
         validation=f' / <a href="{E(relative_run)}/{E(r["revalidation"].get("record","checker-revalidated.json"))}">validation</a>' if 'revalidation' in r else ''
         if r.get('dual_file'):validation+=f' / <a href="{E(relative_run)}/dual.sol">dual</a>'
         parts.append('<tr>'+''.join(f'<td>{E(x)}</td>' for x in values)+f'<td><a href="{E(relative_run)}/run.json">record</a> / <a href="{E(relative_run)}/solver.log">log</a>{validation}</td></tr>')
@@ -63,4 +79,4 @@ def report(root,runs_file='runs.jsonl',prefix='summary'):
     print(json.dumps(data['summary'],indent=2))
     return data
 if __name__=='__main__':
-    ap=argparse.ArgumentParser();ap.add_argument('directory');ap.add_argument('--runs',default='runs.jsonl');ap.add_argument('--prefix',default='summary');args=ap.parse_args();report(args.directory,args.runs,args.prefix)
+    ap=argparse.ArgumentParser();ap.add_argument('directory');ap.add_argument('--runs',default='runs.jsonl');ap.add_argument('--prefix',default='summary');ap.add_argument('--witness-runs',action='append',default=[]);args=ap.parse_args();report(args.directory,args.runs,args.prefix,args.witness_runs)

@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/resource.h>
+#include <sys/select.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/utsname.h>
@@ -24,6 +25,7 @@ typedef struct {
 } Instance;
 typedef struct {
     char *name, *binary, *sha, *version;
+    char configuration_sha[65], overlay_sha[65];
 } Solver;
 typedef struct {
     int code, signal, timed_out;
@@ -31,6 +33,9 @@ typedef struct {
     long rss;
 } Process;
 static volatile sig_atomic_t interrupted = 0;
+static void child_exited(int signo) {
+    (void)signo;
+}
 static void on_signal(int signo) {
     interrupted = signo;
 }
@@ -127,11 +132,24 @@ static Process run(char *const args[], const char *log, double limit) {
     Process r = {0};
     double begin = lab_now();
     double including_begin = including_suspend();
+    /* Block notifications across waitid and atomically unblock them in pselect.
+     * This avoids charging short-lived solvers the old polling interval. */
+    sigset_t blocked, previous, waiting;
+    sigemptyset(&blocked);
+    sigaddset(&blocked, SIGCHLD);
+    sigaddset(&blocked, SIGINT);
+    sigaddset(&blocked, SIGTERM);
+    if (sigprocmask(SIG_BLOCK, &blocked, &previous))
+        die("sigprocmask");
+    waiting = previous;
+    sigdelset(&waiting, SIGCHLD);
+    sigdelset(&waiting, SIGINT);
+    sigdelset(&waiting, SIGTERM);
     pid_t pid = fork();
     if (pid < 0)
         die("fork");
     if (!pid) {
-        if (setpgid(0, 0))
+        if (sigprocmask(SIG_SETMASK, &previous, NULL) || setpgid(0, 0))
             _exit(126);
         int fd = open(log, O_WRONLY | O_CREAT | O_EXCL, 0644);
         if (fd < 0)
@@ -186,9 +204,14 @@ static Process run(char *const args[], const char *log, double limit) {
             kill(-pid, SIGKILL);
             terminated = 2;
         }
-        struct timespec pause = {0, 20000000};
-        nanosleep(&pause, NULL);
+        double until = terminated ? kill_at : limit;
+        double delay = terminated == 2 ? 1 : fmax(0, fmin(1, until - elapsed));
+        struct timespec pause = {(time_t)delay, (long)((delay - (time_t)delay) * 1e9)};
+        if (pselect(0, NULL, NULL, NULL, &pause, &waiting) < 0 && errno != EINTR)
+            die("pselect");
     }
+    if (sigprocmask(SIG_SETMASK, &previous, NULL))
+        die("sigprocmask restore");
     double including_end = including_suspend();
     r.wall = lab_now() - begin;
     r.suspended = including_begin >= 0 && including_end >= 0
@@ -235,7 +258,7 @@ static void argv_json(FILE *f, char *const args[]) {
  * rather than matching words inside an explanatory message. Other values are
  * structurally validated but do not become independent numerical evidence. */
 static void json_space(const char **p) {
-    while (isspace((unsigned char)**p))
+    while (**p == ' ' || **p == '\t' || **p == '\n' || **p == '\r')
         ++*p;
 }
 static int json_string(const char **p, char *out, size_t cap) {
@@ -356,15 +379,19 @@ static int json_value(const char **p, unsigned depth) {
     }
     return 0;
 }
-static const char *lab_status(const char *p) {
-    static const char *known[] = {"optimal",     "infeasible",  "unbounded",  "numerical_failure",
-                                  "unsupported", "input_error", "time_limit", "iteration_limit",
-                                  "node_limit",  "lp_unbounded"};
+static const char *const evidence_fields[] = {"search_route", "closure_reason", "bound_origin", "bound_scope"};
+enum { EVIDENCE_FIELDS = sizeof evidence_fields / sizeof *evidence_fields };
+typedef struct {
+    char value[EVIDENCE_FIELDS][64];
+} SearchEvidence;
+
+static const char *json_status(const char *p, const char *const known[], size_t count, char *bound, SearchEvidence *evidence) {
     json_space(&p);
     if (*p++ != '{')
         return NULL;
-    char value[64] = "";
-    int seen = 0;
+    char value[64] = "", numeric_bound[128] = "";
+    SearchEvidence parsed = {0};
+    int seen = 0, seen_bound = 0;
     json_space(&p);
     if (*p == '}')
         return NULL;
@@ -379,8 +406,31 @@ static const char *lab_status(const char *p) {
         if (!strcmp(key, "status")) {
             if (seen++ || json_string(&p, value, sizeof value))
                 return NULL;
-        } else if (json_value(&p, 0)) {
-            return NULL;
+        } else if (bound && !strcmp(key, "best_bound")) {
+            const char *start = p;
+            if (seen_bound++ || json_value(&p, 0))
+                return NULL;
+            if (*start == '-' || isdigit((unsigned char)*start)) {
+                size_t n = (size_t)(p - start);
+                if (n >= sizeof numeric_bound)
+                    return NULL;
+                memcpy(numeric_bound, start, n);
+                if (!isfinite(strtod(numeric_bound, NULL)))
+                    return NULL;
+            } else if (p - start != 4 || memcmp(start, "null", 4)) {
+                return NULL;
+            }
+        } else {
+            size_t field = 0;
+            while (field < EVIDENCE_FIELDS && strcmp(key, evidence_fields[field]))
+                ++field;
+            if (evidence && field < EVIDENCE_FIELDS) {
+                if (parsed.value[field][0] || json_string(&p, parsed.value[field], sizeof parsed.value[field]) ||
+                    !parsed.value[field][0])
+                    return NULL;
+            } else if (json_value(&p, 0)) {
+                return NULL;
+            }
         }
         json_space(&p);
         if (*p == '}') {
@@ -394,11 +444,34 @@ static const char *lab_status(const char *p) {
     json_space(&p);
     if (*p || !seen)
         return NULL;
-    for (size_t i = 0; i < sizeof known / sizeof *known; ++i)
-        if (!strcmp(value, known[i]))
+    for (size_t i = 0; i < count; ++i)
+        if (!strcmp(value, known[i])) {
+            if (bound)
+                strcpy(bound, numeric_bound);
+            if (evidence)
+                *evidence = parsed;
             return known[i];
+        }
     return NULL;
 }
+static const char *lab_status(const char *p, char bound[128], SearchEvidence *evidence) {
+    static const char *const known[] = {"optimal",     "infeasible",  "unbounded",  "numerical_failure",
+                                        "unsupported", "input_error", "time_limit", "iteration_limit",
+                                        "node_limit",  "gap_limit", "lp_unbounded"};
+    return json_status(p, known, sizeof known / sizeof *known, bound, evidence);
+}
+
+/* milpcheck returns a structured result for each of its five normal exit codes. */
+static const char *checker_report_status(const char *report, int code) {
+    static const char *const statuses[] = {"valid", "invalid", "error", "unsupported", "no_solution",
+                                           "unavailable"};
+    const char *status = json_status(report, statuses, sizeof statuses / sizeof *statuses, NULL, NULL);
+    if (code < 0 || code > 4 || !status)
+        return NULL;
+    return !strcmp(status, statuses[code]) || (code == 4 && !strcmp(status, "unavailable"))
+               ? status : NULL;
+}
+
 static int cbc_lp_optimal_line(const char *line) {
     const char *value;
     int summary = 0;
@@ -466,7 +539,7 @@ static int cbc_report_conflict(const char *log_status, const char *solution_stat
     return strcmp(log_status, solution_status) != 0;
 }
 static const char *status_from_log(const char *solver, const char *path, Process p,
-                                   const char **reported, char bound[128]) {
+                                   const char **reported, char bound[128], SearchEvidence *evidence) {
     *reported = "unknown";
     bound[0] = 0;
     FILE *f = fopen(path, "r");
@@ -484,7 +557,7 @@ static const char *status_from_log(const char *solver, const char *path, Process
                 }
                 continue;
             }
-            const char *parsed = lab_status(line);
+            const char *parsed = lab_status(line, bound, evidence);
             if (parsed)
                 status = parsed;
             continue;
@@ -650,7 +723,7 @@ static size_t load_solvers(const char *path, Solver **out) {
         for (size_t j = 0; j < n; j++)
             if (!strcmp(a[j].name, v[0]))
                 die("duplicate solver");
-        a[n] = (Solver){lab_strdup(v[0]), absolute(v[1]), lab_strdup(v[2]), lab_strdup(v[3])};
+        a[n] = (Solver){lab_strdup(v[0]), absolute(v[1]), lab_strdup(v[2]), lab_strdup(v[3]), {0}};
         verify(a[n].binary, a[n].sha);
         n++;
     }
@@ -659,16 +732,104 @@ static size_t load_solvers(const char *path, Solver **out) {
     *out = a;
     return n;
 }
+/* Configuration identity excludes per-instance output paths. The runner hash
+ * binds adapter defaults; each attempt retains its actual argv/settings. */
+static void freeze_config(Solver *solver, const char *out, const char *runner_sha,
+                          int relax, double limit, double grace, int seed, int paired) {
+    char name[64];
+    solver->overlay_sha[0] = 0;
+    snprintf(name, sizeof name, "%s-config.json", solver->name);
+    char *path = pathcat(out, name);
+    FILE *f = fopen(path, "wx");
+    if (!f)
+        die("cannot create frozen solver configuration");
+    fprintf(f, "{\"runner_sha256\":\"%s\",\"solver_sha256\":\"%s\",\"adapter\":\"%s\","
+            "\"mode\":\"%s\",\"time_limit_s\":%.17g,\"watchdog_grace_s\":%.17g,"
+            "\"requested_threads\":1,\"seed\":%d,\"paired_caps\":%s",
+            runner_sha, solver->sha, solver->name, relax ? "relax" : "mip", limit, grace,
+            seed, paired ? "true" : "false");
+    if (!strcmp(solver->name, "lab")) {
+        const char *overlay = getenv("LAB_SCIP_SET");
+        if (overlay) {
+            char *copy = pathcat(out, "lab-scip.set");
+            FILE *src = fopen(overlay, "rb");
+            FILE *dst = fopen(copy, "wbx");
+            if (!src || !dst)
+                die("cannot snapshot LAB_SCIP_SET");
+            char buffer[8192];
+            size_t n;
+            while ((n = fread(buffer, 1, sizeof buffer, src)))
+                if (fwrite(buffer, 1, n, dst) != n)
+                    die("writing LAB_SCIP_SET snapshot");
+            if (ferror(src) || fclose(src) || fclose(dst) || lab_sha256(copy, solver->overlay_sha) ||
+                setenv("LAB_SCIP_SET", copy, 1))
+                die("freezing LAB_SCIP_SET");
+            free(copy);
+        }
+        fprintf(f, ",\"scip_set_sha256\":");
+        if (*solver->overlay_sha)
+            lab_json_string(f, solver->overlay_sha);
+        else
+            fputs("null", f);
+        fputs(",\"subscip_fraction_env\":", f);
+        const char *fraction = getenv("LAB_SUBSCIP_FRAC");
+        if (fraction)
+            lab_json_string(f, fraction);
+        else
+            fputs("null", f);
+        fprintf(f, ",\"phase_trace\":%s", getenv("LAB_PHASE_TRACE") ? "true" : "false");
+    }
+    fputs("}\n", f);
+    if (fclose(f) || lab_sha256(path, solver->configuration_sha))
+        die("hashing frozen configuration");
+    free(path);
+}
+static void paired_fields(FILE *f, const char *campaign_id, const char *host, double limit,
+                          double grace, int seed) {
+    fputs(",\"campaign_id\":", f);
+    lab_json_string(f, campaign_id);
+    fputs(",\"hardware_id\":", f);
+    lab_json_string(f, host);
+    fprintf(f, ",\"measurement\":\"solver_process_wall_excluding_checker\","
+            "\"budget\":{\"time_limit_s\":%.9g,\"watchdog_grace_s\":%.9g,"
+            "\"seed\":%d,\"requested_threads\":1,\"memory_limit_bytes\":null,"
+            "\"node_limit\":10000000,\"iteration_limit\":100000}", limit, grace, seed);
+}
+
+static void write_campaign(const char *out, const char *id, const char *host, const Solver *solvers,
+                           double limit, double grace, int seed, int quiescent,
+                           const char *checker_sha, const char *runner_sha, const char *suite_sha) {
+    char *path = pathcat(out, "campaign.json");
+    FILE *f = fopen(path, "wx");
+    if (!f)
+        die("cannot create paired campaign");
+    fprintf(f, "{\"schema\":1,\"fair_timing_campaign\":%s,\"quiescent\":%s,"
+            "\"serial_solver_processes\":true,\"coverage_exploration\":%s,"
+            "\"checker_sha256\":\"%s\",\"runner_sha256\":\"%s\",\"suite_sha256\":\"%s\"",
+            quiescent ? "true" : "false", quiescent ? "true" : "false",
+            quiescent ? "false" : "true", checker_sha, runner_sha, suite_sha);
+    paired_fields(f, id, host, limit, grace, seed);
+    fputs(",\"engines\":{", f);
+    for (size_t j = 0; j < 2; j++) {
+        fprintf(f, "%s\"%s\":{\"solver_sha256\":\"%s\",\"configuration_sha256\":\"%s\"}",
+                j ? "," : "", solvers[j].name, solvers[j].sha, solvers[j].configuration_sha);
+    }
+    fputs("}}\n", f);
+    if (fclose(f))
+        die("writing paired campaign");
+    free(path);
+}
 static void one(const Instance *inst, const Solver *s, const char *checker, const char *checker_sha,
                 const char *runner_sha, const char *out, double limit, double grace, int seed,
-                int relax, FILE *all) {
+                int relax, const char *campaign_id, const char *host, FILE *all) {
     char id[1024];
     snprintf(id, sizeof id, "%s/%s/seed-%d", inst->id, s->name, seed);
     char *dir = pathcat(out, id);
     mkdirs(dir);
     char *log = pathcat(dir, "solver.log"), *sol = pathcat(dir, "solution.sol"),
          *options = pathcat(dir, "settings.txt"), *result = pathcat(dir, "run.json"),
-         *checklog = pathcat(dir, "checker.json"), *dual = pathcat(dir, "dual.sol");
+         *checklog = pathcat(dir, "checker.json"), *dual = pathcat(dir, "dual.sol"),
+         *farkas = pathcat(dir, "infeasible.farkas");
     char secs[64], seedstr[32];
     snprintf(secs, sizeof secs, "%.9g", limit);
     snprintf(seedstr, sizeof seedstr, "%d", seed);
@@ -690,12 +851,16 @@ static void one(const Instance *inst, const Solver *s, const char *checker, cons
         if (relax) {
             args[k++] = "--dual";
             args[k++] = dual;
+            args[k++] = "--farkas";
+            args[k++] = farkas;
         }
         fprintf(opt,
                 "relaxation=%s\nmode=%s\ntime_limit=%s\nthreads=1\nalgorithm=deterministic\n"
                 "seed_argument=none\nreference_objectives=%s\n",
                 relax ? "true" : "false", relax ? "relax" : "mip", secs, relax ? "LP" : "MIP");
     } else if (!strcmp(s->name, "highs")) {
+        if (campaign_id)
+            fputs("mip_max_nodes = 10000000\nsimplex_iteration_limit = 100000\n", opt);
         fprintf(opt,
                 "time_limit = %s\nthreads = 1\nrandom_seed = %s\nmip_rel_gap = 0\nmip_abs_gap = "
                 "0\nwrite_solution_to_file = true\nwrite_solution_style = 0\nsolution_file = "
@@ -758,9 +923,13 @@ static void one(const Instance *inst, const Solver *s, const char *checker, cons
     fclose(opt);
     args[k] = NULL;
     Process p = run(args, log, limit + grace);
+    verify(s->binary, s->sha);
+    if (s->overlay_sha[0])
+        verify(getenv("LAB_SCIP_SET"), s->overlay_sha);
     char bound[128];
     const char *reported;
-    const char *claimed = status_from_log(s->name, log, p, &reported, bound);
+    SearchEvidence evidence = {0};
+    const char *claimed = status_from_log(s->name, log, p, &reported, bound, &evidence);
     const char *solution_status = !strcmp(s->name, "cbc") ? cbc_solution_status(sol) : NULL;
     int status_conflict = cbc_report_conflict(reported, solution_status);
     const char *status_source = !strcmp(claimed, reported) ? "solver_log" : "process";
@@ -781,10 +950,18 @@ static void one(const Instance *inst, const Solver *s, const char *checker, cons
     Process cp = {.code = -1};
     int has_solution = access(sol, R_OK) == 0;
     int has_dual = relax && !strcmp(s->name, "lab") && access(dual, R_OK) == 0;
-    int has_evidence = has_solution || has_dual;
+    int has_farkas = relax && !strcmp(s->name, "lab") && access(farkas, R_OK) == 0;
+    int has_evidence = has_solution || has_dual || has_farkas;
+    char solution_sha[65], dual_sha[65], farkas_sha[65];
+    if ((has_solution && lab_sha256(sol, solution_sha)) || (has_dual && lab_sha256(dual, dual_sha)) ||
+        (has_farkas && lab_sha256(farkas, farkas_sha)))
+        die("cannot hash retained checker evidence");
     char *check = NULL;
+    char *ca[16] = {NULL};
     if (has_evidence && !interrupted) {
-        char *ca[16] = {(char *)checker, "--model", inst->path};
+        ca[0] = (char *)checker;
+        ca[1] = "--model";
+        ca[2] = inst->path;
         int c = 3;
         if (has_solution) {
             ca[c++] = "--solution";
@@ -798,17 +975,32 @@ static void one(const Instance *inst, const Solver *s, const char *checker, cons
             ca[c++] = "--dual";
             ca[c++] = dual;
         }
+        if (has_farkas) {
+            ca[c++] = "--farkas";
+            ca[c++] = farkas;
+        }
         ca[c] = NULL;
         cp = run(ca, checklog, 120);
+        verify(checker, checker_sha);
         check = readfile(checklog);
     }
-    if (!check || check[0] != '{' || cp.timed_out || cp.signal || cp.code < 0 || cp.code > 4) {
+    const char *checked_status = check && !cp.timed_out && !cp.signal
+                                     ? checker_report_status(check, cp.code) : NULL;
+    if (!checked_status) {
         free(check);
-        check = lab_strdup("{\"status\":\"unavailable\",\"checked_feasible\":false}");
+        check = lab_strdup(has_evidence
+                               ? "{\"status\":\"error\",\"checked_feasible\":false,"
+                                 "\"message\":\"checker did not complete with a matching JSON report\"}"
+                               : "{\"status\":\"unavailable\",\"checked_feasible\":false}");
     }
     size_t checklen = strlen(check);
     while (checklen && isspace((unsigned char)check[checklen - 1]))
         check[--checklen] = 0;
+    /* Raw newlines in a validated JSON object can occur only between tokens.
+     * Keep one line per attempt in runs.jsonl even for a pretty-printed report. */
+    for (size_t i = 0; i < checklen; ++i)
+        if (check[i] == '\r' || check[i] == '\n')
+            check[i] = ' ';
     FILE *f = fopen(result, "wx");
     if (!f)
         die("cannot write run result");
@@ -826,6 +1018,7 @@ static void one(const Instance *inst, const Solver *s, const char *checker, cons
     lab_json_string(f, s->sha);
     fprintf(f, ",\"checker_sha256\":");
     lab_json_string(f, checker_sha);
+    fprintf(f, ",\"configuration_sha256\":\"%s\"", s->configuration_sha);
     fprintf(f, ",\"runner_sha256\":");
     lab_json_string(f, runner_sha);
     fprintf(f, ",\"relaxation\":%s,\"mode\":\"%s\",\"dual_file\":", relax ? "true" : "false",
@@ -840,6 +1033,8 @@ static void one(const Instance *inst, const Solver *s, const char *checker, cons
             "\"watchdog_timeout\":%s",
             seed, limit, grace, p.wall, p.cpu, p.rss, p.code, p.signal,
             p.timed_out ? "true" : "false");
+    if (campaign_id)
+        paired_fields(f, campaign_id, host, limit, grace, seed);
     if (p.suspended >= 0)
         fprintf(f, ",\"host_suspend_s\":%.9g,\"sleep_affected\":%s", p.suspended,
                 p.suspended > 5.0 ? "true" : "false");
@@ -855,6 +1050,13 @@ static void one(const Instance *inst, const Solver *s, const char *checker, cons
     fprintf(f, ",\"status_source\":");
     lab_json_string(f, status_source);
     fprintf(f, ",\"status_conflict\":%s", status_conflict ? "true" : "false");
+    for (size_t field = 0; field < EVIDENCE_FIELDS; ++field) {
+        fprintf(f, ",\"%s\":", evidence_fields[field]);
+        if (evidence.value[field][0])
+            lab_json_string(f, evidence.value[field]);
+        else
+            fputs("null", f);
+    }
     fprintf(f, ",\"reported_dual_bound\":");
     if (bound[0])
         lab_json_string(f, bound);
@@ -866,6 +1068,16 @@ static void one(const Instance *inst, const Solver *s, const char *checker, cons
     lab_json_string(f, inst->value);
     fprintf(f, ",\"argv\":");
     argv_json(f, args);
+    fputs(",\"checker_argv\":", f);
+    argv_json(f, ca);
+    fputs(",\"evidence_sha256\":{", f);
+    if (has_solution)
+        fprintf(f, "\"solution.sol\":\"%s\"", solution_sha);
+    if (has_dual)
+        fprintf(f, "%s\"dual.sol\":\"%s\"", has_solution ? "," : "", dual_sha);
+    if (has_farkas)
+        fprintf(f, "%s\"infeasible.farkas\":\"%s\"", has_solution || has_dual ? "," : "", farkas_sha);
+    fputc('}', f);
     fprintf(f, ",\"checker_exit_code\":");
     if (has_evidence)
         fprintf(f, "%d", cp.code);
@@ -878,10 +1090,7 @@ static void one(const Instance *inst, const Solver *s, const char *checker, cons
     fflush(all);
     printf("%s %s seed=%d status=%s wall=%.3fs check=%s\n", inst->id, s->name, seed, claimed,
            p.wall,
-           has_evidence ? (cp.code == 0   ? "valid"
-                           : cp.code == 1 ? "invalid"
-                                          : "unavailable")
-                        : "no_solution");
+           checked_status ? checked_status : (has_evidence ? "error" : "no_solution"));
     fflush(stdout);
     free(json);
     free(check);
@@ -892,12 +1101,13 @@ static void one(const Instance *inst, const Solver *s, const char *checker, cons
     free(result);
     free(checklog);
     free(dual);
+    free(farkas);
 }
 int main(int argc, char **argv) {
     if (argc == 2 && !strcmp(argv[1], "--help")) {
         puts("milpbench --suite FILE --out NEW_DIR [--solvers FILE] [--checker FILE]\n"
              "          [--limit SECONDS] [--grace SECONDS] [--seed POSITIVE_INT]\n"
-             "          [--max-instances N] [--relax | --mip]\n"
+             "          [--max-instances N] [--relax | --mip] [--paired [--quiescent]]\n"
              "--relax currently supports only lab; suite reference objectives must be LP values.\n"
              "--mip permits lab/native mixed runs and keeps integrality checks enabled.\n"
              "Run from the project root. Results are immutable per output directory.");
@@ -906,9 +1116,17 @@ int main(int argc, char **argv) {
     const char *suite = NULL, *config = "config/solvers.tsv", *output = NULL,
                *checker_arg = "build/milpcheck";
     double limit = 2, grace = 15;
-    int seed = 1, relax = 0, mip = 0;
+    int seed = 1, relax = 0, mip = 0, paired = 0, quiescent = 0;
     size_t max = SIZE_MAX;
     for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "--quiescent")) {
+            quiescent = 1;
+            continue;
+        }
+        if (!strcmp(argv[i], "--paired")) {
+            paired = 1;
+            continue;
+        }
         if (!strcmp(argv[i], "--relax")) {
             relax = 1;
             continue;
@@ -968,12 +1186,26 @@ int main(int argc, char **argv) {
             die("--relax currently supports only lab; native MILP adapters cannot be mixed with LP "
                 "references");
     }
+    if (quiescent && !paired)
+        die("--quiescent requires --paired");
+    if (paired && (!mip || ns != 2 || seed != 1 ||
+        (strcmp(solvers[0].name, "lab") && strcmp(solvers[1].name, "lab")) ||
+        (strcmp(solvers[0].name, "highs") && strcmp(solvers[1].name, "highs"))))
+        die("--paired requires --mip, seed 1, and exactly lab and highs");
+    if (paired && grace <= 0)
+        die("paired campaigns require positive watchdog grace");
+    if (paired && (getenv("LAB_SCIP_SET") || getenv("LAB_PHASE_TRACE")))
+        die("paired adapter defaults require LAB_SCIP_SET and LAB_PHASE_TRACE unset");
     size_t loaded_instances = ni;
     struct sigaction action = {0};
     action.sa_handler = on_signal;
     sigemptyset(&action.sa_mask);
     if (sigaction(SIGINT, &action, NULL) || sigaction(SIGTERM, &action, NULL))
         die("sigaction");
+    action.sa_handler = child_exited;
+    action.sa_flags = SA_NOCLDSTOP;
+    if (sigaction(SIGCHLD, &action, NULL))
+        die("SIGCHLD handler");
     char *checker = absolute(checker_arg), *self = absolute(argv[0]);
     char checker_sha[65], runner_sha[65];
     if (lab_sha256(checker, checker_sha) || lab_sha256(self, runner_sha))
@@ -984,6 +1216,8 @@ int main(int argc, char **argv) {
     FILE *all = fopen(allpath, "wx");
     if (!all)
         die("output directory already contains results");
+    for (size_t j = 0; j < ns; j++)
+        freeze_config(&solvers[j], out, runner_sha, relax, limit, grace, seed, paired);
     char *envpath = pathcat(out, "environment.json");
     FILE *env = fopen(envpath, "wx");
     if (!env)
@@ -1000,6 +1234,16 @@ int main(int argc, char **argv) {
     char h[65];
     if (lab_sha256(suite, h))
         die("suite hash");
+    char campaign_id[128];
+    if (paired) {
+        struct timespec started;
+        if (clock_gettime(CLOCK_REALTIME, &started))
+            die("cannot identify campaign");
+        snprintf(campaign_id, sizeof campaign_id, "%s-%ld-%ld-%ld", h, (long)started.tv_sec,
+                 started.tv_nsec, (long)getpid());
+        write_campaign(out, campaign_id, machine.nodename, solvers, limit, grace, seed, quiescent,
+                       checker_sha, runner_sha, h);
+    }
     fprintf(env, ",\"suite_sha256\":");
     lab_json_string(env, h);
     if (lab_sha256(config, h))
@@ -1025,7 +1269,7 @@ int main(int argc, char **argv) {
         verify(instances[i].path, instances[i].sha);
         for (size_t j = 0; j < ns && !interrupted; j++)
             one(&instances[i], &solvers[(j + i) % ns], checker, checker_sha, runner_sha, out, limit,
-                grace, seed, relax, all);
+                grace, seed, relax, paired ? campaign_id : NULL, machine.nodename, all);
     }
     fclose(all);
     for (size_t i = 0; i < loaded_instances; i++) {

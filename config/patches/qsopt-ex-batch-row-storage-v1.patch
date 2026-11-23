@@ -1,0 +1,111 @@
+--- a/qsopt_ex/lib.c
++++ b/qsopt_ex/lib.c
+@@ -121,6 +121,8 @@
+ # include "config.h"
+ #endif
+ 
++#include <limits.h>
++#include <stdint.h>
+ #include <stdlib.h>
+ #include <string.h>
+ 
+@@ -1510,6 +1512,89 @@
+ 	EG_RETURN (rval);
+ }
+ 
++/* Reserve each existing column's final length before inserting a large row
++ * batch. matrix_addrow can then append in input order without moving a
++ * column or repacking the matrix. The logical columns grow at the tail. */
++static int reserve_row_batch (
++	EGLPNUM_TYPENAME_ILLlpdata *qslp, int num, const int *cnt, const int *beg,
++	const int *ind)
++{
++	EGLPNUM_TYPENAME_ILLmatrix *A = &qslp->A;
++	int *space = NULL, *newind = NULL;
++	EGLPNUM_TYPE *newval = NULL;
++	int rval = 0;
++	int64_t added = 0, used = 0;
++
++	if (num < 64 || !ind || A->matcols == 0)
++		return 0;
++	for (int i = 0; i < num; ++i)
++		added += cnt[i];
++	/* Small cut batches on an established LP use the incremental path. */
++	if (added == 0 || added < qslp->nzcount / 2)
++		return 0;
++	if (added + num + (int64_t)qslp->nzcount > INT_MAX)
++		return 1;
++
++	ILL_SAFE_MALLOC (space, A->matcols, int);
++	memcpy (space, A->matcnt, (size_t) A->matcols * sizeof *space);
++	for (int i = 0; i < num; ++i)
++		for (int k = 0; k < cnt[i]; ++k)
++		{
++			int j = ind[beg[i] + k];
++			if (j < 0 || j >= qslp->nstruct)
++			{
++				rval = 1;
++				goto CLEANUP;
++			}
++			++space[qslp->structmap[j]];
++		}
++	for (int j = 0; j < A->matcols; ++j)
++		used += space[j] ? space[j] : 1;
++	if (used + num + EXTRA_MAT > INT_MAX)
++	{
++		rval = 1;
++		goto CLEANUP;
++	}
++	int capacity = (int)used + num + EXTRA_MAT;
++	ILL_SAFE_MALLOC (newind, capacity, int);
++	newval = EGLPNUM_TYPENAME_EGlpNumAllocArray (capacity);
++	if (!newval)
++	{
++		rval = 1;
++		goto CLEANUP;
++	}
++	for (int k = 0; k < capacity; ++k)
++		newind[k] = -1;
++	int start = 0;
++	for (int j = 0; j < A->matcols; ++j)
++	{
++		int old = A->matbeg[j];
++		/* Even an empty column owns one slot that neighbors cannot steal. */
++		newind[start] = 1;
++		for (int k = 0; k < A->matcnt[j]; ++k)
++		{
++			newind[start + k] = A->matind[old + k];
++			EGLPNUM_TYPENAME_EGlpNumCopy (newval[start + k], A->matval[old + k]);
++		}
++		A->matbeg[j] = start;
++		start += space[j] ? space[j] : 1;
++	}
++	ILL_IFFREE(A->matind);
++	EGLPNUM_TYPENAME_EGlpNumFreeArray (A->matval);
++	A->matind = newind;
++	A->matval = newval;
++	A->matsize = capacity;
++	A->matfree = capacity - start;
++	newind = NULL;
++	newval = NULL;
++
++CLEANUP:
++	ILL_IFFREE(space);
++	ILL_IFFREE(newind);
++	EGLPNUM_TYPENAME_EGlpNumFreeArray (newval);
++	return rval;
++}
++
+ int EGLPNUM_TYPENAME_ILLlib_addrows (
+ 	EGLPNUM_TYPENAME_lpinfo * lp,
+ 	EGLPNUM_TYPENAME_ILLlp_basis * B,
+@@ -1633,6 +1718,9 @@
+ 
+ 		badfactor = 1;
+ 	}
++
++	rval = reserve_row_batch (lp->O, num, rmatcnt, rmatbeg, rmatind);
++	CHECKRVALG (rval, CLEANUP);
+ 
+ 	for (i = 0; i < num; i++)
+ 	{

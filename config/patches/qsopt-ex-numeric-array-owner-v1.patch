@@ -1,0 +1,26 @@
+--- a/qsopt_ex/qsopt.h
++++ b/qsopt_ex/qsopt.h
+@@ -84,6 +84,7 @@
+ #endif
+ 
+ EGLPNUM_TYPENAME_QSLIB_INTERFACE void EGLPNUM_TYPENAME_QSfree ( void *ptr),
++		EGLPNUM_TYPENAME_QSfree_numeric_array ( EGLPNUM_TYPE *values),
+ 		EGLPNUM_TYPENAME_QSfree_prob ( EGLPNUM_TYPENAME_QSprob p),
+ 		EGLPNUM_TYPENAME_QSfree_basis ( EGLPNUM_TYPENAME_QSbas B),
+ 	  EGLPNUM_TYPENAME_QSset_precision ( const unsigned prec),/**< set the precision for floating 
+--- a/qsopt_ex/qsopt.c
++++ b/qsopt_ex/qsopt.c
+@@ -3489,6 +3489,13 @@
+ 	EG_RETURN (rval);
+ }
+ 
++/* Numeric vectors returned by the row/column getters carry an allocation header. */
++EGLPNUM_TYPENAME_QSLIB_INTERFACE void EGLPNUM_TYPENAME_QSfree_numeric_array (
++	EGLPNUM_TYPE *values)
++{
++	EGLPNUM_TYPENAME_EGlpNumFreeArray (values);
++}
++
+ EGLPNUM_TYPENAME_QSLIB_INTERFACE void EGLPNUM_TYPENAME_QSfree (
+ 	void *ptr)
+ {

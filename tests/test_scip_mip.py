@@ -1,6 +1,8 @@
 """Contract tests for the general C17 SCIP branch-and-cut and symmetry detector."""
 from fractions import Fraction as F
+from itertools import permutations, product
 import json
+import os
 from pathlib import Path
 import random
 import subprocess
@@ -8,22 +10,329 @@ import sys
 import tempfile
 import unittest
 
-from test_mip_solver import integer_mps
+from test_lp_solver import decimal
+from test_mip_solver import generated_models, integer_mps, mip_oracle
 
 SOLVER, CHECKER = (Path(p).resolve() for p in sys.argv[1:3])
 del sys.argv[1:3]
 
 
 class ScipGeneralMip(unittest.TestCase):
-    def run_model(self, directory, text, options=()):
+    def test_binary_cover_uses_exact_decimal_threshold(self):
+        low = F(3333333333, 10**10)
+        just_below = F(3333333333333333332, 10**19)
+        just_above = 1 - 2 * just_below
+        for weights, cost, expected in [
+            ([low] * 7, [1] * 7, 4),
+            ([F(3333333334, 10**10)] * 7, [1] * 7, 3),
+            ([F(1, 100)] * 7, [1] * 7, 10),
+            ([just_below, just_below, just_above] + [just_below] * 4, [1, 1, 1, 4, 4, 4, 4], 3),
+        ]:
+            for upper in (False, True):
+                sign = -1 if upper else 1
+                a = [sign * w for w in [F(5, 4), 2, *weights]] + [0] * 25
+                data = dict(cost=[sign * c for c in [10, 20, *cost]] + [0] * 25,
+                            bounds=[(0, 1)] * 34, integer=[True] * 9 + [False] * 25,
+                            rows=[(a, None, -1) if upper else (a, 1, None)], offset=0, maximize=upper)
+                with self.subTest(weights=weights, upper=upper), tempfile.TemporaryDirectory() as tmp:
+                    result, model, solution = self.run_model(Path(tmp), integer_mps(data))
+                    self.assertEqual(result['status'], 'optimal', result)
+                    check = subprocess.run([CHECKER, '--model', model, '--solution', solution, '--exact'],
+                                           capture_output=True, text=True, check=True)
+                    self.assertEqual(F(json.loads(check.stdout)['objective']), sign * expected)
+
+    def test_binary_cover_respects_continuous_columns_and_both_row_sides(self):
+        a = [2] + [F(2, 5)] * 4 + [0] * 29
+        for integer, upper, expected in [(False, None, F(1, 2)), (True, F(5, 4), 3)]:
+            data = dict(cost=[1] * 5 + [0] * 29, integer=[integer] + [True] * 4 + [False] * 29,
+                        bounds=[(0, 1)] * 34, rows=[(a, 1, upper)], offset=0, maximize=False)
+            with self.subTest(integer=integer), tempfile.TemporaryDirectory() as tmp:
+                result, model, solution = self.run_model(Path(tmp), integer_mps(data))
+                self.assertEqual(result['status'], 'optimal', result)
+                check = subprocess.run([CHECKER, '--model', model, '--solution', solution, '--exact'],
+                                       capture_output=True, text=True, check=True)
+                self.assertEqual(F(json.loads(check.stdout)['objective']), expected)
+
+    def test_uniform_binary_cover_rounds_the_source_ratio(self):
+        for n, unit, required in [(7, F(3333333333, 10**10), 4), (2, F(4999999999, 10**10), None)]:
+            data = dict(cost=[1] * n + [0] * 32, integer=[True] * n + [False] * 32,
+                        bounds=[(0, 1)] * (n + 32), offset=0, maximize=False,
+                        rows=[([unit] * n + [0] * 32, 1, None)])
+            with self.subTest(n=n), tempfile.TemporaryDirectory() as tmp:
+                result, model, solution = self.run_model(Path(tmp), integer_mps(data))
+                if required is None:
+                    self.assertEqual(result['status'], 'infeasible', result)
+                else:
+                    self.assertEqual(result['status'], 'optimal', result)
+                    check = subprocess.run([CHECKER, '--model', model, '--solution', solution, '--exact'],
+                                           capture_output=True, text=True, check=True)
+                    self.assertEqual(F(json.loads(check.stdout)['objective']), required)
+
+    def test_signed_integer_row_rounding_against_enumeration(self):
+        for unit, rhs, upper, domain in [
+            (F(3333333334, 10**10), 1, True, (0, 1)),
+            (F(3333333334, 10**10), -1, False, (-2, 2)),
+            (F(3333333333, 10**10), -1, True, (-2, 2)),
+            (F(9999999999999999999, 10**19), 1, False, (0, 1)),
+        ]:
+            signs = [1, -1, 1, 1]
+            values = [sum(s * v for s, v in zip(signs, x))
+                      for x in product(range(domain[0], domain[1] + 1), repeat=len(signs))]
+            expected = (max(v for v in values if unit * v <= rhs) if upper else
+                        min(v for v in values if unit * v >= rhs))
+            a = [s * unit for s in signs] + [0] * 32
+            data = dict(cost=signs + [0] * 32, integer=[True] * 4 + [False] * 32,
+                        bounds=[domain] * 4 + [(0, 1)] * 32, offset=0, maximize=upper,
+                        rows=[(a, None, rhs) if upper else (a, rhs, None)])
+            with self.subTest(unit=unit, upper=upper, domain=domain), tempfile.TemporaryDirectory() as tmp:
+                result, model, solution = self.run_model(Path(tmp), integer_mps(data))
+                self.assertEqual(result['status'], 'optimal', result)
+                check = subprocess.run([CHECKER, '--model', model, '--solution', solution, '--exact'],
+                                       capture_output=True, text=True, check=True)
+                self.assertEqual(F(json.loads(check.stdout)['objective']), expected)
+
+    def test_nonuniform_integer_row_lattice_against_enumeration(self):
+        # A bound can land exactly on an attainable activity in binary64 while
+        # lying strictly on the other side in the original decimal model.
+        cases = [
+            ([F(1, 5), F(2, 5), F(3, 5)], 1),
+            ([F(-1, 8), F(3, 16), F(5, 32)], F(-3, 32)),
+            ([F(-3, 100), F(21, 200), F(-3, 40)], F(3, 40)),
+        ]
+        for (a, boundary), upper, digits in product(cases, (True, False), (10, 19)):
+            rhs = boundary + (-1 if upper else 1) * F(1, 10**digits)
+            cost = [int(c * 800) for c in a]
+            feasible = []
+            for x in product(range(-2, 3), repeat=3):
+                activity = sum(c * y for c, y in zip(a, x))
+                if (activity <= rhs if upper else activity >= rhs):
+                    feasible.append(sum(c * y for c, y in zip(cost, x)))
+            expected = (max if upper else min)(feasible)
+            coeff = a + [0] * 32
+            model = dict(cost=cost + [0] * 32, integer=[True] * 3 + [False] * 32,
+                         bounds=[(-2, 2)] * 3 + [(0, 1)] * 32, offset=0, maximize=upper,
+                         rows=[(coeff, None, rhs) if upper else (coeff, rhs, None)])
+            with self.subTest(a=a, upper=upper, digits=digits), tempfile.TemporaryDirectory() as tmp:
+                result, original, witness = self.run_model(Path(tmp), integer_mps(model))
+                self.assertEqual((result['status'], result['objective']), ('optimal', expected))
+                checked = subprocess.run([CHECKER, '--exact', '--model', original, '--solution', witness],
+                                         capture_output=True, text=True, check=True)
+                self.assertEqual(F(json.loads(checked.stdout)['objective']), expected)
+
+    def run_model(self, directory, text, options=(), env=None):
         model = directory / 'test.mps'
         sol = directory / 'point.sol'
         model.write_text(text)
         r = subprocess.run([SOLVER, model, '--mip', '--solution', sol, '--time-limit', '10',
-                            *options], capture_output=True, text=True, timeout=20)
+                            *options], capture_output=True, text=True, timeout=20, env=env)
         self.assertIn(r.returncode, (0, 4), (r.stdout, r.stderr))
         self.assertNotIn('runtime error:', r.stderr)
         return json.loads(r.stdout), model, sol
+
+    def test_small_reduced_cost_on_large_transport_flow(self):
+        # With equal supplies and demands the LP has an optimal permutation.
+        # Every permutation remains feasible with an integer first column entry.
+        increments = [[0, 61, 0], [22, 84, 61], [61, 38, 61]]
+        costs = [F(22000000 + v, 10**9) for row in increments for v in row]
+        expected = 10000 * min(sum(costs[3*i+j] for i, j in enumerate(order))
+                               for order in permutations(range(3)))
+        for algorithm in ('default', 'primal'):
+            with self.subTest(algorithm=algorithm), tempfile.TemporaryDirectory() as tmp:
+                directory = Path(tmp)
+                lines = ['NAME TRANSPORT', 'ROWS', ' N COST']
+                rows = [f'{side}{i}' for side in ('r', 's') for i in range(3)]
+                lines.extend(f' E {row}' for row in rows)
+                lines.append('COLUMNS')
+                for i, j in product(range(3), repeat=2):
+                    lines.extend([f' x{i}{j} COST {decimal(costs[3*i+j])} r{i} 1',
+                                  f' x{i}{j} s{j} 1'])
+                lines.extend(f' z{k} COST 0' for k in range(33))
+                lines.append('RHS')
+                lines.extend(f' rhs {row} 10000' for row in rows)
+                lines.extend(['BOUNDS', ' LI bd x00 0', 'ENDATA'])
+                env = os.environ.copy()
+                if algorithm == 'primal':
+                    settings = directory / 'primal.set'
+                    settings.write_text('lp/initalgorithm = p\n')
+                    env['LAB_SCIP_SET'] = str(settings)
+                result, model, sol = self.run_model(directory, '\n'.join(lines) + '\n', env=env)
+                self.assertEqual((result['search_route'], result['status']), ('general_scip', 'optimal'))
+                checked = json.loads(subprocess.check_output([CHECKER, '--model', model, '--solution', sol, '--exact']))
+                self.assertEqual(F(checked['objective']), expected)
+                self.assertAlmostEqual(result['best_bound'], float(expected), places=9)
+
+    def test_near_tied_prices_in_equivalent_formulations(self):
+        # a+b >= 10^6 implies the objective is at least 10^6 times the
+        # cheaper price. The integer b alone attains that lower bound.
+        fixture = (Path(__file__).parent / 'fixtures/near_tied_costs_order.mps').read_text()
+        prices = [' b COST 0.022 DEMAND 1', ' a COST 0.0220000004 DEMAND 1']
+        for sign, scale, offset, swap in product((1, -1), (1, 1000), (0, 17), (False, True)):
+            lines = [line.replace(price, decimal(sign * scale * F(price)))
+                     for line, price in zip(prices, ['0.022', '0.0220000004'])]
+            text = fixture.replace('\n'.join(prices), '\n'.join(reversed(lines) if swap else lines))
+            text = text.replace('ROWS\n', 'OBJSENSE\n ' + ('MAX' if sign < 0 else 'MIN') + '\nROWS\n')
+            text = text.replace('RHS\n', f'RHS\n rhs COST {-offset}\n')
+            for route, options in [('general', []), ('disabled', ['--no-scip'])]:
+                with self.subTest(sign=sign, scale=scale, offset=offset, swap=swap, route=route), \
+                        tempfile.TemporaryDirectory() as tmp:
+                    result, model, sol = self.run_model(Path(tmp), text, options)
+                    self.assertEqual((result['status'], result['scip_route']), ('optimal', route), result)
+                    check = subprocess.run([CHECKER, '--model', model, '--solution', sol, '--exact'],
+                                           capture_output=True, text=True, check=True)
+                    for value in [json.loads(check.stdout)['objective'], result['objective'], result['best_bound']]:
+                        self.assertEqual((F(str(value)) - offset) / (sign * scale), 22000)
+
+    def test_distinct_prices_below_the_strict_threshold_fall_back(self):
+        source = (Path(__file__).parent / 'fixtures/near_tied_costs_order.mps').read_text()
+        text = source.replace('0.0220000004', '0.0220000000000005')
+        with tempfile.TemporaryDirectory() as tmp:
+            result, model, sol = self.run_model(Path(tmp), text)
+            self.assertEqual(result['scip_route'], 'general_fallback')
+            self.assertEqual(result['scip_fallback_reason'], 'lossy_model_import')
+            self.assertEqual((result['search_route'], result['bound_origin']), ('native', 'search_exhaustion'))
+            self.assertEqual((result['status'], result['best_bound']), ('optimal', 22000))
+            check = subprocess.run([CHECKER, '--model', model, '--solution', sol, '--exact'],
+                                   capture_output=True, text=True, check=True)
+            self.assertEqual(F(json.loads(check.stdout)['objective']), 22000)
+
+    def test_relative_gap_stop_preserves_the_open_bound(self):
+        # A large offset makes the all-zero feasible independent set reach the
+        # requested relative gap while its objective is still improvable.
+        n = 36
+        rng = random.Random(240)
+        rows = []
+        for i in range(n):
+            for j in range(i):
+                if rng.random() < 0.2:
+                    row = [0] * n
+                    row[i] = row[j] = 1
+                    rows.append((row, None, 1))
+        data = dict(cost=[1 + rng.randrange(10) for _ in range(n)], bounds=[(0, 1)] * n,
+                    integer=[True] * n, rows=rows, offset=10**9, maximize=True)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            model, settings, sol = root/'gap.mps', root/'gap.set', root/'gap.sol'
+            model.write_text(integer_mps(data))
+            settings.write_text('limits/gap = 1e-6\nlimits/absgap = 0\n')
+            run = subprocess.run([SOLVER, model, '--mip', '--solution', sol],
+                                 env={**os.environ, 'LAB_SCIP_SET': str(settings)},
+                                 capture_output=True, text=True, timeout=20)
+            self.assertEqual(run.returncode, 4, run.stderr)
+            result = json.loads(run.stdout)
+            self.assertEqual((result['status'], result['scip_route']), ('gap_limit', 'general'))
+            self.assertFalse(result['certifies_optimality'])
+            check = subprocess.run([CHECKER, '--model', model, '--solution', sol, '--exact'],
+                                   capture_output=True, text=True, check=True)
+            primal = F(json.loads(check.stdout)['objective'])
+            dual = F(str(result['best_bound']))
+            self.assertGreater(dual, primal)
+            self.assertLessEqual((dual - primal) / primal, F(1, 10**6))
+
+    def test_small_coefficient_and_nearly_dependent_equalities(self):
+        fixtures = Path(__file__).parent / 'fixtures'
+        small = (fixtures / 'small_coefficient_scip.mps').read_text()
+        parallel = (fixtures / 'near_parallel_scip.mps').read_text()
+        scaled_small = (small.replace(' G R\n', ' L R\n')
+                        .replace('O 1 R 1', 'O 1 R -2').replace('y R 1e-10', 'y R -2e-10')
+                        .replace('b R 1', 'b R -2'))
+        reordered = (parallel.replace(' E A\n E B\n', ' E B\n E A\n')
+                     .replace(' x B 1\n', ' x B -2\n')
+                     .replace('B 1.000000000014551915228366851806640625',
+                              'B -2.00000000002910383045673370361328125')
+                     .replace('B .0000019073486328125', 'B -.000003814697265625'))
+        for name, text in [('small', small), ('scaled', scaled_small), ('parallel', parallel),
+                           ('reordered', reordered)]:
+            with self.subTest(model=name), tempfile.TemporaryDirectory() as tmp:
+                result, path, point = self.run_model(Path(tmp), text)
+                self.assertEqual(result['status'], 'optimal', result)
+                checker = subprocess.run([CHECKER, '--model', path, '--solution', point, '--exact'],
+                                         capture_output=True, text=True, check=True)
+                self.assertEqual(F(json.loads(checker.stdout)['objective']), 0)
+                self.assertFalse(result['certifies_optimality'])
+
+    def test_small_objective_over_large_domain(self):
+        original = (Path(__file__).parent / 'fixtures/small_coefficient_scip.mps').read_text()
+        for exponent in (10, 16):
+            text = (original.replace('x O 1 R 1', 'x O 0 R 1')
+                    .replace('y R 1e-10', f'y O -1e-{exponent}')
+                    .replace('10000000000', '1000000000000'))
+            with self.subTest(exponent=exponent), tempfile.TemporaryDirectory() as tmp:
+                result, path, point = self.run_model(Path(tmp), text)
+                self.assertEqual(result['status'], 'optimal', result)
+                checked = subprocess.run([CHECKER, '--model', path, '--solution', point, '--exact'],
+                                         capture_output=True, check=True, text=True)
+                self.assertEqual(F(json.loads(checked.stdout)['objective']), -F(10**12, 10**exponent))
+                if exponent == 16:
+                    self.assertEqual(result['scip_fallback_reason'], 'lossy_model_import')
+
+    def test_source_equalities_beyond_backend_precision(self):
+        original = (Path(__file__).parent / 'fixtures/near_parallel_scip.mps').read_text()
+        source_coefficient = '1.000000000014551915228366851806640625'
+        for exponent in (50, 54):
+            coefficient = '1.' + str(5 ** exponent).zfill(exponent)
+            text = original.replace(source_coefficient, coefficient)
+            for flags in ([], ['--no-scip']):
+                with self.subTest(exponent=exponent, flags=flags), tempfile.TemporaryDirectory() as tmp:
+                    result, path, point = self.run_model(Path(tmp), text, flags)
+                    self.assertEqual((result['status'], result['objective']), ('optimal', 0))
+                    check = subprocess.run([CHECKER, '--exact', '--model', path, '--solution', point],
+                                           capture_output=True, check=True, text=True)
+                    self.assertTrue(json.loads(check.stdout)['checked_feasible'])
+            if exponent == 54:
+                with tempfile.TemporaryDirectory() as tmp:
+                    result, _, _ = self.run_model(Path(tmp), text, ['--no-exact'])
+                    self.assertEqual(result['status'], 'numerical_failure', result)
+            # A redundant inequality makes the matrix rectangular. If the exact
+            # recovery cannot find a point, the floating cutoff must stay open.
+            rectangular = text.replace(' E B\n', ' E B\n L C\n').replace(
+                ' x B 1\n', ' x B 1 C 1\n').replace(' b A 0', ' b C 0\n b A 0')
+            with tempfile.TemporaryDirectory() as tmp:
+                result, path, _ = self.run_model(Path(tmp), rectangular)
+                witness = Path(tmp) / 'known.sol'
+                y = 2 ** (exponent - 19)
+                witness.write_text(f'x {-y}\ny {y}\n')
+                subprocess.run([CHECKER, '--exact', '--model', path, '--solution', witness],
+                               capture_output=True, check=True)
+                self.assertIn(result['status'], ('optimal', 'numerical_failure'))
+
+    def test_padded_generated_models_against_exact_oracle(self):
+        for case, model in enumerate(generated_models(16)):
+            optimum = mip_oracle(model)
+            padding = 36 - len(model['cost'])
+            padded = {**model, 'cost': model['cost'] + [0] * padding,
+                      'bounds': model['bounds'] + [(0, 0)] * padding,
+                      'integer': model['integer'] + [False] * padding,
+                      'rows': [(a + [0] * padding, lo, hi) for a, lo, hi in model['rows']]}
+            with tempfile.TemporaryDirectory() as tmp:
+                result, path, point = self.run_model(Path(tmp), integer_mps(padded))
+                # Every eleventh generated case has a half-integral singleton equality.
+                self.assertEqual(result['search_route'], 'presolve' if case % 11 == 0 else 'general_scip')
+                if optimum is None:
+                    self.assertEqual(result['status'], 'infeasible', result)
+                else:
+                    self.assertEqual(result['status'], 'optimal', result)
+                    check = subprocess.run([CHECKER, '--model', path, '--solution', point],
+                                           capture_output=True, text=True, check=True)
+                    self.assertLessEqual(abs(F(json.loads(check.stdout)['objective']) - optimum), F(1, 10**7))
+                    self.assertLessEqual(abs(F(str(result['best_bound'])) - optimum), F(1, 10**7))
+
+    def test_observing_or_disabling_native_heuristics_preserves_backend(self):
+        text = (Path(__file__).parent / 'fixtures/small_coefficient_scip.mps').read_text()
+        for options in ([], ['--no-root-diving'], ['--no-root-cuts'], ['--trace']):
+            with tempfile.TemporaryDirectory() as tmp:
+                trace = Path(tmp) / 'events.jsonl'
+                args = [*options, trace] if options == ['--trace'] else options
+                result, _, _ = self.run_model(Path(tmp), text, args)
+                self.assertEqual(result['scip_route'], 'general', result)
+                self.assertEqual((result['status'], result['objective']), ('optimal', 0))
+                if trace.exists():
+                    events = [json.loads(line)['event'] for line in trace.read_text().splitlines()]
+                    self.assertIn('scip_mip_start', events)
+                    self.assertIn('scip_mip_optimum', events)
+        with tempfile.TemporaryDirectory() as tmp:
+            result, _, _ = self.run_model(Path(tmp), text, ['--no-scip'])
+            self.assertEqual(result['scip_route'], 'disabled')
+            self.assertEqual((result['status'], result['objective']), ('optimal', 0))
 
     def test_mixed_integer_min_max_and_offset(self):
         # 36 columns: 18 binary + 18 continuous, with linking big-M rows and offset.
@@ -47,13 +356,22 @@ class ScipGeneralMip(unittest.TestCase):
             rows.append(([0] * n_bin + [1] * n_bin, 10, 20))
             m = dict(cost=costs, bounds=bounds, integer=integer, rows=rows,
                      offset=F(11, 4), maximize=maximize)
-            # Compute exact optimum by choosing best y_i in {0, 4} for each open x_i.
-            pair_vals = []
+            # For fixed binaries this is a box with a single sum constraint and
+            # integer endpoints, so an integral continuous optimum exists.
+            best = max if maximize else min
+            dp = {(0, 0): F(0)}
             for i in range(n_bin):
-                c_x, c_y = costs[i], costs[n_bin + i]
-                pair_vals.append((c_x, c_y))
-            # Exact DP / enumeration over k open bins is tiny (n_bin=18, 2^18=262k? Even simpler:
-            # compare SCIP result against native --no-root-diving fallback on exact same model!)
+                after = dict(dp)
+                for (opened, units), value in dp.items():
+                    if opened == 7:
+                        continue
+                    for y in range(5):
+                        state = opened + 1, units + y
+                        score = value + costs[i] + y * costs[n_bin + i]
+                        after[state] = best(after.get(state, score), score)
+                dp = after
+            expected = m['offset'] + best(v for (k, u), v in dp.items()
+                                          if 3 <= k <= 7 and 10 <= u <= 20)
             with self.subTest(maximize=maximize), tempfile.TemporaryDirectory() as tmp:
                 text = integer_mps(m)
                 v, model, sol = self.run_model(Path(tmp), text)
@@ -65,14 +383,7 @@ class ScipGeneralMip(unittest.TestCase):
                 self.assertEqual(chk.returncode, 0, (chk.stdout, chk.stderr))
                 c = json.loads(chk.stdout)
                 self.assertTrue(c['checked_feasible'], c)
-                # Cross-check against exact brute-force over the optimal LP per k:
-                # For any chosen subset S (3 <= |S| <= 7), sum y_i in [10, 20], 0 <= y_i <= 4.
-                # Verify optimality against native B&B with --no-root-diving (disables SCIP).
-                nat_dir = Path(tmp) / 'nat'
-                nat_dir.mkdir()
-                v_nat, _, _ = self.run_model(nat_dir, text, ['--no-root-diving'])
-                if v_nat['status'] == 'optimal':
-                    self.assertAlmostEqual(float(F(c['objective'])), v_nat['objective'], places=5)
+                self.assertEqual(F(c['objective']), expected)
 
     def test_symmetric_packing_exercises_c17_symmetry(self):
         # 6 identical bins x 8 items = 48 binary vars + 6 bin-open vars = 54 vars.
@@ -251,12 +562,26 @@ class ScipGeneralMip(unittest.TestCase):
             self.assertEqual(chk.returncode, 0, (chk.stdout, chk.stderr))
             c = json.loads(chk.stdout)
             self.assertTrue(c['checked_feasible'], c)
-            # Cross-check objective against native B&B (--no-root-diving disables SCIP).
-            nat_dir = Path(tmp) / 'nat'
-            nat_dir.mkdir()
-            v_nat, _, _ = self.run_model(nat_dir, text, ['--no-root-diving'])
-            if v_nat['status'] == 'optimal':
-                self.assertAlmostEqual(float(F(c['objective'])), v_nat['objective'], places=5)
+            # Fixing each binary pair leaves two box-bounded continuous
+            # variables and an integer upper bound on their sum. Enumerate
+            # their integral vertices and combine independent pairs by budget.
+            dp = {0: 0}
+            for i in range(0, n_bin, 2):
+                after = {}
+                for x0, x1, y0, y1 in product(range(2), range(2), range(4), range(4)):
+                    if y0 + y1 > min(1000 * x0, 1003 - 1000 * x1):
+                        continue
+                    if any(j % 3 == 0 and 1000 * x + y < 2 or
+                           j % 3 == 1 and y - 1000 * x < -998
+                           for j, x, y in [(i, x0, y0), (i + 1, x1, y1)]):
+                        continue
+                    cost = sum(a * b for a, b in zip((x0, x1, y0, y1),
+                               (costs[i], costs[i+1], costs[n_bin+i], costs[n_bin+i+1])))
+                    for used, value in dp.items():
+                        count = used + x0 + x1
+                        after[count] = min(after.get(count, value + cost), value + cost)
+                dp = after
+            self.assertEqual(F(c['objective']), min(v for k, v in dp.items() if 3 <= k <= 8))
 
 
 if __name__ == '__main__':

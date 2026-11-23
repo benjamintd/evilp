@@ -1,0 +1,103 @@
+--- a/src/lpi/lpi_qso.c
++++ b/src/lpi/lpi_qso.c
+@@ -332,7 +332,7 @@
+       {
+       case 0:
+         /* check for equations */
+-         if( EPSEQ(lhs[i], rhs[i], EPSILON) )
++         if( lhs[i] == rhs[i] )
+          {
+             lpi->isen[i] = 'E';
+             lpi->irhs[i] = lhs[i];
+@@ -341,7 +341,7 @@
+          else
+          {
+             double width = rhs[i] - lhs[i];
+-            if (lhs[i] + width != rhs[i] || rhs[i] - width != lhs[i]) {
++            if (lhs[i] + width != rhs[i] || rhs[i] - width != lhs[i] || (lhs[i] < -0x1p40 && rhs[i] >= 0.5 * lhs[i])) {
+                lpi->isen[i]='B'; lpi->irhs[i]=lhs[i]; lpi->irng[i]=rhs[i]; break;
+             }
+             lpi->isen[i] = 'R';
+@@ -2677,6 +2677,56 @@
+    return SCIP_OKAY;
+ }
+ 
++/* Slack reconstruction can cancel the entire activity near the middle of
++ * a very wide interval. Evaluate these rows at the returned structural point. */
++static SCIP_RETCODE getBoxActivities(SCIP_LPI* lpi, double* primal, double* activity, int count)
++{
++   int* lengths = NULL;
++   int* starts = NULL;
++   int* indices = NULL;
++   double* values = NULL;
++   double* allocated = NULL;
++   SCIP_RETCODE rc = SCIP_LPERROR;
++   if( primal == NULL )
++   {
++      int ncols = QSget_colcount(lpi->prob);
++      allocated = malloc((size_t)(ncols ? ncols : 1) * sizeof(*allocated));
++      if( allocated == NULL )
++         return SCIP_NOMEMORY;
++      primal = allocated;
++      if( dbl_QSget_x_array(lpi->prob, primal) )
++         goto done;
++   }
++   if( QSget_ranged_rows_list(lpi->prob, count, lpi->ircnt, &lengths, &starts,
++                              &indices, &values, NULL, NULL, NULL, NULL) )
++      goto done;
++   for( int row = 0; row < count; ++row )
++   {
++      double sum = 0.0;
++      double correction = 0.0;
++      for( int j = 0; j < lengths[row]; ++j )
++      {
++         int k = starts[row] + j;
++         double x = primal[indices[k]];
++         double product = values[k] * x;
++         double next = sum + product;
++         correction += fma(values[k], x, -product);
++         correction += fabs(sum) >= fabs(product) ? (sum - next) + product : (product - next) + sum;
++         sum = next;
++      }
++      activity[lpi->ircnt[row]] = sum + correction;
++   }
++   rc = SCIP_OKAY;
++done:
++   QSfree(lengths);
++   QSfree(starts);
++   QSfree(indices);
++   if( values != NULL )
++      dbl_QSfree_numeric_array(values);
++   free(allocated);
++   return rc;
++}
++
+ /** gets primal and dual solution vectors for feasible LPs
+  *
+  *  Before calling this function, the caller must ensure that the LP has been solved to optimality, i.e., that
+@@ -2712,6 +2762,7 @@
+    /* build back the activity */
+    if( activity )
+    {
++      int boxed = 0;
+       QS_CONDRET( QSget_rhs(lpi->prob, lpi->irhs) );
+       QS_CONDRET( QSget_senses(lpi->prob, lpi->isen) );
+ 
+@@ -2719,7 +2770,7 @@
+       {
+          switch( lpi->isen[i] )
+          {
+-         case 'B': activity[i]=lpi->irng[i]; break;
++         case 'B': lpi->ircnt[boxed++] = i; break;
+          case 'R':
+          case 'E':
+          case 'G':
+@@ -2735,6 +2786,8 @@
+             return SCIP_INVALIDDATA; /*lint !e527*/
+          }
+       }
++      if( boxed )
++         SCIP_CALL( getBoxActivities(lpi, primsol, activity, boxed) );
+    }
+ 
+ #ifdef SCIP_DISABLED_CODE

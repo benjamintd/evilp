@@ -20,6 +20,7 @@ enum { MODEL_ITEMS = 5000000, MODEL_ENTRIES = 50000000, LINE_SIZE = 16384,
        OBJECTIVE_RECORDS = 524288, OBJECTIVE_TEXT_BYTES = 16 * 1024 * 1024 };
 typedef struct {
     const char *name;
+    size_t hash;
     size_t index;
 } NameSlot;
 typedef struct {
@@ -145,34 +146,40 @@ static size_t name_hash(const char *text) {
 static size_t find_name(const Names *names, const char *text) {
     if (!names->capacity)
         return SIZE_MAX;
-    size_t k = name_hash(text) % names->capacity;
+    size_t mask = names->capacity - 1;
+    size_t h = name_hash(text);
+    size_t k = h & mask;
     while (names->slots[k].name) {
-        if (!strcmp(names->slots[k].name, text))
+        if (names->slots[k].hash == h && !strcmp(names->slots[k].name, text))
             return names->slots[k].index;
-        k = (k + 1) % names->capacity;
+        k = (k + 1) & mask;
     }
     return SIZE_MAX;
 }
 static void save_name(Names *names, const char *text, size_t value) {
     if (!names->capacity || names->used >= names->capacity / 2) {
         size_t cap = names->capacity ? 2 * names->capacity : 128;
+        size_t mask = cap - 1;
         NameSlot *next = lab_alloc(cap, sizeof *next);
         for (size_t i = 0; i < names->capacity; ++i) {
             if (!names->slots[i].name)
                 continue;
-            size_t k = name_hash(names->slots[i].name) % cap;
+            size_t k = names->slots[i].hash & mask;
             while (next[k].name)
-                k = (k + 1) % cap;
+                k = (k + 1) & mask;
             next[k] = names->slots[i];
         }
         free(names->slots);
         names->slots = next;
         names->capacity = cap;
     }
-    size_t k = name_hash(text) % names->capacity;
+    size_t mask = names->capacity - 1;
+    size_t h = name_hash(text);
+    size_t k = h & mask;
     while (names->slots[k].name)
-        k = (k + 1) % names->capacity;
+        k = (k + 1) & mask;
     names->slots[k].name = text;
+    names->slots[k].hash = h;
     names->slots[k].index = value;
     ++names->used;
 }
@@ -195,58 +202,99 @@ static int reserve(Reader *p, void **data, size_t *capacity, size_t count, size_
     return 0;
 }
 static int split(char *line, char **field, size_t *count) {
-    *count = 0;
-    char *save = NULL;
-    for (char *s = strtok_r(line, " \t\r\n", &save); s; s = strtok_r(NULL, " \t\r\n", &save)) {
-        if (*s == '$')
+    size_t n = 0;
+    char *s = line;
+    for (;;) {
+        while (*s == ' ' || *s == '\t' || *s == '\r' || *s == '\n')
+            ++s;
+        if (!*s || *s == '$')
             break;
-        if (*count == 8)
+        if (n == 8)
             return -1;
-        field[(*count)++] = s;
+        field[n++] = s;
+        while (*s && *s != ' ' && *s != '\t' && *s != '\r' && *s != '\n')
+            ++s;
+        if (!*s)
+            break;
+        *s++ = '\0';
     }
+    *count = n;
     return 0;
 }
+static int fast_exact_int(const char *text, double *value) {
+    const char *s = text;
+    int neg = 0;
+    if (*s == '-') {
+        neg = 1;
+        ++s;
+    } else if (*s == '+') {
+        ++s;
+    }
+    if (*s < '0' || *s > '9')
+        return 0;
+    uint64_t mag = 0;
+    int digits = 0;
+    while (*s >= '0' && *s <= '9') {
+        if (++digits > 15)
+            return 0;
+        mag = mag * 10U + (uint64_t)(unsigned char)(*s - '0');
+        ++s;
+    }
+    if (*s != '\0')
+        return 0;
+    if (neg && mag == 0)
+        return 0; /* let strtod preserve -0.0 semantics if ever inspected */
+    *value = neg ? -(double)mag : (double)mag;
+    return 1;
+}
 static int finite_number(Reader *p, const char *text, double *value) {
-    size_t n = strlen(text);
-    if (!n || n >= LINE_SIZE)
-        return problem(p, "invalid numeric field");
-    char copy[LINE_SIZE];
-    for (size_t i = 0; i <= n; ++i)
-        copy[i] = text[i] == 'D' || text[i] == 'd' ? 'e' : text[i];
     /* strtod accepts hexadecimal floats and NaNs, neither of which is MPS
      * decimal syntax. Validate the grammar before converting. */
-    const char *s = copy;
+    const char *s = text;
     if (*s == '-' || *s == '+')
         ++s;
     int digits = 0;
-    while (isdigit((unsigned char)*s)) {
+    while ((unsigned char)(*s - '0') <= 9U) {
         ++s;
         ++digits;
     }
     if (*s == '.') {
         ++s;
-        while (isdigit((unsigned char)*s)) {
+        while ((unsigned char)(*s - '0') <= 9U) {
             ++s;
             ++digits;
         }
     }
     if (!digits)
         return problem(p, "invalid decimal %s", text);
-    if (*s == 'e' || *s == 'E') {
+    int has_d = 0;
+    if (*s == 'e' || *s == 'E' || *s == 'd' || *s == 'D') {
+        if (*s == 'd' || *s == 'D')
+            has_d = 1;
         ++s;
         if (*s == '-' || *s == '+')
             ++s;
         const char *first = s;
-        while (isdigit((unsigned char)*s))
+        while ((unsigned char)(*s - '0') <= 9U)
             ++s;
         if (s == first)
             return problem(p, "invalid exponent %s", text);
     }
     if (*s)
         return problem(p, "invalid decimal %s", text);
+    size_t n = (size_t)(s - text);
+    if (!n || n >= LINE_SIZE)
+        return problem(p, "invalid numeric field");
+    const char *src = text;
+    char copy[LINE_SIZE];
+    if (has_d) {
+        for (size_t i = 0; i <= n; ++i)
+            copy[i] = text[i] == 'D' || text[i] == 'd' ? 'e' : text[i];
+        src = copy;
+    }
     errno = 0;
     char *end = NULL;
-    double result = strtod(copy, &end);
+    double result = strtod(src, &end);
     if (errno || !end || *end || !isfinite(result))
         return problem(p, "numeric field is outside finite double range: %s", text);
     *value = result;
@@ -317,13 +365,15 @@ static int add_values(Reader *p, size_t column, size_t start, size_t n, char **f
             return problem(p, "unknown coefficient row %s", field[i]);
         const char *token = field[i + 1];
         LabInterval enclosure;
-        /* Unit coefficients dominate sparse incidence and packing models. */
+        /* Unit and small exact integer coefficients dominate sparse MIP models. */
         if (token[0] == '1' && token[1] == '\0') {
             number = 1;
             enclosure = (LabInterval){1, 1};
         } else if (token[0] == '-' && token[1] == '1' && token[2] == '\0') {
             number = -1;
             enclosure = (LabInterval){-1, -1};
+        } else if (fast_exact_int(token, &number)) {
+            enclosure = (LabInterval){number, number};
         } else {
             if (finite_number(p, token, &number))
                 return -1;
@@ -877,6 +927,75 @@ static void cleanup(Reader *p) {
     free(p->range_name);
     free(p->bound_name);
 }
+enum { READ_BUF_SIZE = 262144 };
+
+static char *next_line(gzFile input, char *rbuf, size_t *pos, size_t *len, int *eof,
+                       char *line, int *out_binary, int *out_too_long) {
+    *out_binary = 0;
+    *out_too_long = 0;
+    size_t used = 0;
+    for (;;) {
+        if (*pos == *len) {
+            if (*eof) {
+                if (!used)
+                    return NULL;
+                line[used] = '\0';
+                return line;
+            }
+            int got = gzread(input, rbuf, (unsigned)READ_BUF_SIZE);
+            if (got < 0)
+                return NULL;
+            if (got == 0) {
+                *eof = 1;
+                if (!used)
+                    return NULL;
+                line[used] = '\0';
+                return line;
+            }
+            *pos = 0;
+            *len = (size_t)got;
+        }
+        char *src = rbuf + *pos;
+        size_t avail = *len - *pos;
+        char *nl = memchr(src, '\n', avail);
+        /* Zero-copy fast path: complete line sits inside rbuf and within limit. */
+        if (!used && nl != NULL) {
+            size_t chunk = (size_t)(nl - src) + 1U;
+            if (chunk <= LINE_SIZE - 1U) {
+                if (memchr(src, '\0', chunk) != NULL)
+                    *out_binary = 1;
+                src[chunk - 1U] = '\0';
+                *pos += chunk;
+                return src;
+            }
+            if (memchr(src, '\0', LINE_SIZE - 1U) != NULL)
+                *out_binary = 1;
+            *out_too_long = 1;
+            *pos += LINE_SIZE - 1U;
+            line[0] = '\0';
+            return line;
+        }
+        size_t rem = (LINE_SIZE - 1U) - used;
+        size_t chunk = nl != NULL ? (size_t)(nl - src) + 1U : avail;
+        int found_nl = (nl != NULL && chunk <= rem);
+        size_t take = chunk <= rem ? chunk : rem;
+        if (memchr(src, '\0', take) != NULL)
+            *out_binary = 1;
+        memcpy(line + used, src, take);
+        used += take;
+        *pos += take;
+        if (found_nl) {
+            line[used - 1U] = '\0';
+            return line;
+        }
+        if (used == LINE_SIZE - 1U) {
+            *out_too_long = 1;
+            line[used] = '\0';
+            return line;
+        }
+    }
+}
+
 static int read_model(LabModel *model, const char *path) {
     Reader p = {.output=model,.exact_enabled=1,.native_enabled=1,.objective_enabled=1,.objective_row=SIZE_MAX};
     model->parsed_decimal = 1;
@@ -887,26 +1006,28 @@ static int read_model(LabModel *model, const char *path) {
     if (!input)
         return problem(&p, "cannot open model %s", path);
     gzbuffer(input, 1 << 20);
-    char line[LINE_SIZE];
+    char *rbuf = lab_alloc(READ_BUF_SIZE, 1);
+    size_t rpos = 0, rlen = 0;
+    int reof = 0;
+    char line_buf[LINE_SIZE];
     size_t previous = SIZE_MAX;
-    z_off_t position = gztell(input);
-    while (!model->error[0] && gzgets(input, line, sizeof line)) {
+    int line_binary = 0, line_too_long = 0;
+    char *line = NULL;
+    while (!model->error[0] &&
+           (line = next_line(input, rbuf, &rpos, &rlen, &reof, line_buf,
+                             &line_binary, &line_too_long)) != NULL) {
         ++p.line;
-        size_t length = strlen(line);
-        z_off_t next_position = gztell(input);
-        if (position < 0 || next_position < position ||
-            (uintmax_t)(next_position - position) != (uintmax_t)length) {
+        if (line_binary) {
             problem(&p, "binary or unreadable MPS record");
             break;
         }
-        position = next_position;
-        if (length == sizeof line - 1 && line[sizeof line - 2] != '\n') {
+        if (line_too_long) {
             problem(&p, "record exceeds line resource limit");
             break;
         }
         if (line[0] == '*')
             continue;
-        int header = !isspace((unsigned char)line[0]);
+        int header = line[0] != '\0' && !isspace((unsigned char)line[0]);
         char *field[8];
         size_t n;
         if (split(line, field, &n)) {
@@ -1031,6 +1152,7 @@ static int read_model(LabModel *model, const char *path) {
     if (zstatus != Z_OK && zstatus != Z_STREAM_END)
         problem(&p, "compressed model read failed");
     gzclose(input);
+    free(rbuf);
     if (!seen_rows || !seen_columns || !ended || marker)
         problem(&p, "truncated or incomplete model");
     if (!model->error[0])

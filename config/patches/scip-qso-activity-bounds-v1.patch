@@ -1,0 +1,216 @@
+--- a/src/lpi/lpi_qso.c
++++ b/src/lpi/lpi_qso.c
+@@ -72,6 +72,7 @@
+    double*               itab;               /**< array of length tbsz */
+    char*                 ibas;               /**< array of length tbsz */
+    int                   pricing;            /**< SCIP pricing option */
++   SCIP_Bool             reprice;
+    SCIP_Bool             fromscratch;        /**< solve from scratch instead of warm-starting */
+    SCIP_Bool             sbactive;           /**< inside StartStrongbranch..EndStrongbranch session */
+    SCIP_Bool             sbused;             /**< strongbranch called during current session */
+@@ -339,6 +340,10 @@
+          }
+          else
+          {
++            double width = rhs[i] - lhs[i];
++            if (lhs[i] + width != rhs[i] || rhs[i] - width != lhs[i]) {
++               lpi->isen[i]='B'; lpi->irhs[i]=lhs[i]; lpi->irng[i]=rhs[i]; break;
++            }
+             lpi->isen[i] = 'R';
+             lpi->irhs[i] = lhs[i];
+             lpi->irng[i] = rhs[i] - lhs[i];
+@@ -591,6 +596,7 @@
+    assert(ind != NULL);
+    assert(val != NULL);
+ 
++   lpi->reprice = FALSE;
+    lpi->solstat = 0;
+ 
+    SCIPdebugMessage("loading LP in column format into QSopt: %d cols, %d rows\n", ncols, nrows);
+@@ -673,6 +679,7 @@
+       return SCIP_OKAY;
+    assert( lb != NULL && ub != NULL );
+ 
++   lpi->reprice = FALSE;
+    lpi->solstat = 0;
+ 
+    /* ensure column size */
+@@ -751,6 +758,7 @@
+    if( len <= 0 )
+       return SCIP_OKAY;
+ 
++   lpi->reprice = FALSE;
+    lpi->solstat = 0;
+ 
+    SCIP_CALL( ensureColMem(lpi, len) );
+@@ -779,6 +787,7 @@
+    assert(dstat != NULL);
+ 
+    ncols = QSget_colcount(lpi->prob);
++   lpi->reprice = FALSE;
+    lpi->solstat = 0;
+ 
+    SCIPdebugMessage("deleting a column set from QSopt\n");
+@@ -818,6 +827,7 @@
+    assert(lhs != NULL);
+    assert(rhs != NULL);
+ 
++   lpi->reprice = FALSE;
+    lpi->solstat = 0;
+ 
+    SCIPdebugMessage("adding %d rows with %d nonzeros to QSopt\n", nrows, nnonz);
+@@ -1032,6 +1042,7 @@
+    if( len <= 0 )
+       return SCIP_OKAY;
+ 
++   lpi->reprice = FALSE;
+    lpi->solstat = 0;
+ 
+    SCIP_CALL( ensureRowMem(lpi, len) );
+@@ -1060,6 +1071,7 @@
+    assert(lpi->prob != NULL);
+ 
+    nrows = QSget_rowcount(lpi->prob);
++   lpi->reprice = FALSE;
+    lpi->solstat = 0;
+ 
+    for( i = 0; i < nrows; ++i )
+@@ -1096,6 +1108,7 @@
+    assert(lpi->prob != NULL);
+ 
+    SCIPdebugMessage("clearing QSopt LP\n");
++   lpi->reprice = FALSE;
+    lpi->solstat = 0;
+ 
+    /* save sense and name of problem */
+@@ -1132,6 +1145,7 @@
+    if( ncols <= 0 )
+       return SCIP_OKAY;
+ 
++   lpi->reprice = FALSE;
+    lpi->solstat = 0;
+ 
+    SCIPdebugMessage("changing %d bounds in QSopt\n", ncols);
+@@ -1183,6 +1197,7 @@
+    if( nrows <= 0 )
+       return SCIP_OKAY;
+ 
++   lpi->reprice = FALSE;
+    lpi->solstat = 0;
+ 
+    SCIPdebugMessage("changing %d sides in QSopt\n", nrows);
+@@ -1199,7 +1214,7 @@
+ 
+       QS_CONDRET( QSchange_rhscoef(lpi->prob, ind[i], lpi->irhs[i]) );
+ 
+-      if( lpi->isen[i] == 'R' )
++      if( lpi->isen[i] == 'R' || lpi->isen[i] == 'B' )
+       {
+          QS_CONDRET( QSchange_range(lpi->prob, ind[i], lpi->irng[i]) );
+       }
+@@ -1219,6 +1234,7 @@
+    assert(lpi != NULL);
+    assert(lpi->prob != NULL);
+ 
++   lpi->reprice = FALSE;
+    lpi->solstat = 0;
+ 
+    SCIPdebugMessage("changing coefficient row %d, column %d in QSopt to %g\n", row, col, newval);
+@@ -1237,6 +1253,7 @@
+    assert(lpi != NULL);
+    assert(lpi->prob != NULL);
+ 
++   lpi->reprice = FALSE;
+    lpi->solstat = 0;
+    SCIPdebugMessage("changing objective sense in QSopt to %d\n", objsen);
+ 
+@@ -1268,6 +1285,7 @@
+    assert(ind != NULL);
+    assert(obj != NULL);
+ 
++   lpi->reprice = lpi->reprice || lpi->solstat == QS_LP_OPTIMAL;
+    lpi->solstat = 0;
+ 
+    SCIPdebugMessage("changing %d objective values in QSopt\n", ncols);
+@@ -1297,6 +1315,7 @@
+    assert(lpi != NULL);
+    assert(lpi->prob != NULL);
+ 
++   lpi->reprice = FALSE;
+    lpi->solstat = 0;
+ 
+    SCIPdebugMessage("scaling row %d with factor %g in QSopt\n", row, scaleval);
+@@ -1313,6 +1332,14 @@
+       QS_TESTG(rval, CLEANUP, " ");
+    }
+ 
++   if( sense[0] == 'B' )
++   {
++      double lo = (scaleval >= 0.0 ? rhs[0] : range[0]) * scaleval;
++      double hi = (scaleval >= 0.0 ? range[0] : rhs[0]) * scaleval;
++      SCIP_RETCODE rc = SCIPlpiChgSides(lpi, 1, &row, &lo, &hi);
++      rval = rc == SCIP_OKAY ? 0 : 1;
++      goto CLEANUP;
++   }
+    /* if we have a positive scalar, we just scale rhs and range */
+    if( scaleval >= 0 )
+    {
+@@ -1404,6 +1431,7 @@
+    assert(lpi != NULL);
+    assert(lpi->prob != NULL);
+ 
++   lpi->reprice = FALSE;
+    lpi->solstat = 0;
+ 
+    SCIPdebugMessage("scaling column %d with factor %g in QSopt\n", col, scaleval);
+@@ -1722,6 +1750,7 @@
+       {
+          switch( lsense[i] )
+          {
++         case 'B': lhs[i]=lrhs[i]; rhs[i]=lrng[i]; break;
+          case 'R':
+             lhs[i] = lrhs[i];
+             rhs[i] = lrhs[i] + lrng[i];
+@@ -1898,6 +1927,7 @@
+    {
+       switch( lsense[i] )
+       {
++      case 'B': lhss[i]=lrhs[i]; rhss[i]=lrng[i]; break;
+       case 'R':
+          lhss[i] = lrhs[i];
+          rhss[i] = lrhs[i] + lrng[i];
+@@ -1979,6 +2009,7 @@
+ 
+    if( lpi->fromscratch )
+       SCIP_CALL( SCIPlpiClearState(lpi) );
++   lpi->reprice = FALSE;
+    QS_CONDRET( QSopt_primal(lpi->prob, &(lpi->solstat)) );
+    lpi->algo = LPI_QSOPT_ALGO_PRIMAL;
+ 
+@@ -1992,6 +2023,10 @@
+ {
+    assert(lpi != NULL);
+    assert(lpi->prob != NULL);
++
++   if( lpi->reprice && !lpi->fromscratch )
++      return SCIPlpiSolvePrimal(lpi);
++   lpi->reprice = FALSE;
+ 
+    SCIPdebugMessage("calling QSopt dual simplex: %d cols, %d rows, %d nz\n", QSget_colcount(lpi->prob),
+       QSget_rowcount(lpi->prob), QSget_nzcount(lpi->prob));
+@@ -2684,6 +2719,7 @@
+       {
+          switch( lpi->isen[i] )
+          {
++         case 'B': activity[i]=lpi->irng[i]; break;
+          case 'R':
+          case 'E':
+          case 'G':
+@@ -3918,6 +3954,7 @@
+    if( lpi->prob != NULL )
+       QSfree_prob(lpi->prob);
+ 
++   lpi->reprice = FALSE;
+    lpi->solstat = 0;
+    lpi->previt = 0;
+ 

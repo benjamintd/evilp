@@ -1,0 +1,274 @@
+--- a/qsopt_ex/lib.c
++++ b/qsopt_ex/lib.c
+@@ -917,6 +917,8 @@
+ 	EGLPNUM_TYPENAME_ILLlp_basis_init (&B);
+ 	EGLPNUM_TYPENAME_ILLlp_basis_init (&origB);
+ 	EGLPNUM_TYPENAME_ILLprice_init_pricing_info (&lpinf);
++	lpinf.pI_price = QS_PRICE_PDEVEX;
++	lpinf.pII_price = QS_PRICE_PDEVEX;
+ 	lpinf.dI_price = QS_PRICE_DSTEEP;
+ 	lpinf.dII_price = QS_PRICE_DSTEEP;
+ 
+@@ -1096,6 +1098,8 @@
+ 	EGLPNUM_TYPENAME_EGlpNumInitVar (oldbnd);
+ 	EGLPNUM_TYPENAME_EGlpNumZero (oldbnd);
+ 	EGLPNUM_TYPENAME_ILLprice_init_pricing_info (&lpinf);
++	lpinf.pI_price = QS_PRICE_PDEVEX;
++	lpinf.pII_price = QS_PRICE_PDEVEX;
+ 	lpinf.dI_price = QS_PRICE_DSTEEP;
+ 	lpinf.dII_price = QS_PRICE_DSTEEP;
+ 	int base_ready = 0;
+--- a/qsopt_ex/price.c
++++ b/qsopt_ex/price.c
+@@ -108,6 +108,9 @@
+ 	EGLPNUM_TYPENAME_heap *const h = &(pinf->h);
+ 	int rval = 0;
+ 	EGLPNUM_TYPE ravg;
++
++	if (keylist == NULL || nkeys <= 0)
++		return 0;
+ 
+ 	if (upd != 0)
+ 	{
+@@ -836,32 +839,57 @@
+ 	EGLPNUM_TYPENAME_ILLfct_load_workvector (lp, wz);
+ 	v = lp->work.coef;
+ 
+-	for (k = 0; k < lp->zA.nzcnt; k++)
+-	{
+-		j = lp->zA.indx[k];
+-		EGLPNUM_TYPENAME_EGlpNumCopy (zAj, lp->zA.coef[k]);
+-		EGLPNUM_TYPENAME_EGlpNumZero (wAj);
+-		mcnt = lp->matcnt[lp->nbaz[j]];
+-		mbeg = lp->matbeg[lp->nbaz[j]];
+-		for (i = 0; i < mcnt; i++)
+-			EGLPNUM_TYPENAME_EGlpNumAddInnProdTo (wAj, lp->matval[mbeg + i], v[lp->matind[mbeg + i]]);
+-
+-		/* compute ntmp = (zAj * ((zAj * normj / yl) - (2.0 * wAj))) / yl; */ 
+-		EGLPNUM_TYPENAME_EGlpNumCopy(ntmp,zAj);
+-		EGLPNUM_TYPENAME_EGlpNumMultTo(ntmp,normj);
+-		EGLPNUM_TYPENAME_EGlpNumDivTo(ntmp,yl);
+-		EGLPNUM_TYPENAME_EGlpNumSubTo(ntmp,wAj);
+-		EGLPNUM_TYPENAME_EGlpNumSubTo(ntmp,wAj);
+-		EGLPNUM_TYPENAME_EGlpNumMultTo(ntmp,zAj);
+-		EGLPNUM_TYPENAME_EGlpNumDivTo(ntmp,yl);
+-		/* set psinfo->norms[j] += (zAj * ((zAj * normj / yl) - (2.0 * wAj))) / yl; */
+-		EGLPNUM_TYPENAME_EGlpNumAddTo(psinfo->norms[j],ntmp);
+-		if (EGLPNUM_TYPENAME_EGlpNumIsLess (psinfo->norms[j], EGLPNUM_TYPENAME_oneLpNum))
+-			EGLPNUM_TYPENAME_EGlpNumOne (psinfo->norms[j]);
+-	}
+-
+-	EGLPNUM_TYPENAME_EGlpNumCopyFrac (psinfo->norms[eindex], normj, yl);
+-	EGLPNUM_TYPENAME_EGlpNumDivTo (psinfo->norms[eindex], yl);
++	{
++		int zAnz = lp->zA.nzcnt;
++		int *zAindx = lp->zA.indx;
++		EGLPNUM_TYPE *zAcoef = lp->zA.coef;
++		int *nbaz = lp->nbaz;
++		int *matcnt = lp->matcnt;
++		int *matbeg = lp->matbeg;
++		int *matind = lp->matind;
++		EGLPNUM_TYPE *matval = lp->matval;
++		EGLPNUM_TYPE *norms = psinfo->norms;
++		EGLPNUM_TYPE inv_yl, c1, c2;
++
++		EGLPNUM_TYPENAME_EGlpNumInitVar (inv_yl);
++		EGLPNUM_TYPENAME_EGlpNumInitVar (c1);
++		EGLPNUM_TYPENAME_EGlpNumInitVar (c2);
++		EGLPNUM_TYPENAME_EGlpNumCopyFrac (inv_yl, EGLPNUM_TYPENAME_oneLpNum, yl);
++		EGLPNUM_TYPENAME_EGlpNumCopy (c1, normj);
++		EGLPNUM_TYPENAME_EGlpNumMultTo (c1, inv_yl);
++		EGLPNUM_TYPENAME_EGlpNumMultTo (c1, inv_yl);
++		EGLPNUM_TYPENAME_EGlpNumCopySum (c2, inv_yl, inv_yl);
++
++		for (k = 0; k < zAnz; k++)
++		{
++			int col;
++			int *ind;
++			EGLPNUM_TYPE *mval;
++			j = zAindx[k];
++			EGLPNUM_TYPENAME_EGlpNumCopy (zAj, zAcoef[k]);
++			EGLPNUM_TYPENAME_EGlpNumZero (wAj);
++			col = nbaz[j];
++			mcnt = matcnt[col];
++			mbeg = matbeg[col];
++			ind = matind + mbeg;
++			mval = matval + mbeg;
++			for (i = 0; i < mcnt; i++)
++				EGLPNUM_TYPENAME_EGlpNumAddInnProdTo (wAj, mval[i], v[ind[i]]);
++
++			/* ntmp = zAj * (zAj * c1 - c2 * wAj) */
++			EGLPNUM_TYPENAME_EGlpNumCopy (ntmp, zAj);
++			EGLPNUM_TYPENAME_EGlpNumMultTo (ntmp, c1);
++			EGLPNUM_TYPENAME_EGlpNumSubInnProdTo (ntmp, c2, wAj);
++			EGLPNUM_TYPENAME_EGlpNumMultTo (ntmp, zAj);
++			EGLPNUM_TYPENAME_EGlpNumAddTo (norms[j], ntmp);
++			if (EGLPNUM_TYPENAME_EGlpNumIsLess (norms[j], EGLPNUM_TYPENAME_oneLpNum))
++				EGLPNUM_TYPENAME_EGlpNumOne (norms[j]);
++		}
++		EGLPNUM_TYPENAME_EGlpNumCopy (norms[eindex], c1);
++		EGLPNUM_TYPENAME_EGlpNumClearVar (c2);
++		EGLPNUM_TYPENAME_EGlpNumClearVar (c1);
++		EGLPNUM_TYPENAME_EGlpNumClearVar (inv_yl);
++	}
+ 	if (EGLPNUM_TYPENAME_EGlpNumIsLess (psinfo->norms[eindex], EGLPNUM_TYPENAME_oneLpNum))
+ 		EGLPNUM_TYPENAME_EGlpNumOne (psinfo->norms[eindex]);
+ 
+@@ -941,21 +969,29 @@
+ 		return EGLPNUM_TYPENAME_ILLprice_build_ddevex_norms (lp, ddinfo, 1);
+ 	}
+ 
+-	for (i = 0; i < lp->yjz.nzcnt; i++)
+-	{
+-		r = lp->yjz.indx[i];
+-		EGLPNUM_TYPENAME_EGlpNumCopy(yr, lp->yjz.coef[i]);
+-		EGLPNUM_TYPENAME_EGlpNumCopy(ntmp,yr);
+-		EGLPNUM_TYPENAME_EGlpNumMultTo(ntmp,yr);
+-		EGLPNUM_TYPENAME_EGlpNumMultTo(ntmp,normi);
+-		EGLPNUM_TYPENAME_EGlpNumDivTo(ntmp,yl);
+-		EGLPNUM_TYPENAME_EGlpNumDivTo(ntmp,yl);
+-		if (EGLPNUM_TYPENAME_EGlpNumIsLess (ddinfo->norms[r], ntmp))
+-			EGLPNUM_TYPENAME_EGlpNumCopy (ddinfo->norms[r], ntmp);
+-	}
+-	EGLPNUM_TYPENAME_EGlpNumCopy (ddinfo->norms[lindex], normi);
+-	EGLPNUM_TYPENAME_EGlpNumDivTo(ddinfo->norms[lindex], yl);
+-	EGLPNUM_TYPENAME_EGlpNumDivTo(ddinfo->norms[lindex], yl);
++	{
++		int ynz = lp->yjz.nzcnt;
++		int *yindx = lp->yjz.indx;
++		EGLPNUM_TYPE *ycoef = lp->yjz.coef;
++		EGLPNUM_TYPE *norms = ddinfo->norms;
++		EGLPNUM_TYPE c1;
++
++		EGLPNUM_TYPENAME_EGlpNumInitVar (c1);
++		EGLPNUM_TYPENAME_EGlpNumCopyFrac (c1, normi, yl);
++		EGLPNUM_TYPENAME_EGlpNumDivTo (c1, yl);
++		for (i = 0; i < ynz; i++)
++		{
++			r = yindx[i];
++			EGLPNUM_TYPENAME_EGlpNumCopy (yr, ycoef[i]);
++			EGLPNUM_TYPENAME_EGlpNumCopy (ntmp, yr);
++			EGLPNUM_TYPENAME_EGlpNumMultTo (ntmp, yr);
++			EGLPNUM_TYPENAME_EGlpNumMultTo (ntmp, c1);
++			if (EGLPNUM_TYPENAME_EGlpNumIsLess (norms[r], ntmp))
++				EGLPNUM_TYPENAME_EGlpNumCopy (norms[r], ntmp);
++		}
++		EGLPNUM_TYPENAME_EGlpNumCopy (norms[lindex], c1);
++		EGLPNUM_TYPENAME_EGlpNumClearVar (c1);
++	}
+ 	if (EGLPNUM_TYPENAME_EGlpNumIsLess (ddinfo->norms[lindex], EGLPNUM_TYPENAME_oneLpNum))
+ 		EGLPNUM_TYPENAME_EGlpNumOne (ddinfo->norms[lindex]);
+ 	EGLPNUM_TYPENAME_EGlpNumClearVar (normi);
+@@ -1075,25 +1111,40 @@
+ 	EGLPNUM_TYPENAME_ILLfct_load_workvector (lp, wz);
+ 	v = lp->work.coef;
+ 
+-	for (k = 0; k < lp->yjz.nzcnt; k++)
+-	{
+-		i = lp->yjz.indx[k];
+-		EGLPNUM_TYPENAME_EGlpNumCopy (yij, lp->yjz.coef[k]);
+-		/* compute in ntmp (yij * ((yij * norml / yl) - (2.0 * v[i]))) / yl; */
+-		EGLPNUM_TYPENAME_EGlpNumCopy(ntmp,yij);
+-		EGLPNUM_TYPENAME_EGlpNumMultTo(ntmp,norml);
+-		EGLPNUM_TYPENAME_EGlpNumDivTo(ntmp,yl);
+-		EGLPNUM_TYPENAME_EGlpNumSubTo(ntmp,v[i]);
+-		EGLPNUM_TYPENAME_EGlpNumSubTo(ntmp,v[i]);
+-		EGLPNUM_TYPENAME_EGlpNumMultTo (ntmp, yij);
+-		EGLPNUM_TYPENAME_EGlpNumDivTo (ntmp, yl);
+-		/* set dsinfo->norms[i] += (yij * ((yij * norml / yl) - (2.0 * v[i]))) / yl;*/
+-		EGLPNUM_TYPENAME_EGlpNumAddTo(dsinfo->norms[i], ntmp);
+-		if (EGLPNUM_TYPENAME_EGlpNumIsLess (dsinfo->norms[i], EGLPNUM_TYPENAME_PARAM_MIN_DNORM))
+-			EGLPNUM_TYPENAME_EGlpNumCopy (dsinfo->norms[i], EGLPNUM_TYPENAME_PARAM_MIN_DNORM);
+-	}
+-	EGLPNUM_TYPENAME_EGlpNumCopyFrac (dsinfo->norms[lindex], norml, yl);
+-	EGLPNUM_TYPENAME_EGlpNumDivTo (dsinfo->norms[lindex], yl);
++	{
++		int ynz = lp->yjz.nzcnt;
++		int *yindx = lp->yjz.indx;
++		EGLPNUM_TYPE *ycoef = lp->yjz.coef;
++		EGLPNUM_TYPE *norms = dsinfo->norms;
++		EGLPNUM_TYPE inv_yl, c1, c2;
++
++		EGLPNUM_TYPENAME_EGlpNumInitVar (inv_yl);
++		EGLPNUM_TYPENAME_EGlpNumInitVar (c1);
++		EGLPNUM_TYPENAME_EGlpNumInitVar (c2);
++		EGLPNUM_TYPENAME_EGlpNumCopyFrac (inv_yl, EGLPNUM_TYPENAME_oneLpNum, yl);
++		EGLPNUM_TYPENAME_EGlpNumCopy (c1, norml);
++		EGLPNUM_TYPENAME_EGlpNumMultTo (c1, inv_yl);
++		EGLPNUM_TYPENAME_EGlpNumMultTo (c1, inv_yl);
++		EGLPNUM_TYPENAME_EGlpNumCopySum (c2, inv_yl, inv_yl);
++
++		for (k = 0; k < ynz; k++)
++		{
++			i = yindx[k];
++			EGLPNUM_TYPENAME_EGlpNumCopy (yij, ycoef[k]);
++			/* ntmp = yij * (yij * c1 - c2 * v[i]) */
++			EGLPNUM_TYPENAME_EGlpNumCopy (ntmp, yij);
++			EGLPNUM_TYPENAME_EGlpNumMultTo (ntmp, c1);
++			EGLPNUM_TYPENAME_EGlpNumSubInnProdTo (ntmp, c2, v[i]);
++			EGLPNUM_TYPENAME_EGlpNumMultTo (ntmp, yij);
++			EGLPNUM_TYPENAME_EGlpNumAddTo (norms[i], ntmp);
++			if (EGLPNUM_TYPENAME_EGlpNumIsLess (norms[i], EGLPNUM_TYPENAME_PARAM_MIN_DNORM))
++				EGLPNUM_TYPENAME_EGlpNumCopy (norms[i], EGLPNUM_TYPENAME_PARAM_MIN_DNORM);
++		}
++		EGLPNUM_TYPENAME_EGlpNumCopy (norms[lindex], c1);
++		EGLPNUM_TYPENAME_EGlpNumClearVar (c2);
++		EGLPNUM_TYPENAME_EGlpNumClearVar (c1);
++		EGLPNUM_TYPENAME_EGlpNumClearVar (inv_yl);
++	}
+ 	if (EGLPNUM_TYPENAME_EGlpNumIsLess (dsinfo->norms[lindex], EGLPNUM_TYPENAME_PARAM_MIN_DNORM))
+ 		EGLPNUM_TYPENAME_EGlpNumCopy (dsinfo->norms[lindex], EGLPNUM_TYPENAME_PARAM_MIN_DNORM);
+ 
+--- a/qsopt_ex/fct.c
++++ b/qsopt_ex/fct.c
+@@ -778,10 +778,18 @@
+ 	EGLPNUM_TYPENAME_lpinfo * lp,
+ 	EGLPNUM_TYPE alpha)
+ {
+-	int i;
+-
+-	for (i = 0; i < lp->zz.nzcnt; i++)
+-		EGLPNUM_TYPENAME_EGlpNumAddInnProdTo (lp->piz[lp->zz.indx[i]], alpha, lp->zz.coef[i]);
++	int i, znz;
++	int *zindx;
++	EGLPNUM_TYPE *zcoef, *piz;
++
++	if (!EGLPNUM_TYPENAME_EGlpNumIsNeqqZero (alpha))
++		return;
++	znz = lp->zz.nzcnt;
++	zindx = lp->zz.indx;
++	zcoef = lp->zz.coef;
++	piz = lp->piz;
++	for (i = 0; i < znz; i++)
++		EGLPNUM_TYPENAME_EGlpNumAddInnProdTo (piz[zindx[i]], alpha, zcoef[i]);
+ }
+ 
+ void EGLPNUM_TYPENAME_ILLfct_update_pIpiz (
+@@ -810,11 +818,22 @@
+ 	int eindex,
+ 	EGLPNUM_TYPE alpha)
+ {
+-	int i;
+-
+-	for (i = 0; i < lp->zA.nzcnt; i++)
+-		EGLPNUM_TYPENAME_EGlpNumSubInnProdTo (lp->dz[lp->zA.indx[i]], alpha, lp->zA.coef[i]);
+-	EGLPNUM_TYPENAME_EGlpNumCopyNeg (lp->dz[eindex], alpha);
++	int i, znz;
++	int *zAindx;
++	EGLPNUM_TYPE *zAcoef, *dz;
++
++	if (!EGLPNUM_TYPENAME_EGlpNumIsNeqqZero (alpha))
++	{
++		EGLPNUM_TYPENAME_EGlpNumZero (lp->dz[eindex]);
++		return;
++	}
++	znz = lp->zA.nzcnt;
++	zAindx = lp->zA.indx;
++	zAcoef = lp->zA.coef;
++	dz = lp->dz;
++	for (i = 0; i < znz; i++)
++		EGLPNUM_TYPENAME_EGlpNumSubInnProdTo (dz[zAindx[i]], alpha, zAcoef[i]);
++	EGLPNUM_TYPENAME_EGlpNumCopyNeg (dz[eindex], alpha);
+ }
+ 
+ void EGLPNUM_TYPENAME_ILLfct_update_pIdz (

@@ -213,11 +213,12 @@ static int convert_scaled(mpq_srcptr q, double value, int64_t scale, int64_t *ou
         !mpz_fits_slong_p(mpq_numref(q)))
         return 0;
     unsigned long den = mpz_get_ui(mpq_denref(q));
-    if (!den || scale % (int64_t)den)
+    if (!den || den > (uint64_t)scale || scale % (int64_t)den)
         return 0;
     long num = mpz_get_si(mpq_numref(q));
     int64_t factor = scale / (int64_t)den;
-    if (num && llabs((int64_t)num) > MAX_WEIGHT / factor)
+    int64_t limit = MAX_WEIGHT / factor;
+    if (num < -limit || num > limit)
         return 0;
     *out = (int64_t)num * factor;
     return 1;
@@ -721,6 +722,92 @@ typedef struct {
     int64_t scaled[MAX_OBJ_TERMS], scaled_gcd, scaled_total;
     int pb_exact;
 } Objective;
+
+/* Charge row-implied flips against the remaining cost of each literal.
+ * All costs and activities are in their respective exact integer units.
+ * Once a charge is used, later rows can spend only the residual cost. */
+static int64_t row_penalty_bound(const LabModel *m, const double *lo, const double *hi,
+                                 const size_t *start, const Term *terms, const int64_t *scale,
+                                 const Objective *cost, double deadline) {
+    int64_t *price = lab_alloc(m->cols, sizeof *price);
+    for (int k = 0; k < cost->n; ++k) {
+        int lit = cost->lit[k];
+        int64_t weight = cost->scaled[k] / cost->scaled_gcd;
+        price[abs(lit) - 1] = lit > 0 ? weight : -weight;
+    }
+    int64_t bound = 0;
+    mpq_t q;
+    mpq_init(q);
+    for (size_t i = 0; i < m->rows; ++i) {
+        if (lab_now() >= deadline)
+            break;
+        if (!scale[i])
+            continue;
+        for (int upper = 0; upper <= 1; ++upper) {
+            double rhs = upper ? m->row_upper[i] : m->row_lower[i];
+            int64_t required;
+            if (!isfinite(rhs) || lab_source_exact_row_bound(m, i, upper, q) ||
+                !convert_scaled(q, rhs, scale[i], &required))
+                continue;
+            if (upper)
+                required = -required;
+            int64_t max_gain = 0, total_gain = 0, min_cost = INT64_MAX;
+            int64_t unit_num = 0, unit_den = 1;
+            int usable = 1;
+            for (size_t k = start[i]; k < start[i + 1]; ++k) {
+                size_t j = (size_t)terms[k].lit - 1;
+                int64_t a = upper ? -terms[k].weight : terms[k].weight;
+                /* A zero weight can mean an unrepresentable source coefficient.
+                 * Each variable must occur once for the flip count to be valid. */
+                if (!a || (k > start[i] && terms[k - 1].lit == terms[k].lit)) {
+                    usable = 0;
+                    break;
+                }
+                int endpoint = price[j] ? price[j] < 0 : (a > 0 ? (int)hi[j] : (int)lo[j]);
+                required -= a * endpoint;
+                if ((a > 0 && price[j] > 0) || (a < 0 && price[j] < 0)) {
+                    int64_t gain = llabs(a);
+                    int64_t penalty = llabs(price[j]);
+                    total_gain += gain;
+                    if (gain > max_gain)
+                        max_gain = gain;
+                    if (penalty < min_cost)
+                        min_cost = penalty;
+                    if (!unit_num || penalty * unit_den < unit_num * gain) {
+                        unit_num = penalty;
+                        unit_den = gain;
+                    }
+                }
+            }
+            if (!usable || required <= 0 || required > total_gain)
+                continue;
+            /* At least this many distinct priced literals must flip, even
+             * when every free variable takes its most favorable value. */
+            int64_t flips = 1 + (required - 1) / max_gain;
+            int64_t fixed_charge = flips * min_cost;
+            /* Charge in proportion to row activity if it gives the stronger
+             * bound. At the minimum cost/gain ratio, rounding each literal's
+             * charge up still fits its integer price. Any feasible set pays
+             * at least ceil(required * unit_num / unit_den) in total. */
+            int64_t activity_charge = (required / unit_den) * unit_num +
+                ((required % unit_den) * unit_num + unit_den - 1) / unit_den;
+            int proportional = activity_charge > fixed_charge;
+            bound += proportional ? activity_charge : fixed_charge;
+            for (size_t k = start[i]; k < start[i + 1]; ++k) {
+                size_t j = (size_t)terms[k].lit - 1;
+                int64_t a = upper ? -terms[k].weight : terms[k].weight;
+                if ((a > 0 && price[j] > 0) || (a < 0 && price[j] < 0)) {
+                    int64_t charge = proportional ? (llabs(a) * unit_num + unit_den - 1) / unit_den
+                                                  : min_cost;
+                    price[j] += a > 0 ? -charge : charge;
+                }
+            }
+        }
+    }
+    mpq_clear(q);
+    free(price);
+    return bound;
+}
 
 /* A cheaper assignment cannot contain any subset with cost >= cutoff.
  * Costs represent positive penalties on signed literals. */
@@ -1912,7 +1999,7 @@ static int cheapest_face_general_int(const LabModel *m, const double *lo, const 
     return solved && lab_now() < deadline;
 }
 
-int lab_binary_sat(const LabModel *m, const double *lo, const double *hi, double deadline,
+static int solve_binary_sat(const LabModel *m, const double *lo, const double *hi, double deadline,
                    size_t budget, double *point, size_t *calls) {
     *calls = 0;
     if (!m->cols || m->cols > MAX_TERMS || m->rows > MAX_TERMS || m->nnz > MAX_TERMS || !budget ||
@@ -2048,8 +2135,11 @@ int lab_binary_sat(const LabModel *m, const double *lo, const double *hi, double
             terms[next[i]++] = (Term){(int)j + 1, w, k};
         }
     }
-    int face_unsat = 0;
-    if (try_face || face_only) {
+    int pb_mode = !face_only && cost.n > SHORT_ROW && cost.pb_exact && cost.scaled_gcd > 0;
+    int64_t pb_lo = pb_mode ? row_penalty_bound(m, lo, hi, start, terms, row_scale, &cost,
+                                               fmin(deadline, lab_now() + .1)) : 0;
+    /* A positive bound already excludes every cheapest-face assignment. */
+    if ((try_face || face_only) && !pb_lo) {
         double face_dl = face_only
                              ? fmin(orig_deadline, lab_now() + fmin(10.0, .40 * (orig_deadline - lab_now())))
                              : fmin(orig_deadline, lab_now() + fmin(0.8, .12 * (orig_deadline - lab_now())));
@@ -2058,8 +2148,8 @@ int lab_binary_sat(const LabModel *m, const double *lo, const double *hi, double
             result = 1;
             goto done;
         }
-        if (faced < 0)
-            face_unsat = 1;
+        if (faced < 0 && pb_mode)
+            pb_lo = 1;
         if (face_only) {
             /* Before giving up on a large-objective pure-binary model, run one
              * fast feasibility check; UNSAT on a relaxation proves infeasibility. */
@@ -2091,8 +2181,6 @@ int lab_binary_sat(const LabModel *m, const double *lo, const double *hi, double
     double local_deadline = 0;
     interior = lab_alloc(m->cols, 1);
     trial = lab_alloc(m->cols, sizeof *trial);
-    int pb_mode = cost.n > SHORT_ROW && cost.pb_exact && cost.scaled_gcd > 0;
-    int64_t pb_lo = (pb_mode && face_unsat) ? 1 : 0;
     int64_t pb_hi = pb_mode ? cost.scaled_total / cost.scaled_gcd : 0;
     ClauseBuf base_cnf = {0};
     int base_vars = (int)m->cols;
@@ -2294,4 +2382,21 @@ done:
     if (result && lab_now() < deadline)
         return result;
     return incumbent ? 2 : 0;
+}
+
+LabSearchResult lab_binary_sat(const LabModel *m, const double *lo, const double *hi, double deadline,
+                   size_t budget, double *point, size_t *calls) {
+    int found = solve_binary_sat(m, lo, hi, deadline, budget, point, calls);
+    LabSearchResult r = {.route = "binary_sat"};
+    if (found < 0) {
+        r.status = LAB_MIP_INFEASIBLE;
+        r.closure = LAB_CLOSE_UNSAT;
+    } else if (found > 0) {
+        r.point = point;
+        if (found == 1) {
+            r.status = LAB_MIP_OPTIMAL;
+            r.closure = LAB_CLOSE_MATCHING_BOUND;
+        }
+    }
+    return r;
 }

@@ -157,9 +157,9 @@ static double original_basic_tolerance(const Work *w, size_t position) {
     size_t j = w->basis[position];
     double tolerance = LAB_PRIMAL_TOLERANCE;
     if (j < w->structural)
-        tolerance = fmin(tolerance, 1e-7 / fabs(w->sign[j]));
+        tolerance = fmin(tolerance, w->options->primal_tolerance / fabs(w->sign[j]));
     else if (!w->artificial[j] && w->a[j].count == 1)
-        tolerance = fmin(tolerance, 1e-7 * w->equation_scale[w->a[j].row[0]]);
+        tolerance = fmin(tolerance, w->options->primal_tolerance * w->equation_scale[w->a[j].row[0]]);
     return tolerance;
 }
 static int factor_basis(Work *w) {
@@ -722,6 +722,29 @@ static int record_pricing_result(Work *w, LabPricing *pricing, LabPricingPending
  * excluded for this basis only; exhausting them never establishes optimality. */
 #include "source_pricing.inc"
 #include "source_support.inc"
+/* Without exact reconstruction, only use the existing numerical Phase I
+ * status when every source feasibility scalar has a point enclosure. */
+static int needs_source_contradiction(const Work *w) {
+    const LabModel *m = w->model;
+    if (!m->parsed_decimal)
+        return 0;
+    const LabSourceEnvelope *e = m->envelope;
+    if (!w->options->no_exact || !e || !e->complete)
+        return 1;
+    for (size_t k = 0; k < m->nnz; ++k)
+        if (e->value[k].lower != e->value[k].upper)
+            return 1;
+    for (size_t i = 0; i < m->rows; ++i)
+        if (e->row_lower[i].lower != e->row_lower[i].upper ||
+            e->row_upper[i].lower != e->row_upper[i].upper)
+            return 1;
+    for (size_t j = 0; j < m->cols; ++j)
+        if (e->col_lower[j].lower != e->col_lower[j].upper ||
+            e->col_upper[j].lower != e->col_upper[j].upper)
+            return 1;
+    return 0;
+}
+
 static int simplex(Work *w, int phase_one) {
     enum { MAX_REJECTED_CANDIDATES = 32 };
     size_t rejected[MAX_REJECTED_CANDIDATES], rejected_count = 0;
@@ -768,7 +791,7 @@ static int simplex(Work *w, int phase_one) {
             long double direct_cost = reduced, dot_magnitude = 0;
             reduced -= dot(w, j, w->pi, &dot_magnitude);
             long double scale = fabsl(direct_cost) + dot_magnitude;
-            long double tolerance = fmaxl(1e-10L * fmaxl(scale, DBL_MIN),
+            long double tolerance = fmaxl((long double)w->options->dual_relative_tolerance * fmaxl(scale, DBL_MIN),
                                           64 * DBL_EPSILON * pi_norm * column_norm(w, j));
             if (!isfinite((double)reduced) || !isfinite((double)scale) || !isfinite(tolerance)) {
                 message(w, "numerical_failure", "Reduced cost overflow");
@@ -838,9 +861,11 @@ static int simplex(Work *w, int phase_one) {
                     }
                     if (budget(w))
                         return -1;
-                    if (worst > 0) {
+                    /* The rounded system can have zero dual residual even
+                     * when distinct source rows collapse to the same row. */
+                    if (worst > 0 || needs_source_contradiction(w)) {
                         message(w, "numerical_failure",
-                                "Uncertain Phase I dual sign; infeasibility unproved");
+                                "Phase I failed to establish a source-model contradiction");
                         return -1;
                     }
                 }
@@ -1790,9 +1815,9 @@ static int recover(Work *w, const LabModel *m, int require_support) {
     r->objective = evaluated_objective;
     residual = evaluated_residual;
     r->primal_residual = residual;
-    if (!isfinite(r->objective) || !isfinite(residual) || residual > 1e-7) {
+    if (!isfinite(r->objective) || !isfinite(residual) || residual > w->options->primal_tolerance) {
         free(activity);
-        message(w, "numerical_failure", "Original-model primal residual exceeds 1e-7");
+        message(w, "numerical_failure", "Original-model primal residual exceeds session tolerance");
         return -1;
     }
     /* A feasible point accompanying an improving-ray claim is not an
@@ -1924,7 +1949,7 @@ static int restore_primal(Work *w, const LabModel *m, int require_support) {
     int outcome = -1;
     for (size_t attempt = 0; attempt < MAX_SOURCE_REPAIRS; attempt++) {
         if (w->options->no_primal_repair || budget(w) ||
-            (!w->result->primal_repair_required && !(w->result->primal_residual > 1e-7)))
+            (!w->result->primal_repair_required && !(w->result->primal_residual > w->options->primal_tolerance)))
             break;
         size_t hinted = source_negative(w);
         if (attempt && hinted == SIZE_MAX) {
@@ -2136,7 +2161,7 @@ static int dual_simplex(Work *w, int original_units) {
                 }
                 long double scale = fabs(w->cost[j]);
                 long double rc = w->cost[j] - dot(w, j, w->pi, &scale);
-                long double tolerance = fmaxl(1e-10L * fmaxl(scale, DBL_MIN),
+                long double tolerance = fmaxl((long double)w->options->dual_relative_tolerance * fmaxl(scale, DBL_MIN),
                                               64 * DBL_EPSILON * pi_norm * column_norm(w, j));
                 if (!isfinite(rc) || !isfinite(scale) || !isfinite(tolerance) || rc < -tolerance)
                     dual_bad = 1;
@@ -2367,7 +2392,22 @@ static int dual_simplex(Work *w, int original_units) {
     free(reduced);
     return outcome;
 }
+typedef struct {
+    size_t column;
+    double lower, upper;
+} BoundUndo;
+
 struct LabLpSession {
+    LabModel owned_domain;
+    int probing, saved_ready;
+    /* A row batch can reuse structural columns and extend the basis with
+     * one slack per new inequality. Stable row keys survive renumbering. */
+    size_t lift_rows, lift_structural;
+    size_t *lift_keys, *lift_basis;
+    unsigned char *lift_transform;
+    size_t *saved_basis;
+    BoundUndo *undo;
+    size_t undo_count, undo_capacity;
     const LabModel *original;
     LabModel model;
     LabLpOptions options, running;
@@ -2378,6 +2418,15 @@ struct LabLpSession {
     int export_ready;
     int standalone;
 };
+int lab_lp_session_set_tolerances(LabLpSession *s, double primal, double dual_relative) {
+    if (!s || s->probing || !isfinite(primal) || primal < 0 || primal > 1e-7 ||
+        !isfinite(dual_relative) || dual_relative < 0 || dual_relative > 1e-10)
+        return -1;
+    s->options.primal_tolerance = primal == 0 ? 1e-7 : primal;
+    s->options.dual_relative_tolerance = dual_relative == 0 ? 1e-10 : dual_relative;
+    s->export_ready = 0;
+    return 0;
+}
 LabLpSession *lab_lp_session_create(const LabModel *m, const LabLpOptions *options) {
     if (!m || !options || !isfinite(options->time_limit) || !options->max_dimension ||
         !options->iteration_limit ||
@@ -2388,6 +2437,10 @@ LabLpSession *lab_lp_session_create(const LabModel *m, const LabLpOptions *optio
     s->original = m;
     s->model = *m;
     s->options = *options;
+    if (lab_lp_session_set_tolerances(s, options->primal_tolerance, options->dual_relative_tolerance)) {
+        free(s);
+        return NULL;
+    }
     s->model.col_lower = lab_alloc(m->cols, sizeof(double));
     s->model.col_upper = lab_alloc(m->cols, sizeof(double));
     memcpy(s->model.col_lower, m->col_lower, m->cols * sizeof(double));
@@ -2401,12 +2454,163 @@ int lab_lp_session_set_bounds(LabLpSession *s, size_t j, double lower, double up
         upper > s->original->col_upper[j])
         return -1;
     if (s->model.col_lower[j] != lower || s->model.col_upper[j] != upper) {
+        if (s->probing) {
+            if (s->undo_count == s->undo_capacity) {
+                size_t cap = s->undo_capacity ? 2 * s->undo_capacity : 16;
+                if (cap < s->undo_capacity || cap > SIZE_MAX / sizeof *s->undo)
+                    return -1;
+                BoundUndo *next = realloc(s->undo, cap * sizeof *next);
+                if (!next)
+                    return -1;
+                s->undo = next;
+                s->undo_capacity = cap;
+            }
+            s->undo[s->undo_count++] = (BoundUndo){j, s->model.col_lower[j], s->model.col_upper[j]};
+        }
         s->bound_generation++;
         s->export_ready = 0;
     }
     s->model.col_lower[j] = lower;
     s->model.col_upper[j] = upper;
     return 0;
+}
+int lab_lp_session_begin_probe(LabLpSession *s) {
+    if (!s || s->probing || s->options.basis_out)
+        return -1;
+    s->probing = 1;
+    s->saved_ready = s->ready;
+    if (s->ready) {
+        s->saved_basis = lab_alloc(s->work.m, sizeof *s->saved_basis);
+        memcpy(s->saved_basis, s->work.basis, s->work.m * sizeof *s->saved_basis);
+    }
+    return 0;
+}
+int lab_lp_session_rollback_probe(LabLpSession *s) {
+    if (!s || !s->probing)
+        return -1;
+    s->probing = 0;
+    while (s->undo_count) {
+        BoundUndo edit = s->undo[--s->undo_count];
+        s->model.col_lower[edit.column] = edit.lower;
+        s->model.col_upper[edit.column] = edit.upper;
+    }
+    s->bound_generation++;
+    s->export_ready = 0;
+    if (s->saved_ready) {
+        Work *w = &s->work;
+        if (memcmp(w->basis, s->saved_basis, w->m * sizeof *w->basis)) {
+            memcpy(w->basis, s->saved_basis, w->m * sizeof *w->basis);
+            w->linear.valid = 0; /* refactor the restored basis on demand */
+        }
+    }
+    s->ready = s->saved_ready;
+    free(s->saved_basis);
+    s->saved_basis = NULL;
+    return 0;
+}
+const LabModel *lab_lp_session_domain(const LabLpSession *s) {
+    return s ? s->original : NULL;
+}
+static size_t *standard_row_keys(const Work *w, size_t cols) {
+    size_t *keys = lab_alloc(w->m, sizeof *keys);
+    for (size_t i = 0; i < w->m; ++i)
+        if (w->source_row[i] != SIZE_MAX)
+            keys[i] = w->source_row[i] * 2 + w->row_upper[i];
+    /* Source sides precede bound sides in build(); both groups are sorted. */
+    for (size_t j = 0; j < cols; ++j) {
+        size_t key = SIZE_MAX / 2 + 2 * j;
+        if (w->lower_row[j] != SIZE_MAX)
+            keys[w->lower_row[j]] = key;
+        if (w->upper_row[j] != SIZE_MAX)
+            keys[w->upper_row[j]] = key + 1;
+    }
+    return keys;
+}
+static void clear_row_basis(LabLpSession *s) {
+    free(s->lift_keys);
+    free(s->lift_basis);
+    free(s->lift_transform);
+    s->lift_keys = s->lift_basis = NULL;
+    s->lift_transform = NULL;
+}
+static void remember_row_basis(LabLpSession *s) {
+    Work *w = &s->work;
+    if (!s->export_ready || w->m != w->total_rows || !w->basis)
+        return;
+    for (size_t i = 0; i < w->m; ++i)
+        if (w->basis[i] >= w->structural + w->m)
+            return;
+    s->lift_keys = standard_row_keys(w, s->model.cols);
+    s->lift_transform = lab_alloc(s->model.cols, 1);
+    memcpy(s->lift_transform, w->transform, s->model.cols);
+    s->lift_rows = w->m;
+    s->lift_structural = w->structural;
+    s->lift_basis = lab_alloc(w->m, sizeof *s->lift_basis);
+    memcpy(s->lift_basis, w->basis, w->m * sizeof *s->lift_basis);
+}
+static int extend_row_basis(LabLpSession *s) {
+    Work *w = &s->work;
+    if (w->structural != s->lift_structural ||
+        memcmp(w->transform, s->lift_transform, s->model.cols))
+        return 0;
+    size_t *keys = standard_row_keys(w, s->model.cols);
+    size_t *map = lab_alloc(s->lift_rows, sizeof *map);
+    size_t old = 0;
+    int ok = 1;
+    for (size_t i = 0; i < w->m; ++i) {
+        if (old < s->lift_rows && s->lift_keys[old] == keys[i]) {
+            map[old++] = i;
+        } else {
+            size_t slack = w->structural + i;
+            if (!w->a[slack].count) {
+                ok = 0; /* A new equality needs Phase I. */
+                break;
+            }
+            w->basis[i] = slack;
+        }
+    }
+    ok = ok && old == s->lift_rows;
+    if (ok)
+        for (size_t i = 0; i < old; ++i) {
+            size_t col = s->lift_basis[i];
+            w->basis[map[i]] = col < w->structural ? col : w->structural + map[col - w->structural];
+        }
+    free(map);
+    free(keys);
+    return ok;
+}
+static LabAugmentStatus append_rows(LabLpSession *s, size_t count, const LabSparseRow *sparse,
+    const LabAddedRow *dense, const LabAugmentLimits *limits) {
+    if (!s || s->probing || !limits)
+        return LAB_AUGMENT_INVALID;
+    if (!count)
+        return LAB_AUGMENT_OK;
+    LabModel next = {0};
+    LabAugmentStatus status = dense ? lab_model_append_rows(s->original, count, dense, limits, &next)
+                                    : lab_model_append_sparse_rows(s->original, count, sparse, limits, &next);
+    if (status != LAB_AUGMENT_OK)
+        return status;
+    double *lower = s->model.col_lower, *upper = s->model.col_upper;
+    remember_row_basis(s);
+    work_free(&s->work);
+    lab_model_free(&s->owned_domain);
+    s->owned_domain = next;
+    s->original = &s->owned_domain;
+    s->model = next;
+    s->model.col_lower = lower;
+    s->model.col_upper = upper;
+    s->ready = s->export_ready = 0;
+    s->bound_generation++;
+    s->options.basis_in = s->options.basis_out = NULL;
+    return LAB_AUGMENT_OK;
+}
+LabAugmentStatus lab_lp_session_append_rows(LabLpSession *s, size_t count,
+    const LabSparseRow *rows, const LabAugmentLimits *limits) {
+    return append_rows(s, count, rows, NULL, limits);
+}
+LabAugmentStatus lab_lp_session_append_dense_rows(LabLpSession *s, size_t count,
+    const LabAddedRow *rows, const LabAugmentLimits *limits) {
+    return append_rows(s, count, NULL, rows, limits);
 }
 static int anchored_value(double raw, double scale, double *value) {
     int e = ilogb(fabs(scale));
@@ -2566,7 +2770,20 @@ void lab_lp_session_solve(LabLpSession *s, LabLpResult *result) {
         snprintf(result->message, sizeof result->message, "Cumulative LP deadline exhausted");
         goto done;
     }
-    if (s->ready && !update_rhs(s)) {
+    int extended = 0;
+    if (s->lift_keys) {
+        w->options = &s->running;
+        w->result = result;
+        w->started = lab_now();
+        w->model = &s->model;
+        extended = !build(w, &s->model, s->original) && extend_row_basis(s);
+        clear_row_basis(s);
+        s->ready = extended;
+        if (!extended)
+            result->cold_fallbacks++;
+        result->standard_nnz = 0;
+    }
+    if (extended || (s->ready && !update_rhs(s))) {
         w->options = &s->running;
         w->result = result;
         w->started = lab_now();
@@ -2575,7 +2792,7 @@ void lab_lp_session_solve(LabLpSession *s, LabLpResult *result) {
         result->standard_columns = w->n;
         result->redundant_rows = w->total_rows - w->m;
         int status = dual_simplex(w, 0);
-        if (status == 1) {
+        if (status == 1 && !extended) {
             /* Basis and factorization remain dual-feasible for the next node.
              * Tiny exact models keep cold retry to preserve Farkas trace certs. */
             if (s->model.cols <= 16 && exact_source(&s->model))
@@ -2606,6 +2823,9 @@ void lab_lp_session_solve(LabLpSession *s, LabLpResult *result) {
     } else if (s->ready) {
         result->cold_fallbacks++;
     }
+    /* A cold probe may choose different transforms and remove different
+     * rows. The old basis indices no longer identify the same columns. */
+    s->saved_ready = 0;
     work_free(w);
     s->ready = 0;
     s->running.time_limit = s->deadline - lab_now();
@@ -2659,6 +2879,10 @@ void lab_lp_session_free(LabLpSession *s) {
     work_free(&s->work);
     free(s->model.col_lower);
     free(s->model.col_upper);
+    lab_model_free(&s->owned_domain);
+    clear_row_basis(s);
+    free(s->saved_basis);
+    free(s->undo);
     free(s);
 }
 /* In a standalone solve a disconnected, exactly costless column may take

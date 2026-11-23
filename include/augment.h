@@ -10,6 +10,14 @@ typedef struct {
     const double *coefficient; /* dense, base->cols finite binary64 values */
     double lower, upper;
 } LabAddedRow;
+/* Sparse rows use strictly increasing column indices and finite nonzero values. */
+typedef struct {
+    const char *name;
+    size_t count;
+    const size_t *column;
+    const double *value;
+    double lower, upper;
+} LabSparseRow;
 typedef struct {
     size_t max_rows, max_nonzeros, max_added_rows;
 } LabAugmentLimits;
@@ -24,4 +32,6 @@ typedef enum {
  * Added coefficients/bounds have their exact binary64 rational meaning. */
 LabAugmentStatus lab_model_append_rows(const LabModel *base, size_t count,
     const LabAddedRow *rows, const LabAugmentLimits *limits, LabModel *out);
+LabAugmentStatus lab_model_append_sparse_rows(const LabModel *base, size_t count,
+    const LabSparseRow *rows, const LabAugmentLimits *limits, LabModel *out);
 #endif

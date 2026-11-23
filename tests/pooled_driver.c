@@ -10,8 +10,9 @@ int main(int argc, char **argv) {
         return 2;
     double *x = lab_alloc(m.cols, sizeof *x);
     LabPooledStats stats;
-    int r = lab_pooled_assignment(&m, lab_now() + 3, strtoul(argv[2], NULL, 10),
+    LabSearchResult result = lab_pooled_assignment(&m, lab_now() + 3, strtoul(argv[2], NULL, 10),
                                   strtoul(argv[3], NULL, 10), x, &stats);
+    int r = result.status == LAB_MIP_OPTIMAL ? 2 : (result.point != NULL);
     if (r) {
         FILE *f = fopen(argv[4], "wx");
         if (!f)

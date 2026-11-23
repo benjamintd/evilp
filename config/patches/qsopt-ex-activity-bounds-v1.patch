@@ -1,0 +1,372 @@
+--- a/qsopt_ex/basis.c
++++ b/qsopt_ex/basis.c
+@@ -201,7 +201,7 @@
+ 	for (i = 0; i < nrows; i++)
+ 	{
+ 		j = rowmap[i];
+-		if (sense[i] == 'R')
++		if (sense[i] == 'R' || sense[i] == 'B')
+ 		{
+ 			if (rstat[i] == QS_ROW_BSTAT_BASIC)
+ 			{
+--- a/qsopt_ex/lib.c
++++ b/qsopt_ex/lib.c
+@@ -1001,7 +1001,12 @@
+ 				EGLPNUM_TYPENAME_EGlpNumCopy (downpen[i], objbound);
+ 		}
+ 		else if (status == QS_LP_OPTIMAL || lp->basisstat.dual_feasible)
+-			EGLPNUM_TYPENAME_EGlpNumCopy (downpen[i], lp->dobjval);
++		{
++			if (lp->O->objsense == EGLPNUM_TYPENAME_ILL_MAX)
++				EGLPNUM_TYPENAME_EGlpNumCopyNeg (downpen[i], lp->dobjval);
++			else
++				EGLPNUM_TYPENAME_EGlpNumCopy (downpen[i], lp->dobjval);
++		}
+ 		else
+ 		{
+ 			if (lp->O->objsense == EGLPNUM_TYPENAME_ILL_MAX)
+@@ -1030,7 +1035,12 @@
+ 				EGLPNUM_TYPENAME_EGlpNumCopy (uppen[i], objbound);
+ 		}
+ 		else if (status == QS_LP_OPTIMAL || lp->basisstat.dual_feasible)
+-			EGLPNUM_TYPENAME_EGlpNumCopy (uppen[i], lp->dobjval);
++		{
++			if (lp->O->objsense == EGLPNUM_TYPENAME_ILL_MAX)
++				EGLPNUM_TYPENAME_EGlpNumCopyNeg (uppen[i], lp->dobjval);
++			else
++				EGLPNUM_TYPENAME_EGlpNumCopy (uppen[i], lp->dobjval);
++		}
+ 		else
+ 		{
+ 			if (lp->O->objsense == EGLPNUM_TYPENAME_ILL_MAX)
+@@ -1503,7 +1513,12 @@
+ 				EGLPNUM_TYPENAME_EGlpNumCopy (downpen[i], objbound);
+ 		}
+ 		else if (status == QS_LP_OPTIMAL || lp->basisstat.dual_feasible)
+-			EGLPNUM_TYPENAME_EGlpNumCopy (downpen[i], lp->dobjval);
++		{
++			if (lp->O->objsense == EGLPNUM_TYPENAME_ILL_MAX)
++				EGLPNUM_TYPENAME_EGlpNumCopyNeg (downpen[i], lp->dobjval);
++			else
++				EGLPNUM_TYPENAME_EGlpNumCopy (downpen[i], lp->dobjval);
++		}
+ 		else
+ 		{
+ 			if (lp->O->objsense == EGLPNUM_TYPENAME_ILL_MAX)
+@@ -1534,7 +1549,12 @@
+ 				EGLPNUM_TYPENAME_EGlpNumCopy (uppen[i], objbound);
+ 		}
+ 		else if (status == QS_LP_OPTIMAL || lp->basisstat.dual_feasible)
+-			EGLPNUM_TYPENAME_EGlpNumCopy (uppen[i], lp->dobjval);
++		{
++			if (lp->O->objsense == EGLPNUM_TYPENAME_ILL_MAX)
++				EGLPNUM_TYPENAME_EGlpNumCopyNeg (uppen[i], lp->dobjval);
++			else
++				EGLPNUM_TYPENAME_EGlpNumCopy (uppen[i], lp->dobjval);
++		}
+ 		else
+ 		{
+ 			if (lp->O->objsense == EGLPNUM_TYPENAME_ILL_MAX)
+@@ -1995,7 +2015,7 @@
+ 
+ 	/* If the row has a range, create the rangeval array if needed  */
+ 
+-	if (sense == 'R' && !(qslp->rangeval) && qslp->rowsize > 0)
++	if ((sense == 'R' || sense == 'B') && !(qslp->rangeval) && qslp->rowsize > 0)
+ 	{
+ 		qslp->rangeval = EGLPNUM_TYPENAME_EGlpNumAllocArray (qslp->rowsize);
+ 		for (i = 0; i < qslp->nrows; i++)
+@@ -2021,7 +2041,7 @@
+ 		//                                 qslp->rowsize + EXTRA_ROWS, sizeof (int));
+ 		//CHECKRVALG(rval,CLEANUP);
+ 
+-		if (qslp->rangeval || sense == 'R')
++		if (qslp->rangeval || (sense == 'R' || sense == 'B'))
+ 			EGLPNUM_TYPENAME_EGlpNumReallocArray (&(qslp->rangeval), qslp->rowsize + EXTRA_ROWS);
+ 
+ 		qslp->rownames = EGrealloc (qslp->rownames,
+@@ -2034,11 +2054,12 @@
+ 	}
+ 
+ 	EGLPNUM_TYPENAME_EGlpNumCopy (qslp->rhs[nrows], rhs);
+-	qslp->sense[nrows] = sense;
++	if (sense == 'B') EGLPNUM_TYPENAME_EGlpNumZero(qslp->rhs[nrows]);
++    qslp->sense[nrows] = sense;
+ 	qslp->rowmap[nrows] = ncols;	/* this will be the new logical */
+ 	if (qslp->rangeval)
+ 	{
+-		if (sense == 'R')
++		if ((sense == 'R' || sense == 'B'))
+ 			EGLPNUM_TYPENAME_EGlpNumCopy (qslp->rangeval[nrows], range);
+ 		else
+ 			EGLPNUM_TYPENAME_EGlpNumZero (qslp->rangeval[nrows]);
+@@ -2062,11 +2083,12 @@
+ 
+ 	EGLPNUM_TYPENAME_EGlpNumZero (qslp->obj[ncols]);
+ 	EGLPNUM_TYPENAME_EGlpNumZero (qslp->lower[ncols]);
++    if (sense == 'B') EGLPNUM_TYPENAME_EGlpNumCopy(qslp->lower[ncols], rhs);
+ 	if (sense == 'E')
+ 	{
+ 		EGLPNUM_TYPENAME_EGlpNumZero (qslp->upper[ncols]);	/* Artificial */
+ 	}
+-	else if (sense == 'R')
++	else if ((sense == 'R' || sense == 'B'))
+ 	{
+ 		EGLPNUM_TYPENAME_EGlpNumCopy (qslp->upper[ncols], range);	/* Range      */
+ 	}
+@@ -2099,7 +2121,7 @@
+ 
+ 	tind[0] = nrows;
+ 	EGLPNUM_TYPENAME_EGlpNumOne (*tval);
+-	if (sense == 'G' || sense == 'R')
++	if (sense == 'G' || (sense == 'R' || sense == 'B'))
+ 		EGLPNUM_TYPENAME_EGlpNumSign (*tval);
+ 
+ 	rval = matrix_addcol (A, 1, tind, tval);
+@@ -2759,14 +2781,23 @@
+ 		k = A->matbeg[j];
+ 		switch (sense[i])
+ 		{
+-		case 'R':									/* Range constraint, we will set its upper bound
++		case 'B':
++            qslp->sense[rowlist[i]] = 'B';
++            EGLPNUM_TYPENAME_EGlpNumZero(qslp->rhs[rowlist[i]]);
++            EGLPNUM_TYPENAME_EGlpNumZero(qslp->lower[j]);
++            EGLPNUM_TYPENAME_EGlpNumZero(qslp->upper[j]);
++            EGLPNUM_TYPENAME_EGlpNumOne(A->matval[k]);
++            EGLPNUM_TYPENAME_EGlpNumSign(A->matval[k]);
++            break;
++        case 'R':									/* Range constraint, we will set its upper bound
+ 																 once we call EGLPNUM_TYPENAME_QSchange_range, by default it 
+ 																 will be zero, i.e. an equation. */
+ 			qslp->sense[rowlist[i]] = 'R';
+ 			EGLPNUM_TYPENAME_EGlpNumZero(qslp->lower[j]);
+ 			EGLPNUM_TYPENAME_EGlpNumZero(qslp->upper[j]);
+ 			EGLPNUM_TYPENAME_EGlpNumOne(A->matval[k]);
+-			break;
++			EGLPNUM_TYPENAME_EGlpNumSign(A->matval[k]);
++            break;
+ 		case 'E':									/* Artificial */
+ 			qslp->sense[rowlist[i]] = 'E';
+ 			EGLPNUM_TYPENAME_EGlpNumZero (qslp->lower[j]);
+@@ -3638,7 +3669,9 @@
+ 		*rhs = EGLPNUM_TYPENAME_EGlpNumAllocArray (num);
+ 		for (i = 0; i < num; i++)
+ 		{
+-			EGLPNUM_TYPENAME_EGlpNumCopy ((*rhs)[i], qslp->rhs[rowlist[i]]);
++			int row = rowlist[i];
++            if (qslp->sense[row] == 'B') EGLPNUM_TYPENAME_EGlpNumCopy((*rhs)[i], qslp->lower[qslp->rowmap[row]]);
++            else EGLPNUM_TYPENAME_EGlpNumCopy((*rhs)[i], qslp->rhs[row]);
+ 		}
+ 	}
+ 
+@@ -4110,7 +4143,7 @@
+ 		}
+ 	}
+ 	
+-	if(qslp->sense[indx] != 'R')
++	if(qslp->sense[indx] != 'R' && qslp->sense[indx] != 'B')
+ 	{
+ 		QSlog("setting range for non-range constraint");
+ 		rval = 1;
+@@ -4118,6 +4151,11 @@
+ 	}
+ 	
+ 	EGLPNUM_TYPENAME_EGlpNumCopy(qslp->rangeval[indx], coef);
++    EGLPNUM_TYPENAME_EGlpNumCopy(qslp->upper[qslp->rowmap[indx]], coef);
++    lp->internal_valid = 0;
++    lp->sb_clean_lp = 0;
++    lp->sb_snap_valid = 0;
++    lp->sb_dnorms_valid = 0;
+ 
+ CLEANUP:
+ 
+@@ -4155,7 +4193,9 @@
+ 	lp->sb_clean_lp = 0;
+ 	lp->sb_snap_valid = 0;
+ 	lp->sb_dnorms_valid = 0;
+-	EGLPNUM_TYPENAME_EGlpNumCopy (lp->O->rhs[indx], coef);
++	if (lp->O->sense[indx] == 'B') {
++        EGLPNUM_TYPENAME_EGlpNumCopy(lp->O->lower[lp->O->rowmap[indx]], coef);
++    } else EGLPNUM_TYPENAME_EGlpNumCopy (lp->O->rhs[indx], coef);
+ 
+ CLEANUP:
+ 
+@@ -4465,7 +4505,7 @@
+ 	for (i = 0; i < nrows; i++)
+ 	{
+ 		j = qslp->rowmap[i];
+-		if (qslp->rangeval && EGLPNUM_TYPENAME_EGlpNumIsNeqqZero (qslp->rangeval[i]))
++		if (qslp->sense[i] == 'B' || (qslp->rangeval && EGLPNUM_TYPENAME_EGlpNumIsNeqqZero (qslp->rangeval[i])))
+ 		{
+ 			switch (lp->vstat[j])
+ 			{
+--- a/qsopt_ex/lp.c
++++ b/qsopt_ex/lp.c
+@@ -450,8 +450,16 @@
+ 		EGLPNUM_TYPENAME_ILLwrite_lp_state_append (line, " = ");
+ 		EGLPNUM_TYPENAME_ILLwrite_lp_state_append_number (line, lp->rhs[i]);
+ 		break;
+-	case 'R':
+-		ILL_FAILtrue (!lp->rangeval, "RANGE constraints without values\n");
++	case 'B':
++        EGLPNUM_TYPENAME_ILLwrite_lp_state_append(line, " >= ");
++        EGLPNUM_TYPENAME_ILLwrite_lp_state_append_number(line, lp->lower[lp->rowmap[i]]);
++        EGLPNUM_TYPENAME_ILLprint_report(lp, "%s\n", line->buf);
++        write_the_expr(lp, line, NULL, lprows, i, colnames, colInRow, colCoef, lp->nstruct);
++        EGLPNUM_TYPENAME_ILLwrite_lp_state_append(line, " <= ");
++        EGLPNUM_TYPENAME_ILLwrite_lp_state_append_number(line, lp->upper[lp->rowmap[i]]);
++        break;
++    case 'R':
++        ILL_FAILtrue (!lp->rangeval, "RANGE constraints without values\n");
+ 		EGLPNUM_TYPENAME_EGlpNumInitVar (ntmp);
+ 		EGLPNUM_TYPENAME_ILLwrite_lp_state_append (line, " >= ");
+ 		EGLPNUM_TYPENAME_ILLwrite_lp_state_append_number (line, lp->rhs[i]);
+--- a/qsopt_ex/mps.c
++++ b/qsopt_ex/mps.c
+@@ -1094,7 +1094,7 @@
+ 	EGLPNUM_TYPENAME_ILLlpdata * lp,
+ 	char **rownames,
+ 	int intmode,
+-	char *objname);
++	char *objname, const char *boxprefix);
+ 
+ int EGLPNUM_TYPENAME_ILLwrite_mps (
+ 	EGLPNUM_TYPENAME_ILLlpdata * lp,
+@@ -1109,6 +1109,7 @@
+ 	EGLPNUM_TYPENAME_ILLlp_rows lp_rows, *lprows = NULL;
+ 	char buf[ILL_namebufsize];
+ 	char *objname = NULL;
++    char boxprefix[32];
+ 	char *str;
+ 
+ 	ILL_CHECKnull (lp, "lp must not be null");
+@@ -1127,6 +1128,24 @@
+ 		ILL_CLEANUP_IF (rval);
+ 		ILL_UTIL_STR (objname, buf);
+ 	}
++    /* The upper half of each activity-bounded row needs its own MPS row.
++     * Reserve a prefix absent from all externally supplied row names. */
++    boxprefix[0] = 0;
++    for (i = 0; i < lp->nrows; ++i) {
++        if (lp->sense[i] == 'B') {
++            size_t salt = 0;
++            int collision;
++            do {
++                snprintf(boxprefix, sizeof boxprefix, "_qsbox%zu_", salt++);
++                size_t n = strlen(boxprefix);
++                collision = !strncmp(objname, boxprefix, n) ||
++                    (lp->refrowname && !strncmp(lp->refrowname, boxprefix, n));
++                for (int k = 0; k < lp->nrows && !collision; ++k)
++                    collision = !strncmp(rownames[k], boxprefix, n);
++            } while (collision);
++            break;
++        }
++    }
+ 	EGLPNUM_TYPENAME_ILLprint_report (lp, "NAME    %s\n", lp->probname);
+ 	EGLPNUM_TYPENAME_ILLprint_report (lp, "OBJSENSE\n  %s\n",
+ 									 (lp->objsense == EGLPNUM_TYPENAME_ILL_MIN) ? "MIN" : "MAX");
+@@ -1158,7 +1177,11 @@
+ 		}
+ 		switch (lp->sense[i])
+ 		{
+-		case 'G':
++		case 'B':
++            EGLPNUM_TYPENAME_ILLprint_report(lp, " L  %s%d\n", boxprefix, i);
++            EGLPNUM_TYPENAME_ILLprint_report(lp, " G  ");
++            break;
++        case 'G':
+ 			EGLPNUM_TYPENAME_ILLprint_report (lp, " G  ");
+ 			break;
+ 		case 'L':
+@@ -1193,7 +1216,7 @@
+ 			ri = lp->sos.matind[el];
+ 			i = lp->structmap[ri];
+ 			intmode = mps_write_col (i, ri, colnames[ri], lp, rownames,
+-															 intmode, objname);
++															 intmode, objname, boxprefix);
+ 			if (lp->refrowname && (lp->refind == -1))
+ 			{
+ 				EGLPNUM_TYPENAME_ILLprint_report (lp, "  %s    %s    %g\n",
+@@ -1211,7 +1234,7 @@
+ 		{
+ 			i = lp->structmap[ri];
+ 			intmode = mps_write_col (i, ri, colnames[ri], lp, rownames,
+-															 intmode, objname);
++															 intmode, objname, boxprefix);
+ 		}
+ 	}
+ 	if (intmode)
+@@ -1222,7 +1245,15 @@
+ 	EGLPNUM_TYPENAME_ILLprint_report (lp, "RHS\n");
+ 	for (i = 0; i < lp->nrows; i++)
+ 	{
+-		if ((lprows->rowcnt[i] != 0) && EGLPNUM_TYPENAME_EGlpNumIsNeqqZero (lp->rhs[i]))
++		if (lprows->rowcnt[i] != 0 && lp->sense[i] == 'B') {
++            int logical = lp->rowmap[i];
++            str = EGLPNUM_TYPENAME_EGlpNumGetStr(lp->lower[logical]);
++            EGLPNUM_TYPENAME_ILLprint_report(lp, " RHS    %s    %s\n", rownames[i], str);
++            EGfree(str);
++            str = EGLPNUM_TYPENAME_EGlpNumGetStr(lp->upper[logical]);
++            EGLPNUM_TYPENAME_ILLprint_report(lp, " RHS    %s%d    %s\n", boxprefix, i, str);
++            EGfree(str);
++        } else if ((lprows->rowcnt[i] != 0) && EGLPNUM_TYPENAME_EGlpNumIsNeqqZero (lp->rhs[i]))
+ 		{
+ 			str = EGLPNUM_TYPENAME_EGlpNumGetStr(lp->rhs[i]);
+ 			EGLPNUM_TYPENAME_ILLprint_report (lp, " RHS    %s    %s\n", rownames[i], str);
+@@ -1235,7 +1266,7 @@
+ 		EGLPNUM_TYPENAME_ILLprint_report (lp, "RANGES\n");
+ 		for (i = 0; i < lp->nrows; i++)
+ 		{
+-			if ((lprows->rowcnt[i] != 0) && EGLPNUM_TYPENAME_EGlpNumIsNeqqZero (lp->rangeval[i]))
++			if (lp->sense[i] != 'B' && (lprows->rowcnt[i] != 0) && EGLPNUM_TYPENAME_EGlpNumIsNeqqZero (lp->rangeval[i]))
+ 			{
+ 				str = EGLPNUM_TYPENAME_EGlpNumGetStr(lp->rangeval[i]);
+ 				EGLPNUM_TYPENAME_ILLprint_report (lp, " RANGE    %s    %s\n", rownames[i], str);
+@@ -1320,7 +1351,7 @@
+ 	EGLPNUM_TYPENAME_ILLlpdata * lp,
+ 	char **rownames,
+ 	int intmode,
+-	char *objname)
++	char *objname, const char *boxprefix)
+ {
+ 	int row, k;
+ 	char*str;
+@@ -1344,6 +1375,8 @@
+ 		row = A->matind[k];
+ 		str = EGLPNUM_TYPENAME_EGlpNumGetStr(A->matval[k]);
+ 		EGLPNUM_TYPENAME_ILLprint_report (lp, "  %s    %s    %s\n", colname, rownames[row], str);
++        if (lp->sense[row] == 'B')
++            EGLPNUM_TYPENAME_ILLprint_report(lp, "  %s    %s%d    %s\n", colname, boxprefix, row, str);
+ 		EGfree(str);
+ 	}
+ 	return intmode;
+--- a/qsopt_ex/presolve.c
++++ b/qsopt_ex/presolve.c
+@@ -438,7 +438,11 @@
+ 		{
+ 			EGLPNUM_TYPENAME_EGlpNumDivTo (lp->rhs[i], gama[i]);
+ 			col = lp->rowmap[i];
+-			if (EGLPNUM_TYPENAME_EGlpNumIsNeqq (lp->upper[col], EGLPNUM_TYPENAME_ILL_MAXDOUBLE))
++            if (lp->sense[i] == 'B') {
++                EGLPNUM_TYPENAME_EGlpNumDivTo(lp->lower[col], gama[i]);
++                EGLPNUM_TYPENAME_EGlpNumDivTo(lp->rangeval[i], gama[i]);
++            }
++            if (EGLPNUM_TYPENAME_EGlpNumIsNeqq (lp->upper[col], EGLPNUM_TYPENAME_ILL_MAXDOUBLE))
+ 			{
+ 				EGLPNUM_TYPENAME_EGlpNumDivTo (lp->upper[col], gama[i]);	/* Ranged row */
+ 			}
+--- a/qsopt_ex/qsopt.c
++++ b/qsopt_ex/qsopt.c
+@@ -786,7 +786,10 @@
+ 												 (const char **) p->qslp->rownames);
+ 	CHECKRVALG (rval, CLEANUP);
+ 
+-	for (j = 0; j < p->qslp->nstruct; j++)
++	for (j=0; j<p->qslp->nrows; ++j)
++        if (p->qslp->sense[j]=='B')
++            EGLPNUM_TYPENAME_EGlpNumCopy(p2->qslp->lower[p2->qslp->rowmap[j]], p->qslp->lower[p->qslp->rowmap[j]]);
++    for (j = 0; j < p->qslp->nstruct; j++)
+ 	{
+ 		col = p->qslp->structmap[j];
+ 		if (p->qslp->colnames)

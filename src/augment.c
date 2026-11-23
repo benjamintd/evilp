@@ -81,38 +81,50 @@ static void copy_column_metadata(const LabModel *base, LabModel *m) {
         }
     }
 }
-LabAugmentStatus lab_model_append_rows(const LabModel *base, size_t count,
-    const LabAddedRow *rows, const LabAugmentLimits *limits, LabModel *out) {
+static int compare_names(const void *left, const void *right) {
+    return strcmp(*(const char *const *)left, *(const char *const *)right);
+}
+/* Sorting the added names avoids scanning all existing rows for each cut. */
+static int distinct_row_names(const LabModel *base, size_t count, const LabSparseRow *rows) {
+    if (!count)
+        return 1;
+    const char **names = lab_alloc(count, sizeof *names);
+    for (size_t r = 0; r < count; ++r)
+        names[r] = rows[r].name;
+    qsort(names, count, sizeof *names, compare_names);
+    int ok = 1;
+    for (size_t r = 1; ok && r < count; ++r)
+        ok = strcmp(names[r-1], names[r]) != 0;
+    for (size_t i = 0; ok && i < base->rows; ++i)
+        ok = !bsearch(&base->row_name[i], names, count, sizeof *names, compare_names);
+    free(names);
+    return ok;
+}
+LabAugmentStatus lab_model_append_sparse_rows(const LabModel *base, size_t count,
+    const LabSparseRow *rows, const LabAugmentLimits *limits, LabModel *out) {
     if (!out || out == base || !limits || (count && !rows) || !valid_base(base))
         return LAB_AUGMENT_INVALID;
     if (count > limits->max_added_rows || base->rows > limits->max_rows ||
         count > limits->max_rows - base->rows || base->nnz > limits->max_nonzeros ||
-        base->cols == SIZE_MAX)
+        base->cols == SIZE_MAX || count > SIZE_MAX / sizeof *rows)
         return LAB_AUGMENT_RESOURCE;
     size_t nnz = base->nnz;
     for (size_t r = 0; r < count; r++) {
-        if (!rows[r].name || !*rows[r].name || (base->cols && !rows[r].coefficient) ||
+        if (!rows[r].name || !*rows[r].name || (rows[r].count && (!rows[r].column || !rows[r].value)) ||
             !side_pair(rows[r].lower, rows[r].upper))
             return LAB_AUGMENT_INVALID;
-        for (size_t i = 0; i < base->rows; i++)
-            if (!strcmp(rows[r].name, base->row_name[i]))
+        if (rows[r].count > limits->max_nonzeros - nnz)
+            return LAB_AUGMENT_RESOURCE;
+        nnz += rows[r].count;
+        for (size_t k = 0; k < rows[r].count; ++k)
+            if (rows[r].column[k] >= base->cols || (k && rows[r].column[k-1] >= rows[r].column[k]) ||
+                !isfinite(rows[r].value[k]) || rows[r].value[k] == 0)
                 return LAB_AUGMENT_INVALID;
-        for (size_t i = 0; i < r; i++)
-            if (!strcmp(rows[r].name, rows[i].name))
-                return LAB_AUGMENT_INVALID;
-        for (size_t j = 0; j < base->cols; j++) {
-            double value = rows[r].coefficient[j];
-            if (!isfinite(value))
-                return LAB_AUGMENT_INVALID;
-            if (value != 0) {
-                if (nnz >= limits->max_nonzeros)
-                    return LAB_AUGMENT_RESOURCE;
-                nnz++;
-            }
-        }
     }
     if (!storage_fits(base->rows + count, base->cols, nnz))
         return LAB_AUGMENT_RESOURCE;
+    if (!distinct_row_names(base, count, rows))
+        return LAB_AUGMENT_INVALID;
     LabModel m = {.rows = base->rows + count, .cols = base->cols, .nnz = nnz,
                   .offset = base->offset, .maximize = base->maximize,
                   .parsed_decimal = base->parsed_decimal};
@@ -183,9 +195,15 @@ LabAugmentStatus lab_model_append_rows(const LabModel *base, size_t count,
                 : (LabInterval){m.row_upper[i], m.row_upper[i]};
         }
     }
-    size_t next = 0;
-    for (size_t j = 0; j < m.cols; j++) {
-        m.col_start[j] = next;
+    /* Count the whole batch before filling CSC, including the decimal
+     * exception remapping for existing coefficients. */
+    size_t *cursor = lab_alloc(m.cols, sizeof *cursor);
+    for (size_t r = 0; r < count; ++r)
+        for (size_t k = 0; k < rows[r].count; ++k)
+            m.col_start[rows[r].column[k] + 1]++;
+    for (size_t j = 0; j < m.cols; ++j) {
+        size_t next = m.col_start[j];
+        m.col_start[j + 1] += next + (base->col_start[j + 1] - base->col_start[j]);
         for (size_t k = base->col_start[j]; k < base->col_start[j + 1]; k++, next++) {
             m.row_index[next] = base->row_index[k];
             m.value[next] = base->value[k];
@@ -207,10 +225,12 @@ LabAugmentStatus lab_model_append_rows(const LabModel *base, size_t count,
                 }
             }
         }
-        for (size_t r = 0; r < count; r++) {
-            double value = rows[r].coefficient[j];
-            if (value == 0)
-                continue;
+        cursor[j] = next;
+    }
+    for (size_t r = 0; r < count; ++r) {
+        for (size_t k = 0; k < rows[r].count; ++k) {
+            size_t next = cursor[rows[r].column[k]]++;
+            double value = rows[r].value[k];
             m.row_index[next] = base->rows + r;
             m.value[next] = value;
             if (m.exact)
@@ -219,11 +239,60 @@ LabAugmentStatus lab_model_append_rows(const LabModel *base, size_t count,
                 mpq_set_d(m.native_exact->value[next],value);
             if (m.envelope)
                 m.envelope->value[next] = (LabInterval){value, value};
-            next++;
         }
     }
-    m.col_start[m.cols] = next;
+    free(cursor);
     lab_model_free(out);
     *out = m;
     return LAB_AUGMENT_OK;
+}
+
+/* Compatibility for callers which already have a dense cut vector. */
+LabAugmentStatus lab_model_append_rows(const LabModel *base, size_t count,
+    const LabAddedRow *rows, const LabAugmentLimits *limits, LabModel *out) {
+    if (!limits || !out || base == out || (count && !rows) || !valid_base(base))
+        return LAB_AUGMENT_INVALID;
+    if (count > limits->max_added_rows || base->rows > limits->max_rows ||
+        count > limits->max_rows - base->rows || base->nnz > limits->max_nonzeros ||
+        count > SIZE_MAX / sizeof(LabSparseRow))
+        return LAB_AUGMENT_RESOURCE;
+    LabSparseRow *sparse = lab_alloc(count, sizeof *sparse);
+    size_t total = 0;
+    LabAugmentStatus status = LAB_AUGMENT_INVALID;
+    for (size_t r = 0; r < count; ++r) {
+        if (base->cols && !rows[r].coefficient)
+            goto done;
+        for (size_t j = 0; j < base->cols; ++j)
+            sparse[r].count += rows[r].coefficient[j] != 0;
+        if (sparse[r].count > limits->max_nonzeros - base->nnz - total) {
+            status = LAB_AUGMENT_RESOURCE;
+            goto done;
+        }
+        total += sparse[r].count;
+    }
+    if (!storage_fits(base->rows + count, base->cols, total)) {
+        status = LAB_AUGMENT_RESOURCE;
+        goto done;
+    }
+    size_t *columns = lab_alloc(total, sizeof *columns);
+    double *values = lab_alloc(total, sizeof *values);
+    size_t pos = 0;
+    for (size_t r = 0; r < count; ++r) {
+        sparse[r].name = rows[r].name;
+        sparse[r].lower = rows[r].lower;
+        sparse[r].upper = rows[r].upper;
+        sparse[r].column = columns + pos;
+        sparse[r].value = values + pos;
+        for (size_t j = 0; j < base->cols; ++j)
+            if (rows[r].coefficient[j] != 0) {
+                columns[pos] = j;
+                values[pos++] = rows[r].coefficient[j];
+            }
+    }
+    status = lab_model_append_sparse_rows(base, count, sparse, limits, out);
+    free(values);
+    free(columns);
+done:
+    free(sparse);
+    return status;
 }

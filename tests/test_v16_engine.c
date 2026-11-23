@@ -1,7 +1,10 @@
+#define _POSIX_C_SOURCE 200809L
 #include "lpi/lpi.h"
 #include "scip/scip.h"
 #include "scip/scipdefplugins.h"
+#include <float.h>
 #include <math.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -439,6 +442,323 @@ static int test_sparse_relaxed_knapsack(void) {
     return 0;
 }
 
+/* 5. Stress dual simplex BFRT exact tie-breaking, ILLfct_update_dIIfeas prefix,
+ *    adaptive row-NNZ compute_zA, and scaled dual cost perturbation + exact unroll
+ *    on a wide, massively dual-degenerate bounded LP. */
+static int test_dual_bfrt_and_degenerate_perturb(void) {
+    const int nrows = 96;
+    const int ncols = 2048;
+    const int nnz_per_col = 4;
+    const int nnz = ncols * nnz_per_col;
+
+    double *obj = calloc((size_t)ncols, sizeof *obj);
+    double *lo = calloc((size_t)ncols, sizeof *lo);
+    double *hi = calloc((size_t)ncols, sizeof *hi);
+    double *lhs = calloc((size_t)nrows, sizeof *lhs);
+    double *rhs = calloc((size_t)nrows, sizeof *rhs);
+    int *beg = calloc((size_t)ncols, sizeof *beg);
+    int *ind = calloc((size_t)nnz, sizeof *ind);
+    double *val = calloc((size_t)nnz, sizeof *val);
+    double *prim_d = calloc((size_t)ncols, sizeof *prim_d);
+    double *prim_p = calloc((size_t)ncols, sizeof *prim_p);
+    CHECK(obj && lo && hi && lhs && rhs && beg && ind && val && prim_d && prim_p);
+
+    for (int j = 0; j < ncols; ++j) {
+        /* 95% zero-cost bounded columns create massive t_j == 0 dual degeneracy;
+         * remaining columns carry scaled objectives up to 500. */
+        obj[j] = (j % 20 == 0) ? (double)((j / 20) % 7 + 1) * 50.0 : 0.0;
+        lo[j] = 0.0;
+        hi[j] = 1.0;
+        beg[j] = j * nnz_per_col;
+        for (int k = 0; k < nnz_per_col; ++k) {
+            int r = (j * 7 + k * 23) % nrows;
+            ind[j * nnz_per_col + k] = r;
+            /* Varying magnitudes so max-|zAj| tie-breaking has real work to do. */
+            val[j * nnz_per_col + k] = 0.25 * (double)((j + k) % 12 + 1);
+        }
+    }
+    for (int i = 0; i < nrows; ++i) {
+        lhs[i] = (i % 3 == 0) ? 12.0 : 8.0;
+        rhs[i] = (i % 3 == 0) ? 12.0 : 1e20;
+    }
+
+    SCIP_LPI *lp_d = NULL;
+    SCIP_LPI *lp_p = NULL;
+    OK(SCIPlpiCreate(&lp_d, NULL, "v20_dual_bfrt", SCIP_OBJSEN_MINIMIZE));
+    OK(SCIPlpiCreate(&lp_p, NULL, "v20_primal_ref", SCIP_OBJSEN_MINIMIZE));
+    OK(SCIPlpiLoadColLP(lp_d, SCIP_OBJSEN_MINIMIZE, ncols, obj, lo, hi, NULL, nrows, lhs, rhs,
+                        NULL, nnz, beg, ind, val));
+    OK(SCIPlpiLoadColLP(lp_p, SCIP_OBJSEN_MINIMIZE, ncols, obj, lo, hi, NULL, nrows, lhs, rhs,
+                        NULL, nnz, beg, ind, val));
+
+    OK(SCIPlpiSolveDual(lp_d));
+    OK(SCIPlpiSolvePrimal(lp_p));
+    CHECK(SCIPlpiIsOptimal(lp_d));
+    CHECK(SCIPlpiIsOptimal(lp_p));
+
+    double obj_d = 0.0, obj_p = 0.0;
+    OK(SCIPlpiGetSol(lp_d, &obj_d, prim_d, NULL, NULL, NULL));
+    OK(SCIPlpiGetSol(lp_p, &obj_p, prim_p, NULL, NULL, NULL));
+    CHECK(fabs(obj_d - obj_p) < 1e-5 * (1.0 + fabs(obj_p)));
+
+    /* Verify primal feasibility directly on the original matrix. */
+    for (int j = 0; j < ncols; ++j)
+        CHECK(prim_d[j] >= lo[j] - 1e-6 && prim_d[j] <= hi[j] + 1e-6);
+    for (int i = 0; i < nrows; ++i) {
+        double act = 0.0;
+        for (int j = 0; j < ncols; ++j) {
+            for (int k = 0; k < nnz_per_col; ++k) {
+                if (ind[j * nnz_per_col + k] == i)
+                    act += val[j * nnz_per_col + k] * prim_d[j];
+            }
+        }
+        CHECK(act >= lhs[i] - 1e-5);
+        if (rhs[i] < 1e19)
+            CHECK(act <= rhs[i] + 1e-5);
+    }
+
+    /* Warm re-solve after tightening bounds & adding a cut row (root-cut pattern). */
+    int cidx[16];
+    double clb[16], cub[16];
+    for (int k = 0; k < 16; ++k) {
+        cidx[k] = k * 40;
+        clb[k] = 0.5;
+        cub[k] = 1.0;
+    }
+    OK(SCIPlpiChgBounds(lp_d, 16, cidx, clb, cub));
+    OK(SCIPlpiChgBounds(lp_p, 16, cidx, clb, cub));
+    int rbeg = 0;
+    int rind[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+    double rval[8] = {1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0};
+    double rlhs = 3.5, rrhs = 1e20;
+    OK(SCIPlpiAddRows(lp_d, 1, &rlhs, &rrhs, NULL, 8, &rbeg, rind, rval));
+    OK(SCIPlpiAddRows(lp_p, 1, &rlhs, &rrhs, NULL, 8, &rbeg, rind, rval));
+    OK(SCIPlpiSolveDual(lp_d));
+    OK(SCIPlpiSolvePrimal(lp_p));
+    CHECK(SCIPlpiIsOptimal(lp_d));
+    CHECK(SCIPlpiIsOptimal(lp_p));
+    OK(SCIPlpiGetSol(lp_d, &obj_d, prim_d, NULL, NULL, NULL));
+    OK(SCIPlpiGetSol(lp_p, &obj_p, prim_p, NULL, NULL, NULL));
+    CHECK(fabs(obj_d - obj_p) < 1e-5 * (1.0 + fabs(obj_p)));
+
+    OK(SCIPlpiFree(&lp_d));
+    OK(SCIPlpiFree(&lp_p));
+    free(prim_p);
+    free(prim_d);
+    free(val);
+    free(ind);
+    free(beg);
+    free(rhs);
+    free(lhs);
+    free(hi);
+    free(lo);
+    free(obj);
+    return 0;
+}
+
+/* y <= 2x + 1 and y <= 5.5 - x meet at (1.5, 4). Branching on x
+ * gives (1, 3) down and (2, 3.5) up. Minimizing -y reverses both signs. */
+static int test_strongbranch_objective_sense(void) {
+    for (int maximize = 0; maximize <= 1; ++maximize) {
+        SCIP_OBJSEN sense = maximize ? SCIP_OBJSEN_MAXIMIZE : SCIP_OBJSEN_MINIMIZE;
+        SCIP_LPI *lp = NULL;
+        OK(SCIPlpiCreate(&lp, NULL, "branch bound sense", sense));
+        double sign = maximize ? 1.0 : -1.0;
+        double cost[] = {0, sign}, lo[] = {0, 0}, hi[] = {3, 8};
+        double lhs[] = {-SCIPlpiInfinity(lp), -SCIPlpiInfinity(lp)}, rhs[] = {1, 5.5};
+        int starts[] = {0, 2}, rows[] = {0, 1, 0, 1};
+        double values[] = {-2, 1, 1, 1};
+        OK(SCIPlpiLoadColLP(lp, sense, 2, cost, lo, hi, NULL, 2, lhs, rhs, NULL,
+                            4, starts, rows, values));
+        OK(SCIPlpiSolveDual(lp));
+        CHECK(SCIPlpiIsOptimal(lp));
+        double parent, prim[2], down, up;
+        SCIP_Bool down_valid, up_valid;
+        OK(SCIPlpiGetSol(lp, &parent, prim, NULL, NULL, NULL));
+        /* The oracle is dyadic. The backend still rounds intermediate pivots. */
+        const double roundoff = 32 * DBL_EPSILON;
+        CHECK(fabs(parent - 4 * sign) <= roundoff && fabs(prim[0] - 1.5) <= roundoff);
+        OK(SCIPlpiStartStrongbranch(lp));
+        OK(SCIPlpiStrongbranchFrac(lp, 0, prim[0], 500, &down, &up, &down_valid, &up_valid, NULL));
+        CHECK(down_valid && up_valid);
+        CHECK(fabs(down - 3 * sign) <= roundoff && fabs(up - 3.5 * sign) <= roundoff);
+        OK(SCIPlpiEndStrongbranch(lp));
+        OK(SCIPlpiFree(&lp));
+    }
+    return 0;
+}
+
+/* 6. Stress fast cached strong branching: compare SCIPlpiStartStrongbranch +
+ *    repeated SCIPlpiStrongbranchFrac against independent fresh dual solves
+ *    across MIN and MAX senses, itlim = 0 / 1 / 500, infeasible branches, and
+ *    external bound/obj/rhs invalidation between sessions. */
+static int test_fast_strongbranch_cached(void) {
+    const int nrows = 40;
+    const int ncols = 120;
+    const int nnz_per_col = 4;
+    const int nnz = ncols * nnz_per_col;
+
+    double *obj = calloc((size_t)ncols, sizeof *obj);
+    double *lo = calloc((size_t)ncols, sizeof *lo);
+    double *hi = calloc((size_t)ncols, sizeof *hi);
+    double *lhs = calloc((size_t)nrows, sizeof *lhs);
+    double *rhs = calloc((size_t)nrows, sizeof *rhs);
+    int *beg = calloc((size_t)ncols, sizeof *beg);
+    int *ind = calloc((size_t)nnz, sizeof *ind);
+    double *val = calloc((size_t)nnz, sizeof *val);
+    double *prim = calloc((size_t)ncols, sizeof *prim);
+    CHECK(obj && lo && hi && lhs && rhs && beg && ind && val && prim);
+
+    for (int j = 0; j < ncols; ++j) {
+        obj[j] = (double)((j * 13) % 19 + 1) * 0.5;
+        lo[j] = 0.0;
+        hi[j] = 1.0;
+        beg[j] = j * nnz_per_col;
+        for (int k = 0; k < nnz_per_col; ++k) {
+            int r = (j * 7 + k * 13) % nrows;
+            ind[j * nnz_per_col + k] = r;
+            val[j * nnz_per_col + k] = 0.5 * (double)((j + 3 * k) % 7 + 1);
+        }
+    }
+    for (int pass = 0; pass < 2; ++pass) {
+        SCIP_OBJSEN sense = (pass == 0) ? SCIP_OBJSEN_MINIMIZE : SCIP_OBJSEN_MAXIMIZE;
+        SCIP_LPI *lp = NULL;
+        SCIP_LPI *ref = NULL;
+        OK(SCIPlpiCreate(&lp, NULL, "v27_sb_fast", sense));
+        OK(SCIPlpiCreate(&ref, NULL, "v27_sb_ref", sense));
+        double inf = SCIPlpiInfinity(lp);
+        if (pass == 0) {
+            for (int i = 0; i < nrows; ++i) {
+                lhs[i] = 2.25 + 0.1 * (double)(i % 5);
+                rhs[i] = (i % 4 == 0) ? lhs[i] + 5.0 : inf;
+            }
+        } else {
+            for (int i = 0; i < nrows; ++i) {
+                lhs[i] = -inf;
+                rhs[i] = 3.25 + 0.1 * (double)(i % 5);
+            }
+        }
+        OK(SCIPlpiLoadColLP(lp, sense, ncols, obj, lo, hi, NULL, nrows, lhs, rhs,
+                            NULL, nnz, beg, ind, val));
+        OK(SCIPlpiLoadColLP(ref, sense, ncols, obj, lo, hi, NULL, nrows, lhs, rhs,
+                            NULL, nnz, beg, ind, val));
+
+        OK(SCIPlpiSolveDual(lp));
+        CHECK(SCIPlpiIsOptimal(lp));
+        double base_obj = 0.0;
+        OK(SCIPlpiGetSol(lp, &base_obj, prim, NULL, NULL, NULL));
+
+        /* Collect fractional variables */
+        int frac_cols[64];
+        double frac_vals[64];
+        int nfrac = 0;
+        for (int j = 0; j < ncols && nfrac < 64; ++j) {
+            double f = prim[j] - floor(prim[j]);
+            if (f > 1e-4 && f < 1.0 - 1e-4) {
+                frac_cols[nfrac] = j;
+                frac_vals[nfrac] = prim[j];
+                nfrac++;
+            }
+        }
+        CHECK(nfrac >= 4);
+
+        /* Session 1: repeated cached strong branching across itlim = 0, 1, 500 */
+        OK(SCIPlpiStartStrongbranch(lp));
+        for (int c = 0; c < nfrac; ++c) {
+            double down = 0.0, up = 0.0;
+            SCIP_Bool dval = FALSE, uval = FALSE;
+            int it = 0;
+            int lim = (c == 0) ? 0 : (c == 1) ? 1 : 500;
+            OK(SCIPlpiStrongbranchFrac(lp, frac_cols[c], frac_vals[c], lim,
+                                       &down, &up, &dval, &uval, &it));
+            CHECK(dval && uval);
+
+            if (lim == 500) {
+                /* Verify exact agreement against independent fresh solve on ref */
+                int col = frac_cols[c];
+                double oldlb = lo[col], oldub = hi[col];
+                double fl = floor(frac_vals[c]), cl = ceil(frac_vals[c]);
+
+                /* Down branch */
+                OK(SCIPlpiChgBounds(ref, 1, &col, &oldlb, &fl));
+                OK(SCIPlpiSolveDual(ref));
+                if (SCIPlpiIsOptimal(ref)) {
+                    double robj = 0.0;
+                    OK(SCIPlpiGetObjval(ref, &robj));
+                    CHECK(fabs(down - robj) < 1e-5 * (1.0 + fabs(robj)));
+                } else {
+                    CHECK(SCIPlpiIsPrimalInfeasible(ref));
+                    CHECK(sense == SCIP_OBJSEN_MINIMIZE ? down > 1e15 : down < -1e15);
+                }
+                OK(SCIPlpiChgBounds(ref, 1, &col, &oldlb, &oldub));
+
+                /* Up branch */
+                OK(SCIPlpiChgBounds(ref, 1, &col, &cl, &oldub));
+                OK(SCIPlpiSolveDual(ref));
+                if (SCIPlpiIsOptimal(ref)) {
+                    double robj = 0.0;
+                    OK(SCIPlpiGetObjval(ref, &robj));
+                    CHECK(fabs(up - robj) < 1e-5 * (1.0 + fabs(robj)));
+                } else {
+                    CHECK(SCIPlpiIsPrimalInfeasible(ref));
+                    CHECK(sense == SCIP_OBJSEN_MINIMIZE ? up > 1e15 : up < -1e15);
+                }
+                OK(SCIPlpiChgBounds(ref, 1, &col, &oldlb, &oldub));
+            }
+        }
+        OK(SCIPlpiEndStrongbranch(lp));
+        CHECK(SCIPlpiIsOptimal(lp));
+        double after_obj = 0.0;
+        OK(SCIPlpiGetObjval(lp, &after_obj));
+        CHECK(fabs(after_obj - base_obj) < 1e-6 * (1.0 + fabs(base_obj)));
+
+        /* Session 2: mutate objective & bound externally to test sb_clean_lp / sb_snap_valid invalidation */
+        int mcol = frac_cols[0];
+        double newobj = obj[mcol] + 7.25;
+        OK(SCIPlpiChgObj(lp, 1, &mcol, &newobj));
+        OK(SCIPlpiChgObj(ref, 1, &mcol, &newobj));
+        OK(SCIPlpiSolveDual(lp));
+        CHECK(SCIPlpiIsOptimal(lp));
+        OK(SCIPlpiGetSol(lp, &base_obj, prim, NULL, NULL, NULL));
+
+        OK(SCIPlpiStartStrongbranch(lp));
+        for (int j = 0; j < ncols; ++j) {
+            double f = prim[j] - floor(prim[j]);
+            if (f > 1e-4 && f < 1.0 - 1e-4) {
+                double down = 0.0, up = 0.0;
+                SCIP_Bool dval = FALSE, uval = FALSE;
+                OK(SCIPlpiStrongbranchFrac(lp, j, prim[j], 500, &down, &up, &dval, &uval, NULL));
+                CHECK(dval && uval);
+                double fl = floor(prim[j]);
+                OK(SCIPlpiChgBounds(ref, 1, &j, &lo[j], &fl));
+                OK(SCIPlpiSolveDual(ref));
+                if (SCIPlpiIsOptimal(ref)) {
+                    double robj = 0.0;
+                    OK(SCIPlpiGetObjval(ref, &robj));
+                    CHECK(fabs(down - robj) < 1e-5 * (1.0 + fabs(robj)));
+                }
+                OK(SCIPlpiChgBounds(ref, 1, &j, &lo[j], &hi[j]));
+                break;
+            }
+        }
+        OK(SCIPlpiEndStrongbranch(lp));
+
+        OK(SCIPlpiFree(&lp));
+        OK(SCIPlpiFree(&ref));
+    }
+
+    free(prim);
+    free(val);
+    free(ind);
+    free(beg);
+    free(rhs);
+    free(lhs);
+    free(hi);
+    free(lo);
+    free(obj);
+    return 0;
+}
+
 int main(void) {
     if (test_dense_lu_and_u_bailout() != 0)
         return 1;
@@ -447,6 +767,12 @@ int main(void) {
     if (test_eventfilter_lazy_hash() != 0)
         return 1;
     if (test_sparse_relaxed_knapsack() != 0)
+        return 1;
+    if (test_dual_bfrt_and_degenerate_perturb() != 0)
+        return 1;
+    if (test_strongbranch_objective_sense() != 0)
+        return 1;
+    if (test_fast_strongbranch_cached() != 0)
         return 1;
     printf("test_v16_engine: ok\n");
     return 0;

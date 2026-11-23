@@ -60,7 +60,8 @@ class IntegerSearch(unittest.TestCase):
             with self.subTest(seed=seed), tempfile.TemporaryDirectory() as tmp:
                 v, model, sol = self.run_model(Path(tmp), integer_mps(m))
                 self.assertEqual(v['status'], 'optimal', v)
-                self.assertIn('SCIP reported optimality', v['message'])
+                self.assertEqual((v['search_route'], v['bound_origin']), ('contracted_scip', 'integer_lattice'))
+                self.assertEqual(F(str(v['best_bound'])), expected)
                 self.assertFalse(v['certifies_optimality'])
                 check = subprocess.run([CHECKER,'--exact','--model',model,'--solution',sol],
                                        capture_output=True,text=True)

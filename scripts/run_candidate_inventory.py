@@ -27,6 +27,8 @@ _helpers = pathlib.Path(__file__).resolve().parent / 'evaluator'
 if (_helpers / 'benchmark_gate.py').is_file():
     sys.path.insert(0, str(_helpers))
 from benchmark_gate import CORPUS_SIZE, validate_manifest, strict_json
+import run_evaluation
+from run_evaluation import EVALUATION_SHA256, assess_evidence, witness_index
 
 
 def digest(path):
@@ -97,6 +99,7 @@ def summarize(manifest, records, logs=None, log_errors=None):
     logs = logs or {}
     log_errors = log_errors or {}
     grouped = collections.defaultdict(list)
+    witnesses = witness_index(records)
     for record in records:
         grouped[record.get('instance')].append(record)
     locked = {model['id']: model for model in manifest['instances']}
@@ -105,7 +108,7 @@ def summarize(manifest, records, logs=None, log_errors=None):
         attempts = grouped.get(name, [])
         run = attempts[0] if len(attempts) == 1 else {}
         solver = logs.get(name) or {}
-        checker = run.get('checker') or {}
+        facts = assess_evidence(run, model, relaxation=False, witnesses=witnesses)
         if not attempts:
             missing.append(name)
         elif len(attempts) != 1:
@@ -130,8 +133,9 @@ def summarize(manifest, records, logs=None, log_errors=None):
                            'singleton_eliminations_peak', 'basis_updates', 'basis_update_rejections',
                            'presolve_passes', 'presolve_tightenings', 'presolve_fixed', 'presolve_rows']
                           if key in solver},
-                      'checked_feasible': checker.get('status') == 'valid' and checker.get('checked_feasible') is True,
-                      'checked_objective': checker.get('objective'), 'checker_status': checker.get('status'),
+                      'checked_feasible': facts['checked_feasible'],
+                      'witness_conflicts': facts['witness_conflicts'], 'contradicting_witness': facts['contradicting_witness'],
+                      'checked_objective': facts['checked_objective'], 'checker_status': facts['checker_outcome'],
                       'run_record': f'runs/{name}/lab/seed-{run.get("seed", 1)}/run.json'})
     shape = {}
     for key in ['rows', 'columns', 'nonzeros']:
@@ -147,9 +151,7 @@ def summarize(manifest, records, logs=None, log_errors=None):
             'malformed_or_missing_solver_logs': [{'instance': name, 'error': error}
                                                  for name, error in sorted(log_errors.items())],
             'invalid_candidates': sum((r.get('checker') or {}).get('status') == 'invalid' for r in records),
-            'checker_errors': sum((r.get('checker') or {}).get('status') in ('error', 'unsupported') or
-                                  r.get('checker_exit_code') not in (None, 0) and
-                                  (r.get('checker') or {}).get('status') != 'invalid' for r in records),
+            'checker_errors': sum(case['checker_status'] in ('error', 'unsupported') for case in cases),
             'crashes': [case['instance'] for case in cases if case['signal'] not in (None, 0) and
                         not case['watchdog_timeout']],
             'watchdog_limits': [case['instance'] for case in cases if case['watchdog_timeout']],
@@ -187,7 +189,13 @@ def main():
     parser.add_argument('--limit', type=float, default=2)
     parser.add_argument('--grace', type=float, default=15)
     parser.add_argument('--seed', type=int, default=1)
+    parser.add_argument('--cmake-cache', type=pathlib.Path,
+                        help='CMake initial cache selecting the locked dependency build')
+    parser.add_argument('--verify-candidate', action='store_true',
+                        help='require the designated feature lock and full contracts on the measured build')
     args = parser.parse_args()
+    if args.verify_candidate and not args.cmake_cache:
+        parser.error('--verify-candidate requires a feature-enabled --cmake-cache')
     root = next(p for p in pathlib.Path(__file__).resolve().parents
                 if (p / '.git').exists() and (p / 'CMakeLists.txt').exists())
     os.chdir(root)
@@ -230,15 +238,30 @@ def main():
     shutil.copy2(suite_path, out / 'suite.tsv')
     shutil.copy2(__file__, out / 'driver.py')
     build = out / 'build'
-    configure = command(['cmake', '-S', frozen_source, '-B', build, '-DCMAKE_BUILD_TYPE=Release'],
-                        out, 'configure', 120)
-    compiled = command(['cmake', '--build', build, '--target', 'milpsolve', 'milpcheck', 'milpbench',
+    configure_args = ['cmake', '-S', frozen_source, '-B', build, '-DCMAKE_BUILD_TYPE=Release']
+    if args.cmake_cache:
+        profile = out / 'candidate-profile.cmake'
+        shutil.copy2(args.cmake_cache, profile)
+        configure_args.extend(['-C', profile])
+    configure = command(configure_args, out, 'configure', 120)
+    targets = [] if args.verify_candidate else ['--target', 'milpsolve', 'milpcheck', 'milpbench']
+    compiled = command(['cmake', '--build', build, *targets,
                         '--parallel', '4'], out, 'build', 300) if configure['exit_code'] == 0 else None
     if configure['exit_code'] != 0 or not compiled or compiled['exit_code'] != 0:
         write(out / 'pipeline-failure.json', {'phase': 'building archived evaluator',
               'source_revision': requested, 'configure': configure, 'build': compiled,
               'solver_processes_launched': 0, 'unattempted_instances': sorted(locked)})
         return 1
+    verification = None
+    if args.verify_candidate:
+        receipt = out / 'candidate-verification.json'
+        checked = command([sys.executable, frozen_source / 'scripts/verify_candidate.py',
+                           '--build', build, '--out', receipt], out, 'candidate-contracts', 3600)
+        if checked['exit_code'] != 0:
+            write(out / 'pipeline-failure.json', {'phase': 'candidate verification', 'contracts': checked,
+                  'solver_processes_launched': 0, 'unattempted_instances': sorted(locked)})
+            return 1
+        verification = strict_json(receipt.read_text())
     cache = (build / 'CMakeCache.txt').read_text()
     compiler = next(line.split('=', 1)[1] for line in cache.splitlines()
                     if line.startswith('CMAKE_C_COMPILER:'))
@@ -251,6 +274,15 @@ def main():
         identities[name] = {'origin': str(original), 'path': str(target), 'sha256': digest(target)}
         if digest(original) != digest(target):
             raise RuntimeError('binary changed while freezing: ' + name)
+    if verification and verification['identity']['binaries'] != {k:v['sha256'] for k,v in identities.items()}:
+        raise RuntimeError('frozen campaign executables differ from tested build')
+    # Earlier revisions kept their evaluation rules inside the two consumers.
+    frozen_policy = frozen_source / 'scripts/run_evaluation.py'
+    if frozen_policy.exists():
+        shutil.copy2(frozen_policy, evaluator)
+    else:
+        # The retained inventory driver itself uses today's evidence schema.
+        shutil.copy2(run_evaluation.__file__, evaluator)
     for name in ['benchmark_gate.py', 'report.py']:
         shutil.copy2(frozen_source / 'scripts' / name, evaluator / name)
     (out / 'solvers.tsv').write_text('solver\tbinary\tsha256\tversion\nlab\t' + str(evaluator / 'milpsolve') +
@@ -266,7 +298,9 @@ def main():
     provenance = {'schema': 1, 'kind': 'Full locked-corpus development coverage inventory; not fair timing or ranking',
                   'coverage_exploration': True, 'fair_timing_campaign': False, 'source_begin': beginning,
                   'source_revision': requested, 'source_archive_sha256': digest(out / 'evaluator-source.tar.gz'),
-                  'driver_sha256': digest(out / 'driver.py'), 'identities': identities,
+                  'driver_sha256': digest(out / 'driver.py'), 'evaluation_sha256': EVALUATION_SHA256,
+                  'identities': identities,
+                  'candidate_verification_sha256': digest(receipt) if verification else None,
                   'evaluators_built_from_archive': True, 'configure': configure, 'build': compiled,
                   'cmake_cache_sha256': digest(build / 'CMakeCache.txt'),
                   'compiler_identity': compiler_identity,
@@ -311,7 +345,7 @@ def main():
     summary = summarize(manifest, records, logs, log_errors)
     if raw.exists():
         gate_process = command([sys.executable, evaluator / 'benchmark_gate.py', '--manifest',
-            out / 'completion-manifest.json', '--runs', raw, '--out', out / 'gate.json'], out, 'gate', 120)
+            out / 'completion-manifest.json', '--runs', raw, '--candidate-config', out / 'runs/lab-config.json', '--out', out / 'gate.json'], out, 'gate', 120)
     else:
         gate_process = {'exit_code': None, 'error': 'run records missing'}
         write(out / 'gate.json', {'passed': False, 'completion_gate_passed': False,

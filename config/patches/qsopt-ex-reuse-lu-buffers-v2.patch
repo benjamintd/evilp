@@ -1,0 +1,521 @@
+--- a/qsopt_ex/factor.h
++++ b/qsopt_ex/factor.h
+@@ -170,6 +170,20 @@
+ 	int er_freebeg;
+ 	int er_space;       /* logical limit for update entries */
+ 	int er_capacity;    /* retained index and coefficient slots */
++	/* Retained capacities across refactorizations to avoid calloc/free churn. */
++	int dim_cap;
++	int ur_inf_cap;
++	int er_inf_cap;
++	int uc_cap;
++	int ur_cap;
++	int lc_cap;
++	int lr_cap;
++	EGLPNUM_TYPE *uccoef_saved;
++	int uccoef_cap;
++	int *ucrind_saved;
++	int ucrind_cap;
++	int *urcind_saved;
++	int urcind_cap;
+ 
+ 	int *p_nsing;
+ 	int **p_singr;
+--- a/qsopt_ex/factor.c
++++ b/qsopt_ex/factor.c
+@@ -157,6 +157,19 @@
+ 	f->dmat = 0;
+ 	EGLPNUM_TYPENAME_ILLsvector_init (&f->xtmp);
+ 	EGLPNUM_TYPENAME_ILLsvector_init (&f->newr);
++	f->dim_cap = 0;
++	f->ur_inf_cap = 0;
++	f->er_inf_cap = 0;
++	f->uc_cap = 0;
++	f->ur_cap = 0;
++	f->lc_cap = 0;
++	f->lr_cap = 0;
++	f->uccoef_saved = 0;
++	f->uccoef_cap = 0;
++	f->ucrind_saved = 0;
++	f->ucrind_cap = 0;
++	f->urcind_saved = 0;
++	f->urcind_cap = 0;
+ }
+ 
+ void EGLPNUM_TYPENAME_ILLfactor_reset_factor_work (
+@@ -171,54 +184,77 @@
+ 						((double) permshifttot) / nupdate);
+ 	}
+ #endif
++	/* Stash update-mode arrays so factorization sees ucrind/urcind == NULL,
++	 * while retaining allocated storage for the next build_iteration_u_data. */
++	if (f->uccoef != 0)
++	{
++		f->uccoef_saved = f->uccoef;
++		f->uccoef = 0;
++	}
++	if (f->ucrind != 0)
++	{
++		f->ucrind_saved = f->ucrind;
++		f->ucrind = 0;
++	}
++	if (f->urcind != 0)
++	{
++		f->urcind_saved = f->urcind;
++		f->urcind = 0;
++	}
++	EGLPNUM_TYPENAME_EGlpNumFreeArray (f->dmat);
++	f->etacnt = 0;
++	f->pf_mode = 0;
++	f->pf_cnt = 0;
++	f->pf_freebeg = 0;
++}
++
++/* Retained workspace, LU factor, and eta arrays are released only here. */
++void EGLPNUM_TYPENAME_ILLfactor_free_factor_work (
++	EGLPNUM_TYPENAME_factor_work * f)
++{
++	EGLPNUM_TYPENAME_ILLfactor_reset_factor_work (f);
+ 	EGLPNUM_TYPENAME_EGlpNumFreeArray (f->work_coef);
+ 	ILL_IFFREE(f->work_indx);
+-
+ 	ILL_IFFREE(f->uc_inf);
+-	if (f->dim + f->max_k > 0 && f->ur_inf)
+-	{
+-		unsigned int i = f->dim + f->max_k + 1;
+-
++	if (f->ur_inf_cap > 0 && f->ur_inf)
++	{
++		int i = f->ur_inf_cap;
+ 		while (i--)
+ 			EGLPNUM_TYPENAME_EGlpNumClearVar (f->ur_inf[i].max);
+ 	}
+ 	ILL_IFFREE(f->ur_inf);
++	f->ur_inf_cap = 0;
+ 	ILL_IFFREE(f->lc_inf);
+ 	ILL_IFFREE(f->lr_inf);
+ 	ILL_IFFREE(f->er_inf);
++	f->er_inf_cap = 0;
+ 	ILL_IFFREE(f->ucindx);
++	f->uc_cap = 0;
+ 	ILL_IFFREE(f->ucrind);
+-
++	ILL_IFFREE(f->ucrind_saved);
++	f->ucrind_cap = 0;
+ 	EGLPNUM_TYPENAME_EGlpNumFreeArray (f->uccoef);
++	EGLPNUM_TYPENAME_EGlpNumFreeArray (f->uccoef_saved);
++	f->uccoef_cap = 0;
+ 	ILL_IFFREE(f->urindx);
++	EGLPNUM_TYPENAME_EGlpNumFreeArray (f->urcoef);
++	f->ur_cap = 0;
+ 	ILL_IFFREE(f->urcind);
+-
+-	EGLPNUM_TYPENAME_EGlpNumFreeArray (f->urcoef);
++	ILL_IFFREE(f->urcind_saved);
++	f->urcind_cap = 0;
+ 	ILL_IFFREE(f->lcindx);
+-
+ 	EGLPNUM_TYPENAME_EGlpNumFreeArray (f->lccoef);
++	f->lc_cap = 0;
+ 	ILL_IFFREE(f->lrindx);
+-
+ 	EGLPNUM_TYPENAME_EGlpNumFreeArray (f->lrcoef);
++	f->lr_cap = 0;
+ 	ILL_IFFREE(f->rperm);
+ 	ILL_IFFREE(f->rrank);
+ 	ILL_IFFREE(f->cperm);
+ 	ILL_IFFREE(f->crank);
+-
+-	EGLPNUM_TYPENAME_EGlpNumFreeArray (f->dmat);
+ 	EGLPNUM_TYPENAME_ILLsvector_free (&f->xtmp);
+ 	EGLPNUM_TYPENAME_ILLsvector_free (&f->newr);
+-	f->pf_mode = 0;
+-	f->pf_cnt = 0;
+-	f->pf_freebeg = 0;
+-}
+-
+-/* Eta entries are overwritten before use after each reset. Only the final
+- * destructor releases their storage. Numerical objects stay initialized. */
+-void EGLPNUM_TYPENAME_ILLfactor_free_factor_work (
+-	EGLPNUM_TYPENAME_factor_work * f)
+-{
+-	EGLPNUM_TYPENAME_ILLfactor_reset_factor_work (f);
++	f->dim_cap = 0;
+ 	ILL_IFFREE(f->erindx);
+ 	EGLPNUM_TYPENAME_EGlpNumFreeArray (f->ercoef);
+ 	f->er_capacity = 0;
+@@ -329,20 +365,57 @@
+ 
+ 	f->dim = dim;
+ 	f->etacnt = 0;
+-	f->work_coef = EGLPNUM_TYPENAME_EGlpNumAllocArray (dim);
+-	ILL_SAFE_MALLOC (f->work_indx, dim, int);
+-
+-	ILL_SAFE_MALLOC (f->uc_inf, dim + (f->max_k + 1), EGLPNUM_TYPENAME_uc_info);
+-	ILL_SAFE_MALLOC (f->ur_inf, dim + (f->max_k + 1), EGLPNUM_TYPENAME_ur_info);
+-	ILL_SAFE_MALLOC (f->lc_inf, dim, EGLPNUM_TYPENAME_lc_info);
+-	ILL_SAFE_MALLOC (f->lr_inf, dim, EGLPNUM_TYPENAME_lr_info);
+-	ILL_SAFE_MALLOC (f->rperm, dim, int);
+-	ILL_SAFE_MALLOC (f->rrank, dim, int);
+-	ILL_SAFE_MALLOC (f->cperm, dim, int);
+-	ILL_SAFE_MALLOC (f->crank, dim, int);
+-
+-	for (i = dim + f->max_k + 1; i--;)
+-		EGLPNUM_TYPENAME_EGlpNumInitVar (f->ur_inf[i].max);
++	if (dim > f->dim_cap || f->work_coef == 0)
++	{
++		int dcap = dim + (dim >> 3) + 32;
++		EGLPNUM_TYPENAME_EGlpNumFreeArray (f->work_coef);
++		ILL_IFFREE(f->work_indx);
++		ILL_IFFREE(f->lc_inf);
++		ILL_IFFREE(f->lr_inf);
++		ILL_IFFREE(f->rperm);
++		ILL_IFFREE(f->rrank);
++		ILL_IFFREE(f->cperm);
++		ILL_IFFREE(f->crank);
++		EGLPNUM_TYPENAME_ILLsvector_free (&f->xtmp);
++		EGLPNUM_TYPENAME_ILLsvector_free (&f->newr);
++		f->dim_cap = 0;
++
++		f->work_coef = EGLPNUM_TYPENAME_EGlpNumAllocArray (dcap);
++		ILL_SAFE_MALLOC (f->work_indx, dcap, int);
++		ILL_SAFE_MALLOC (f->lc_inf, dcap, EGLPNUM_TYPENAME_lc_info);
++		ILL_SAFE_MALLOC (f->lr_inf, dcap, EGLPNUM_TYPENAME_lr_info);
++		ILL_SAFE_MALLOC (f->rperm, dcap, int);
++		ILL_SAFE_MALLOC (f->rrank, dcap, int);
++		ILL_SAFE_MALLOC (f->cperm, dcap, int);
++		ILL_SAFE_MALLOC (f->crank, dcap, int);
++		rval = EGLPNUM_TYPENAME_ILLsvector_alloc (&f->xtmp, dcap);
++		CHECKRVALG (rval, CLEANUP);
++		rval = EGLPNUM_TYPENAME_ILLsvector_alloc (&f->newr, dcap);
++		CHECKRVALG (rval, CLEANUP);
++		f->dim_cap = dcap;
++	}
++	{
++		int ur_need = dim + f->max_k + 1;
++		if (ur_need > f->ur_inf_cap || f->ur_inf == 0 || f->uc_inf == 0)
++		{
++			int ucap = ur_need + (ur_need >> 3) + 32;
++			if (f->ur_inf_cap > 0 && f->ur_inf)
++			{
++				int k = f->ur_inf_cap;
++				while (k--)
++					EGLPNUM_TYPENAME_EGlpNumClearVar (f->ur_inf[k].max);
++			}
++			ILL_IFFREE(f->uc_inf);
++			ILL_IFFREE(f->ur_inf);
++			f->ur_inf_cap = 0;
++
++			ILL_SAFE_MALLOC (f->uc_inf, ucap, EGLPNUM_TYPENAME_uc_info);
++			ILL_SAFE_MALLOC (f->ur_inf, ucap, EGLPNUM_TYPENAME_ur_info);
++			for (i = ucap; i--;)
++				EGLPNUM_TYPENAME_EGlpNumInitVar (f->ur_inf[i].max);
++			f->ur_inf_cap = ucap;
++		}
++	}
+ 
+ 	for (i = 0; i < dim; i++)
+ 	{
+@@ -366,11 +439,6 @@
+ 		f->ur_inf[dim + i].next = dim + i;
+ 		f->ur_inf[dim + i].prev = dim + i;
+ 	}
+-
+-	rval = EGLPNUM_TYPENAME_ILLsvector_alloc (&f->xtmp, dim);
+-	CHECKRVALG (rval, CLEANUP);
+-	rval = EGLPNUM_TYPENAME_ILLsvector_alloc (&f->newr, dim);
+-	CHECKRVALG (rval, CLEANUP);
+ 
+ 	rval = 0;
+ 
+@@ -903,6 +971,9 @@
+ 
+ 	f->ur_freebeg = new_nzcnt;
+ 	f->ur_space = minspace;
++	f->ur_cap = minspace;
++	if (f->urcind != 0)
++		f->urcind_cap = minspace;
+ 
+ #ifdef GROWTH_STATS
+ 	MESSAGE (0,"%d/%d nonzeros", new_nzcnt, old_nzcnt);
+@@ -1023,6 +1094,12 @@
+ 
+ 	f->uc_freebeg = new_nzcnt;
+ 	f->uc_space = minspace;
++	f->uc_cap = minspace;
++	if (f->ucrind != 0)
++	{
++		f->uccoef_cap = minspace;
++		f->ucrind_cap = minspace;
++	}
+ 
+ #ifdef GROWTH_STATS
+ 	MESSAGE (0,"%d nonzeros", new_nzcnt);
+@@ -1080,6 +1157,7 @@
+ 	new_lcindx = 0;
+ 
+ 	f->lc_space = minspace;
++	f->lc_cap = minspace;
+ 
+ #ifdef GROWTH_STATS
+ 	dump_factor_stats (f);
+@@ -1950,32 +2028,44 @@
+ 		nzcnt += ur_inf[i].nzcnt;
+ 	}
+ 
+-	if (f->ucindx == 0)
+-	{
+-		f->uc_space = nzcnt * f->uc_space_mul;
+-		ILL_SAFE_MALLOC (f->ucindx, f->uc_space + 1, int);
+-	}
+-
+-	if (f->urindx == 0 || f->urcoef == 0)
+-	{
+-		ILL_IFFREE(f->urindx);
+-
+-		EGLPNUM_TYPENAME_EGlpNumFreeArray (f->urcoef);
+-		f->ur_space = nzcnt * f->ur_space_mul;
+-		ILL_SAFE_MALLOC (f->urindx, f->ur_space + 1, int);
+-
+-		f->urcoef = EGLPNUM_TYPENAME_EGlpNumAllocArray (f->ur_space);
+-	}
+-
+-	if (f->lcindx == 0 || f->lccoef == 0)
+-	{
+-		ILL_IFFREE(f->lcindx);
+-
+-		EGLPNUM_TYPENAME_EGlpNumFreeArray (f->lccoef);
+-		f->lc_space = nzcnt * f->lc_space_mul;
+-		ILL_SAFE_MALLOC (f->lcindx, f->lc_space, int);
+-
+-		f->lccoef = EGLPNUM_TYPENAME_EGlpNumAllocArray (f->lc_space);
++	{
++		int need_uc = (int) (nzcnt * f->uc_space_mul) + 64;
++		int need_ur = (int) (nzcnt * f->ur_space_mul) + 64;
++		int need_lc = (int) (nzcnt * f->lc_space_mul) + 64;
++
++		if (f->ucindx == 0 || f->uc_cap < need_uc)
++		{
++			int alloc_uc = need_uc + (need_uc >> 2);
++			ILL_IFFREE(f->ucindx);
++			f->uc_cap = 0;
++			ILL_SAFE_MALLOC (f->ucindx, alloc_uc + 1, int);
++			f->uc_cap = alloc_uc;
++		}
++		f->uc_space = need_uc;
++
++		if (f->urindx == 0 || f->urcoef == 0 || f->ur_cap < need_ur)
++		{
++			int alloc_ur = need_ur + (need_ur >> 2);
++			ILL_IFFREE(f->urindx);
++			EGLPNUM_TYPENAME_EGlpNumFreeArray (f->urcoef);
++			f->ur_cap = 0;
++			ILL_SAFE_MALLOC (f->urindx, alloc_ur + 1, int);
++			f->urcoef = EGLPNUM_TYPENAME_EGlpNumAllocArray (alloc_ur);
++			f->ur_cap = alloc_ur;
++		}
++		f->ur_space = need_ur;
++
++		if (f->lcindx == 0 || f->lccoef == 0 || f->lc_cap < need_lc)
++		{
++			int alloc_lc = need_lc + (need_lc >> 2);
++			ILL_IFFREE(f->lcindx);
++			EGLPNUM_TYPENAME_EGlpNumFreeArray (f->lccoef);
++			f->lc_cap = 0;
++			ILL_SAFE_MALLOC (f->lcindx, alloc_lc, int);
++			f->lccoef = EGLPNUM_TYPENAME_EGlpNumAllocArray (alloc_lc);
++			f->lc_cap = alloc_lc;
++		}
++		f->lc_space = f->lc_cap;
+ 	}
+ 
+ 	nzcnt = 0;
+@@ -2078,17 +2168,13 @@
+ 	}
+ 
+ 	j = f->uc_space;
+-	for (i = f->uc_freebeg; i < j; i++)
+-	{
+-		ucindx[i] = -1;
+-	}
++	if (j > f->uc_freebeg)
++		memset (ucindx + f->uc_freebeg, 0xff, (size_t) (j - f->uc_freebeg) * sizeof (int));
+ 	ucindx[j] = 0;
+ 
+ 	j = f->ur_space;
+-	for (i = f->ur_freebeg; i < j; i++)
+-	{
+-		urindx[i] = -1;
+-	}
++	if (j > f->ur_freebeg)
++		memset (urindx + f->ur_freebeg, 0xff, (size_t) (j - f->ur_freebeg) * sizeof (int));
+ 	urindx[j] = 0;
+ 
+ 	for (i = 0; i < dim; i++)
+@@ -2194,31 +2280,91 @@
+ 	{
+ 		int extra_u = (nzcnt >> 1) + dim * 2 + 64;
+ 		int uc_target = nzcnt + extra_u;
+-
+-		ILL_IFFREE(f->urcind);
+-		if (f->ur_freebeg + extra_u >= f->ur_space)
+-		{
+-			rval = make_ur_space (f, extra_u);
+-			CHECKRVALG (rval, CLEANUP);
+-			urindx = f->urindx;
+-			urcoef = f->urcoef;
+-		}
+-
+-		EGLPNUM_TYPENAME_EGlpNumFreeArray (f->uccoef);
+-		uccoef = EGLPNUM_TYPENAME_EGlpNumAllocArray (uc_target);
++		int ur_need = f->ur_freebeg + extra_u + 1;
++
++		if (f->urcind != 0)
++		{
++			f->urcind_saved = f->urcind;
++			f->urcind = 0;
++		}
++		if (ur_need > f->ur_space)
++		{
++			if (ur_need <= f->ur_cap)
++			{
++				/* Expand logical ur_space in-place inside retained ur_cap: zero copy, zero malloc! */
++				f->ur_space = ur_need;
++			}
++			else
++			{
++				rval = make_ur_space (f, extra_u);
++				CHECKRVALG (rval, CLEANUP);
++				urindx = f->urindx;
++				urcoef = f->urcoef;
++			}
++		}
++
++		if (f->uccoef != 0)
++		{
++			f->uccoef_saved = f->uccoef;
++			f->uccoef = 0;
++		}
++		if (f->uccoef_saved != 0 && f->uccoef_cap >= uc_target)
++		{
++			uccoef = f->uccoef_saved;
++			f->uccoef_saved = 0;
++		}
++		else
++		{
++			int alloc_uc = uc_target + (uc_target >> 2);
++			EGLPNUM_TYPENAME_EGlpNumFreeArray (f->uccoef_saved);
++			f->uccoef_cap = 0;
++			uccoef = EGLPNUM_TYPENAME_EGlpNumAllocArray (alloc_uc);
++			f->uccoef_cap = alloc_uc;
++		}
+ 		f->uccoef = uccoef;
+ 
+-		ILL_IFFREE(f->ucrind);
+-		ILL_SAFE_MALLOC (ucrind, uc_target, int);
++		if (f->ucrind != 0)
++		{
++			f->ucrind_saved = f->ucrind;
++			f->ucrind = 0;
++		}
++		if (f->ucrind_saved != 0 && f->ucrind_cap >= uc_target)
++		{
++			ucrind = f->ucrind_saved;
++			f->ucrind_saved = 0;
++		}
++		else
++		{
++			int alloc_uc = uc_target + (uc_target >> 2);
++			ILL_IFFREE(f->ucrind_saved);
++			f->ucrind_cap = 0;
++			ILL_SAFE_MALLOC (ucrind, alloc_uc, int);
++			f->ucrind_cap = alloc_uc;
++		}
+ 		f->ucrind = ucrind;
+ 
+-		ILL_SAFE_MALLOC (urcind, f->ur_space, int);
++		if (f->urcind_saved != 0 && f->urcind_cap >= f->ur_space)
++		{
++			urcind = f->urcind_saved;
++			f->urcind_saved = 0;
++		}
++		else
++		{
++			int alloc_ur = f->ur_space + (f->ur_space >> 2);
++			ILL_IFFREE(f->urcind_saved);
++			f->urcind_cap = 0;
++			ILL_SAFE_MALLOC (urcind, alloc_ur, int);
++			f->urcind_cap = alloc_ur;
++		}
+ 		f->urcind = urcind;
+ 
+-		if (uc_space < uc_target)
+-		{
++		if (f->ucindx == 0 || f->uc_cap < uc_target)
++		{
++			int alloc_uc = uc_target + (uc_target >> 2);
+ 			ILL_IFFREE(f->ucindx);
+-			ILL_SAFE_MALLOC (f->ucindx, uc_target + 1, int);
++			f->uc_cap = 0;
++			ILL_SAFE_MALLOC (f->ucindx, alloc_uc + 1, int);
++			f->uc_cap = alloc_uc;
+ 		}
+ 		f->uc_space = uc_target;
+ 		uc_space = uc_target;
+@@ -2315,17 +2461,20 @@
+ 	}
+ 
+ 	nzcnt = f->ur_space;
+-
+-	for (i = f->ur_freebeg; i < nzcnt; i++)
+-	{
+-		urindx[i] = -1;
+-	}
++	if (nzcnt > f->ur_freebeg)
++		memset (urindx + f->ur_freebeg, 0xff, (size_t) (nzcnt - f->ur_freebeg) * sizeof (int));
+ 	urindx[nzcnt] = 0;
+ 
+ 	clear_work (f);
+ 
+ 	er_space = f->er_space_mul * f->etamax;
+-	ILL_SAFE_MALLOC (f->er_inf, f->etamax, EGLPNUM_TYPENAME_er_info);
++	if (f->er_inf == 0 || f->er_inf_cap < f->etamax)
++	{
++		ILL_IFFREE(f->er_inf);
++		f->er_inf_cap = 0;
++		ILL_SAFE_MALLOC (f->er_inf, f->etamax, EGLPNUM_TYPENAME_er_info);
++		f->er_inf_cap = f->etamax;
++	}
+ 	f->etacnt = 0;
+ 	f->er_freebeg = 0;
+ 	f->er_space = er_space;
+@@ -2365,17 +2514,18 @@
+ 		lc_inf[lc_inf[i].c].crank = i;
+ 	}
+ 
+-	EGLPNUM_TYPENAME_EGlpNumFreeArray (f->lrcoef);
+-	if (nzcnt)
+-	{
+-		lrcoef = EGLPNUM_TYPENAME_EGlpNumAllocArray (nzcnt);
+-		f->lrcoef = lrcoef;
+-	}
+-
+-	ILL_IFFREE(f->lrindx);
+-	ILL_SAFE_MALLOC (lrindx, nzcnt + 1, int);
+-
+-	f->lrindx = lrindx;
++	if (nzcnt > f->lr_cap || f->lrindx == 0 || (nzcnt > 0 && f->lrcoef == 0))
++	{
++		int cap = nzcnt + (nzcnt >> 2) + 64;
++		EGLPNUM_TYPENAME_EGlpNumFreeArray (f->lrcoef);
++		ILL_IFFREE(f->lrindx);
++		f->lr_cap = 0;
++		f->lrcoef = EGLPNUM_TYPENAME_EGlpNumAllocArray (cap);
++		ILL_SAFE_MALLOC (f->lrindx, cap + 1, int);
++		f->lr_cap = cap;
++	}
++	lrcoef = f->lrcoef;
++	lrindx = f->lrindx;
+ 
+ 	for (i = 0; i < dim; i++)
+ 	{

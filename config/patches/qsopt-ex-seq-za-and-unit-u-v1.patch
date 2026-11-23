@@ -1,0 +1,170 @@
+--- a/qsopt_ex/fct.c
++++ b/qsopt_ex/fct.c
+@@ -306,23 +306,36 @@
+ void EGLPNUM_TYPENAME_ILLfct_compute_dz (
+ 	EGLPNUM_TYPENAME_lpinfo * lp)
+ {
+-	int i, j;
+-	int col;
+-	int mcnt, mbeg;
++	int i, col;
++	int ncols = lp->ncols;
++	int *vstat = lp->vstat;
++	int *vindex = lp->vindex;
++	int *matcnt = lp->matcnt;
++	int *matbeg = lp->matbeg;
++	int *matind = lp->matind;
++	EGLPNUM_TYPE *matval = lp->matval;
++	EGLPNUM_TYPE *piz = lp->piz;
++	EGLPNUM_TYPE *cz = lp->cz;
++	EGLPNUM_TYPE *dz = lp->dz;
+ 	EGLPNUM_TYPE sum;
+ 
+ 	EGLPNUM_TYPENAME_EGlpNumInitVar (sum);
+ 
+-	for (j = 0; j < lp->nnbasic; j++)
+-	{
++	for (col = 0; col < ncols; col++)
++	{
++		int mcnt, mbeg;
++		int *ind;
++		EGLPNUM_TYPE *mval;
++		if (vstat[col] == STAT_BASIC)
++			continue;
++		mcnt = matcnt[col];
++		mbeg = matbeg[col];
++		ind = matind + mbeg;
++		mval = matval + mbeg;
+ 		EGLPNUM_TYPENAME_EGlpNumZero (sum);
+-		col = lp->nbaz[j];
+-		mcnt = lp->matcnt[col];
+-		mbeg = lp->matbeg[col];
+ 		for (i = 0; i < mcnt; i++)
+-			EGLPNUM_TYPENAME_EGlpNumAddInnProdTo (sum, lp->piz[lp->matind[mbeg + i]],
+-													 lp->matval[mbeg + i]);
+-		EGLPNUM_TYPENAME_EGlpNumCopyDiff (lp->dz[j], lp->cz[col], sum);
++			EGLPNUM_TYPENAME_EGlpNumAddInnProdTo (sum, piz[ind[i]], mval[i]);
++		EGLPNUM_TYPENAME_EGlpNumCopyDiff (dz[vindex[col]], cz[col], sum);
+ 	}
+ 	EGLPNUM_TYPENAME_EGlpNumClearVar (sum);
+ }
+@@ -398,26 +411,36 @@
+ void EGLPNUM_TYPENAME_ILLfct_compute_phaseI_dz (
+ 	EGLPNUM_TYPENAME_lpinfo * lp)
+ {
+-	int i, j;
+-	int col;
+-	int mcnt, mbeg;
++	int i, col;
++	int ncols = lp->ncols;
++	int *vstat = lp->vstat;
++	int *vindex = lp->vindex;
++	int *matcnt = lp->matcnt;
++	int *matbeg = lp->matbeg;
++	int *matind = lp->matind;
++	EGLPNUM_TYPE *matval = lp->matval;
++	EGLPNUM_TYPE *pIpiz = lp->pIpiz;
++	EGLPNUM_TYPE *pIdz = lp->pIdz;
+ 	EGLPNUM_TYPE sum;
+ 
+ 	EGLPNUM_TYPENAME_EGlpNumInitVar (sum);
+ 	ILL_IFTRACE ("%s\n", __func__);
+ 
+-	for (j = 0; j < lp->nnbasic; j++)
+-	{
++	for (col = 0; col < ncols; col++)
++	{
++		int mcnt, mbeg;
++		int *ind;
++		EGLPNUM_TYPE *mval;
++		if (vstat[col] == STAT_BASIC)
++			continue;
++		mcnt = matcnt[col];
++		mbeg = matbeg[col];
++		ind = matind + mbeg;
++		mval = matval + mbeg;
+ 		EGLPNUM_TYPENAME_EGlpNumZero (sum);
+-		col = lp->nbaz[j];
+-		mcnt = lp->matcnt[col];
+-		mbeg = lp->matbeg[col];
+ 		for (i = 0; i < mcnt; i++)
+-			EGLPNUM_TYPENAME_EGlpNumAddInnProdTo (sum, lp->pIpiz[lp->matind[mbeg + i]],
+-													 lp->matval[mbeg + i]);
+-		EGLPNUM_TYPENAME_EGlpNumCopyNeg (lp->pIdz[j], sum);
+-		ILL_IFTRACE ("%d:%d:%lf:%la\n", j, col, EGLPNUM_TYPENAME_EGlpNumToLf (sum),
+-								 EGLPNUM_TYPENAME_EGlpNumToLf (sum));
++			EGLPNUM_TYPENAME_EGlpNumAddInnProdTo (sum, pIpiz[ind[i]], mval[i]);
++		EGLPNUM_TYPENAME_EGlpNumCopyNeg (pIdz[vindex[col]], sum);
+ 	}
+ 	EGLPNUM_TYPENAME_EGlpNumClearVar (sum);
+ }
+@@ -495,9 +518,10 @@
+ 	EGLPNUM_TYPE ztoler)
+ {
+ 	int rval = 0;
+-	int i, j, nz = 0;
+-	int nnbasic = lp->nnbasic;
+-	int *nbaz = lp->nbaz;
++	int i, col, nz = 0;
++	int ncols = lp->ncols;
++	int *vstat = lp->vstat;
++	int *vindex = lp->vindex;
+ 	int *matcnt = lp->matcnt;
+ 	int *matbeg = lp->matbeg;
+ 	int *matind = lp->matind;
+@@ -514,13 +538,17 @@
+ 	for (i = 0; i < znz; i++)
+ 		EGLPNUM_TYPENAME_EGlpNumCopy (v[zindx[i]], zcoef[i]);
+ 
+-	for (j = 0; j < nnbasic; j++)
+-	{
+-		int col = nbaz[j];
+-		int mcnt = matcnt[col];
+-		int mbeg = matbeg[col];
+-		int *ind = matind + mbeg;
+-		EGLPNUM_TYPE *mval = matval + mbeg;
++	for (col = 0; col < ncols; col++)
++	{
++		int mcnt, mbeg;
++		int *ind;
++		EGLPNUM_TYPE *mval;
++		if (vstat[col] == STAT_BASIC)
++			continue;
++		mcnt = matcnt[col];
++		mbeg = matbeg[col];
++		ind = matind + mbeg;
++		mval = matval + mbeg;
+ 		EGLPNUM_TYPENAME_EGlpNumZero (sum);
+ 		for (i = 0; i < mcnt; i++)
+ 			EGLPNUM_TYPENAME_EGlpNumAddInnProdTo (sum, v[ind[i]], mval[i]);
+@@ -528,7 +556,7 @@
+ 		if (EGLPNUM_TYPENAME_EGlpNumIsNeqZero (sum, ztoler))
+ 		{
+ 			EGLPNUM_TYPENAME_EGlpNumCopy (zAcoef[nz], sum);
+-			zAindx[nz] = j;
++			zAindx[nz] = vindex[col];
+ 			nz++;
+ 		}
+ 	}
+--- a/qsopt_ex/factor.c
++++ b/qsopt_ex/factor.c
+@@ -3597,8 +3597,7 @@
+ 					stack[top++] = nr;
+ 					if (++nreach > dense_lim)
+ 					{
+-						for (i = 0; i < dim; i++)
+-							delay[i] = 0;
++						memset (delay, 0, (size_t) dim * sizeof (int));
+ 						ILLfactor_ftranu (f, work, x);
+ 						return;
+ 					}
+@@ -4561,8 +4560,7 @@
+ 					stack[top++] = nc;
+ 					if (++nreach > dense_lim)
+ 					{
+-						for (i = 0; i < dim; i++)
+-							delay[i] = 0;
++						memset (delay, 0, (size_t) dim * sizeof (int));
+ 						ILLfactor_btranu (f, work, x);
+ 						return;
+ 					}

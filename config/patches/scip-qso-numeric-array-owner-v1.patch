@@ -1,0 +1,136 @@
+--- a/src/lpi/lpi_qso.c
++++ b/src/lpi/lpi_qso.c
+@@ -1367,13 +1367,13 @@
+    if( rowind != NULL )
+       QSfree(rowind);
+    if( rowval != NULL )
+-      QSfree(rowval);
++      dbl_QSfree_numeric_array(rowval);
+    if( rhs != NULL )
+-      QSfree(rhs);
++      dbl_QSfree_numeric_array(rhs);
+    if( sense != NULL )
+       QSfree(sense);
+    if( range != NULL )
+-      QSfree(range);
++      dbl_QSfree_numeric_array(range);
+ 
+    QS_RETURN(rval);
+ }
+@@ -1453,13 +1453,13 @@
+    if( colind != NULL )
+       QSfree(colind);
+    if( colval != NULL )
+-      QSfree(colval);
++      dbl_QSfree_numeric_array(colval);
+    if( obj != NULL )
+-      QSfree(obj);
++      dbl_QSfree_numeric_array(obj);
+    if( lb != NULL )
+-      QSfree(lb);
++      dbl_QSfree_numeric_array(lb);
+    if( ub != NULL )
+-      QSfree(ub);
++      dbl_QSfree_numeric_array(ub);
+ 
+    QS_RETURN(rval);
+ }
+@@ -1580,10 +1580,11 @@
+    {
+       assert(beg != NULL && ind != NULL && val != NULL); /* for lint */
+ 
+-      if( lcnt == NULL || lbeg == NULL || lind == NULL || lval == NULL )
++      if( lcnt == NULL || lbeg == NULL || ((lbeg[len-1] + lcnt[len-1] > 0) && (lind == NULL || lval == NULL)) )
+       {
+          SCIPerrorMessage("QSget_columns_list() failed to allocate memory.\n");
+-         return SCIP_LPERROR;
++         rval = 1;
++         goto CLEANUP;
+       }
+ 
+       *nnonz = lbeg[len-1] + lcnt[len-1];
+@@ -1603,7 +1604,8 @@
+       if( llb == NULL || lub == NULL ) /*lint !e774*/
+       {
+          SCIPerrorMessage("QSget_columns_list() failed to allocate memory.\n");
+-         return SCIP_LPERROR;
++         rval = 1;
++         goto CLEANUP;
+       }
+ 
+       for( i = 0; i < len; ++i )
+@@ -1615,11 +1617,11 @@
+ 
+  CLEANUP:
+    if( lval != NULL )
+-      QSfree(lval);
++      dbl_QSfree_numeric_array(lval);
+    if( lub != NULL ) /*lint !e831 !e774*/
+-      QSfree(lub);
++      dbl_QSfree_numeric_array(lub);
+    if( llb != NULL ) /*lint !e831 !e774*/
+-      QSfree(llb);
++      dbl_QSfree_numeric_array(llb);
+    if( lind != NULL )
+       QSfree(lind);
+    if( lbeg != NULL )
+@@ -1685,10 +1687,11 @@
+    {
+       assert( beg != NULL && ind != NULL && val != NULL ); /* for lint */
+ 
+-      if( lcnt == NULL || lbeg == NULL || lind == NULL || lval == NULL )
++      if( lcnt == NULL || lbeg == NULL || ((lbeg[len-1] + lcnt[len-1] > 0) && (lind == NULL || lval == NULL)) )
+       {
+          SCIPerrorMessage("QSget_ranged_rows_list() failed to allocate memory.\n");
+-         return SCIP_LPERROR;
++         rval = 1;
++         goto CLEANUP;
+       }
+ 
+       *nnonz = lbeg[len-1] + lcnt[len-1];
+@@ -1706,7 +1709,8 @@
+       if( lrhs == NULL || lrng == NULL || lsense == NULL ) /*lint !e774*/
+       {
+          SCIPerrorMessage("QSget_ranged_rows_list() failed to allocate memory.\n");
+-         return SCIP_LPERROR;
++         rval = 1;
++         goto CLEANUP;
+       }
+ 
+       assert( lhs != NULL ); /* for lint */
+@@ -1743,11 +1747,11 @@
+    if( lsense != NULL ) /*lint !e774*/
+       QSfree(lsense);
+    if( lrng != NULL ) /*lint !e774*/
+-      QSfree(lrng);
++      dbl_QSfree_numeric_array(lrng);
+    if( lrhs != NULL ) /*lint !e774*/
+-      QSfree(lrhs);
++      dbl_QSfree_numeric_array(lrhs);
+    if( lval != NULL )
+-      QSfree(lval);
++      dbl_QSfree_numeric_array(lval);
+    if( lind != NULL )
+       QSfree(lind);
+    if( lbeg != NULL )
+@@ -1921,9 +1925,9 @@
+    if( lsense != NULL )
+       QSfree(lsense);
+    if( lrng != NULL )
+-      QSfree(lrng);
++      dbl_QSfree_numeric_array(lrng);
+    if( lrhs != NULL )
+-      QSfree(lrhs);
++      dbl_QSfree_numeric_array(lrhs);
+ 
+    QS_RETURN(rval);
+ }
+@@ -3497,7 +3501,7 @@
+    assert(bas);
+ 
+    rval = QSwrite_basis(lpi->prob, bas, fname);
+-   QSfree(bas);
++   dbl_QSfree_basis(bas);
+    if( rval )
+    {
+       SCIPerrorMessage("Could not write basis to file <%s>.\n", fname);

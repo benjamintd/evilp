@@ -1,0 +1,30 @@
+--- a/src/lpi/lpi_qso.c
++++ b/src/lpi/lpi_qso.c
+@@ -1088,7 +1088,7 @@
+    SCIP_LPI*             lpi                 /**< LP interface structure */
+    )
+ {
+-   char savename[1024];
++   QSprob fresh;
+    char* name;
+    int objsen;
+ 
+@@ -1102,11 +1102,14 @@
+    QS_CONDRET( QSget_objsense(lpi->prob, &objsen) );
+ 
+    name = QSget_probname(lpi->prob);
+-   (void)strncpy(savename, name, 1023);
+-   name[1023] = '\0';
+-
++   if( name == NULL )
++      return SCIP_NOMEMORY;
++   fresh = QScreate_prob(name, objsen);
++   QSfree(name);
++   if( fresh == NULL )
++      return SCIP_NOMEMORY;
+    QSfree_prob(lpi->prob);
+-   lpi->prob = QScreate_prob(savename, objsen);
++   lpi->prob = fresh;
+ 
+    return SCIP_OKAY;
+ }

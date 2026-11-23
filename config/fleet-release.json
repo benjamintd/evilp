@@ -1,0 +1,12 @@
+{
+  "suite": "data/fleet/suite.tsv",
+  "suite_sha256": "29077736119c6db5be8df3bdf2a323c5905dedbc7c1c2c8c8f2c35897c0e9f56",
+  "witness_ledgers": {
+    "results/fleet-repair-60s-v1/runs/runs.jsonl": "74b0be01b97535af861161dea8f99e454ab84683e726ff0e4d7245114c74ef1a",
+    "results/checked-witness-fleet-v1/archive-witnesses-policy.jsonl": "356c87193c3df4b54fd6c61490df9c405109ed8c0bb46d92a9547304188e0165",
+    "results/checked-witness-fleet-v1/runs/runs.jsonl": "7277dd12952e5696fe407787d8bc695d9b84d8d55909893d3228b13deef0830a",
+    "results/checked-witness-fleet-v1/remaining/runs.jsonl": "2f694955cae8642fcd59e71e76a05dc315918b27821e0d818790617afa6e0787"
+  },
+  "legacy_panel": "results/scip-v20-nearmiss20-60s-v1/results.jsonl",
+  "legacy_panel_sha256": "34467efcac7167a63194a2e8d4a075912e2f24107cb2c84e1bf9803b4ffeb40f"
+}

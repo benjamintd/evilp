@@ -1,0 +1,46 @@
+NAME PAR
+ROWS
+ N O
+ E A
+ E B
+COLUMNS
+ x O 0 A 1
+ x B 1
+ y A 1 B 1.000000000014551915228366851806640625
+ z0 O 0
+ z1 O 0
+ z2 O 0
+ z3 O 0
+ z4 O 0
+ z5 O 0
+ z6 O 0
+ z7 O 0
+ z8 O 0
+ z9 O 0
+ z10 O 0
+ z11 O 0
+ z12 O 0
+ z13 O 0
+ z14 O 0
+ z15 O 0
+ z16 O 0
+ z17 O 0
+ z18 O 0
+ z19 O 0
+ z20 O 0
+ z21 O 0
+ z22 O 0
+ z23 O 0
+ z24 O 0
+ z25 O 0
+ z26 O 0
+ z27 O 0
+ z28 O 0
+ z29 O 0
+RHS
+ b A 0 B .0000019073486328125
+BOUNDS
+ FR b x
+ FR b y
+ BV b z0
+ENDATA

@@ -100,6 +100,70 @@ class Harness(unittest.TestCase):
         cfg=root/'solvers.tsv';cfg.write_text(cfg.read_text().replace('\nhighs\t','\nlab\t'))
         suite=root/'suite.tsv';suite.write_text(suite.read_text().replace('\t8.03\n','\t8.53\n'))
         return args
+    def test_lab_bound_is_a_top_level_numeric_claim(self):
+        for fields, status, bound in [
+                ('"best_bound":-1.2345678901234567e+05', 'time_limit', '-1.2345678901234567e+05'),
+                ('"nested":{"best_bound":12}', 'time_limit', None),
+                ('"best_bound":null', 'time_limit', None),
+                ('"best_bound":11,"best_bound":12', 'unknown', None),
+                ('"best_bound":1e999', 'unknown', None)]:
+            with self.subTest(fields=fields), tempfile.TemporaryDirectory() as tmp:
+                root = pathlib.Path(tmp)
+                line = '{"status":"time_limit",' + fields + '}'
+                cmd = self.lab_case(root, 'print(' + repr(line) + ')\n') + ['--mip']
+                subprocess.run(cmd, capture_output=True, check=True)
+                row = json.loads((root/'result/runs.jsonl').read_text())
+                self.assertEqual((row['reported_solver_status'], row['reported_dual_bound']), (status, bound))
+
+    def test_frozen_lab_settings_are_consumed_and_hashed(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = pathlib.Path(td)
+            body = """import json, os, pathlib
+settings = pathlib.Path(os.environ['LAB_SCIP_SET'])
+assert settings.name == 'lab-scip.set' and settings.read_text() == 'numerics/epsilon = 1e-15'
+print(json.dumps({'status':'time_limit'}))
+"""
+            args = self.lab_case(root, body) + ['--mip']
+            original = root / 'override.set'
+            original.write_text('numerics/epsilon = 1e-15')
+            hashes = []
+            for i, fraction in enumerate(('0.1', '0.5')):
+                out = root / str(i)
+                args[args.index('--out') + 1] = str(out)
+                env = dict(os.environ, LAB_SCIP_SET=str(original), LAB_SUBSCIP_FRAC=fraction)
+                subprocess.run(args, env=env, capture_output=True, check=True)
+                row = json.loads((out / 'runs.jsonl').read_text())
+                self.assertEqual(row['claimed_status'], 'time_limit')
+                config = out / 'lab-config.json'
+                self.assertEqual(row['configuration_sha256'], sha(config))
+                self.assertEqual(json.loads(config.read_text())['scip_set_sha256'], sha(original))
+                self.assertEqual((out / 'lab-scip.set').read_bytes(), original.read_bytes())
+                hashes.append(sha(config))
+            self.assertNotEqual(*hashes)
+
+    def test_paired_runner_emits_gate_inputs(self):
+        sys.path.insert(0, str(FIX.parents[1] / 'scripts'))
+        from benchmark_gate import timing_contract
+        with tempfile.TemporaryDirectory() as td:
+            root = pathlib.Path(td)
+            args = self.lab_case(root, 'import json; print(json.dumps(dict(status="time_limit")))') + ['--mip', '--paired', '--quiescent']
+            config = root / 'solvers.tsv'
+            with config.open('a') as stream:
+                fake = root / 'fake highs'
+                stream.write(f'highs\t{fake}\t{sha(fake)}\ttest\n')
+            subprocess.run(args, capture_output=True, check=True)
+            out = root / 'result'
+            campaign = json.loads((out / 'campaign.json').read_text())
+            rows = {row['solver']: {row['instance']:row} for row in
+                    map(json.loads, (out / 'runs.jsonl').read_text().splitlines())}
+            self.assertEqual(timing_contract(campaign, rows['lab'], rows['highs'], 'lab', 'highs'), [])
+            self.assertEqual(campaign['suite_sha256'], sha(root / 'suite.tsv'))
+            for solver in rows:
+                self.assertEqual(sha(out / (solver + '-config.json')), campaign['engines'][solver]['configuration_sha256'])
+            settings = (out / 'tiny/highs/seed-1/settings.txt').read_text()
+            self.assertIn('mip_max_nodes = 10000000', settings)
+            self.assertIn('simplex_iteration_limit = 100000', settings)
+
     def test_lab_relaxation_solution_and_dual_validation(self):
         with tempfile.TemporaryDirectory(prefix='milp lab LP ') as td:
             root=pathlib.Path(td)

@@ -679,23 +679,24 @@ done:
     return result;
 }
 
-int lab_integer_mip(const LabModel *m, const double *lower, const double *upper, double deadline,
+LabSearchResult lab_integer_mip(const LabModel *m, const double *lower, const double *upper, double deadline,
                     size_t nodes, size_t iterations, double *point, LabIntegerMipStats *stats) {
+    LabSearchResult r = {.route = "contracted_scip"};
     *stats = (LabIntegerMipStats){0};
     if (!m->integer || !nodes || !iterations || nodes > LLONG_MAX || iterations > LLONG_MAX ||
         !m->rows || m->cols < 32 || m->rows > ROW_CAP || m->cols > COL_CAP || m->nnz > ENTRY_CAP ||
         lab_now() >= deadline)
-        return 0;
+        return r;
     int general = 0;
     for (size_t j = 0; j < m->cols; ++j) {
         if (!m->integer[j])
-            return 0;
+            return r;
         if (!isfinite(m->col_lower[j]) || !isfinite(m->col_upper[j]) || m->col_lower[j] < 0 ||
             m->col_upper[j] > 1)
             general = 1;
     }
     if (!general)
-        return 0;
+        return r;
     Projection p = {.model = m, .presolve_lower = lower, .presolve_upper = upper,
                     .deadline = deadline};
     p.row = lab_alloc(m->rows, sizeof *p.row);
@@ -712,5 +713,11 @@ int lab_integer_mip(const LabModel *m, const double *lower, const double *upper,
     free(p.group);
     free(p.col);
     free(p.row);
-    return result;
+    if (result > 0)
+        r.point = point;
+    if (result == 2) {
+        r.status = LAB_MIP_OPTIMAL;
+        r.closure = LAB_CLOSE_INTEGER_LATTICE;
+    }
+    return r;
 }

@@ -173,7 +173,42 @@ static void constant_cut_and_binary_model(void) {
     lab_model_free(&owned);
     lab_model_free(&source);
 }
+static void sparse_batch(void) {
+    LabModel source = {0}, result = {0};
+    read_model(&source);
+    LabAugmentLimits cap = limits();
+    size_t cols[] = {0, 2};
+    double first[] = {0.125, -0.5}, last[] = {3, 1};
+    LabSparseRow rows[] = {{"A", 2, cols, first, 0, 1}, {"empty", 0, NULL, NULL, 0, 0},
+                           {"B", 2, cols, last, -INFINITY, 4}};
+    require(lab_model_append_sparse_rows(&source, 3, rows, &cap, &result) == LAB_AUGMENT_OK,
+            "append overlapping sparse rows with an intervening empty row");
+    require(result.nnz == source.nnz + 4 && result.rows == source.rows + 3,
+            "count only supplied nonzeros");
+    for (size_t j = 0; j < source.cols; ++j) {
+        size_t old_count = source.col_start[j+1] - source.col_start[j];
+        size_t pos = result.col_start[j] + old_count;
+        if (j == 1) {
+            require(pos == result.col_start[j+1], "untouched column length");
+            continue;
+        }
+        require(pos + 2 == result.col_start[j+1] && result.row_index[pos] == source.rows &&
+                result.row_index[pos+1] == source.rows + 2, "stable row placement in CSC");
+        dyadic_equal(result.exact->value[pos], first[j/2], "first row coefficient exact");
+        dyadic_equal(result.exact->value[pos+1], last[j/2], "last row coefficient exact");
+    }
+    size_t *saved = result.col_start;
+    for (size_t i = 0; i < 3; ++i) {
+        const size_t bad[][2] = {{0, 0}, {2, 0}, {0, 3}};
+        rows[0].column = bad[i];
+        require(lab_model_append_sparse_rows(&source, 3, rows, &cap, &result) == LAB_AUGMENT_INVALID &&
+                result.col_start == saved, "duplicate, unsorted and invalid columns fail atomically");
+    }
+    lab_model_free(&result);
+    lab_model_free(&source);
+}
 int main(void) {
+    sparse_batch();
     source_preservation_and_lifetime();
     failure_atomicity();
     constant_cut_and_binary_model();

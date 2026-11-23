@@ -17,16 +17,18 @@ def fixture():
     budget = {'time_limit_s': 10, 'watchdog_grace_s': 15, 'seed': 1, 'requested_threads': 1,
               'memory_limit_bytes': None, 'node_limit': None, 'iteration_limit': None}
     campaign = {'campaign_id': 'paired-new-campaign', 'hardware_id': 'same-host-fingerprint',
+                'runner_sha256': '1'*64, 'checker_sha256': '2'*64,
                 'fair_timing_campaign': True, 'serial_solver_processes': True, 'quiescent': True,
                 'coverage_exploration': False, 'measurement': MEASUREMENT, 'budget': budget,
                 'engines': {name: {'solver_sha256': char*64, 'configuration_sha256': config*64}
                             for name, char, config in [('lab', 'a', 'b'), ('highs', 'c', 'd')]}}
     def runs(solver):
         return [{'instance': model['id'], 'solver': solver, 'model_sha256': model['sha256'],
-                 'mode': 'mip', 'relaxation': False, 'claimed_status': 'optimal', 'exit_code': 0,
+                 'mode': 'mip', 'relaxation': False, 'claimed_status': 'optimal', 'exit_code': 0, 'sleep_affected': False,
+                 'runner_sha256': '1'*64, 'checker_sha256': '2'*64,
                  'signal': 0, 'watchdog_timeout': False, 'status_conflict': False,
                  'reference_status': '=opt=', 'reference_objective': '1', 'checker_exit_code': 0,
-                 'checker': {'status': 'valid', 'checked_feasible': True, 'objective': '1',
+                 'checker': {'status': 'valid', 'checked_feasible': True, 'relaxation': False, 'objective': '1',
                              'linear_tolerance': '1e-4', 'integer_tolerance': '1e-5',
                              'objective_tolerance': '1e-4', 'certifies_optimality': False,
                              'row_violations': 0, 'bound_violations': 0, 'integrality_violations': 0,
@@ -46,6 +48,44 @@ class Gate(unittest.TestCase):
     def gate(self):
         return evaluate(self.manifest, self.lab, self.highs, self.campaign)
 
+    def test_checked_incumbent_overrules_optimal_and_speed_claims(self):
+        for sense, value in [('min', '0.9998'), ('max', '1.0002')]:
+            witness = copy.deepcopy(self.highs[0])
+            witness.update(claimed_status='time_limit', exit_code=4, seed=42, instance='renamed')
+            witness['checker'].update(objective=value, objective_sense=sense)
+            self.lab[0]['checker']['objective_sense'] = sense
+            self.lab[0]['reported_dual_bound'] = '1'
+            result = evaluate(self.manifest, self.lab, self.highs, self.campaign, witness_runs=[witness])
+            facts = result['candidate_results']['m000']
+            self.assertCountEqual(facts['witness_conflicts'], ['reported_bound_excludes_checked_witness',
+                                                              'optimal_objective_worse_than_checked_witness'])
+            self.assertEqual(facts['contradicting_witness']['seed'], 42)
+            self.assertFalse(facts['independently_certified_optimality'])
+            self.assertFalse(result['completion_gate_passed'])
+            self.assertEqual(result['strict_candidate_wins'], 239)
+
+    def test_witness_eligibility_and_limits(self):
+        from run_evaluation import assess_evidence, witness_index
+        row = self.lab[0]
+        row['checker']['objective_sense'] = 'min'
+        witness = copy.deepcopy(row)
+        witness['checker']['objective'] = '0'
+        for mutation in [dict(model_sha256='f'*64), dict(mode='relax'), dict(checker_exit_code=1),
+                         dict(checker={**witness['checker'], 'relaxation': True}),
+                         dict(checker={**witness['checker'], 'linear_tolerance': '0.1'}),
+                         dict(checker={**witness['checker'], 'max_row_violation': '2'})]:
+            facts = assess_evidence(row, row, relaxation=False, witnesses=witness_index([{**witness, **mutation}]))
+            self.assertFalse(facts['witness_conflicts'], mutation)
+        row.update(claimed_status='time_limit', reported_dual_bound='0.0001')
+        index = witness_index([witness])
+        self.assertFalse(assess_evidence(row, row, relaxation=False, witnesses=index)['witness_conflicts'])
+        row['reported_dual_bound'] = '0.00010000000000000001'
+        self.assertEqual(assess_evidence(row, row, relaxation=False, witnesses=index)['witness_conflicts'],
+                         ['reported_bound_excludes_checked_witness'])
+        row.update(claimed_status='infeasible', checker={}, reported_dual_bound=None)
+        self.assertEqual(assess_evidence(row, row, relaxation=False, witnesses=index)['witness_conflicts'],
+                         ['infeasible_despite_checked_witness'])
+
     def test_all_240_complete_and_120_strict_wins_pass(self):
         for record in self.lab[120:]:
             record['wall_s'] = 3
@@ -54,6 +94,34 @@ class Gate(unittest.TestCase):
         self.assertEqual(result['strict_candidate_wins'], 120)
         self.assertEqual(result['speed_denominator'], 240)
         self.assertFalse(result['candidate_results']['m000']['independently_certified_optimality'])
+
+    def test_mixed_candidate_build_or_configuration_blocks_standalone_completion(self):
+        for key in ('solver_sha256', 'configuration_sha256', 'runner_sha256', 'checker_sha256'):
+            with self.subTest(key=key):
+                manifest, candidate, _, _ = fixture()
+                candidate[0][key] = 'f' * 64
+                self.assertFalse(evaluate(manifest, candidate, candidate_engine=self.campaign['engines']['lab'])['completion_gate_passed'])
+                del candidate[0][key]
+                self.assertFalse(evaluate(manifest, candidate, candidate_engine=self.campaign['engines']['lab'])['completion_gate_passed'])
+
+    def test_standalone_completion_requires_declared_build(self):
+        self.assertFalse(evaluate(self.manifest, self.lab)['completion_gate_passed'])
+        result = evaluate(self.manifest, self.lab, candidate_engine=self.campaign['engines']['lab'])
+        self.assertTrue(result['completion_gate_passed'])
+        self.assertFalse(result['speed_gate_passed'])
+
+    def test_panel_membership_and_accounting(self):
+        panel = self.manifest['instances'][:3]
+        self.lab[0]['checker']['objective'] = '0'
+        self.highs[1]['claimed_status'] = 'time_limit'
+        result = evaluate(self.manifest, self.lab[:3], self.highs[:3], self.campaign, panel=panel)
+        self.assertTrue(result['panel_records_complete'])
+        self.assertEqual(result['completed_correctly'], 2)
+        self.assertEqual(result['strict_candidate_wins'], 1)
+        self.assertFalse(result['completion_gate_passed'])
+        self.assertFalse(result['speed_gate_passed'])
+        with self.assertRaises(ValueError):
+            evaluate(self.manifest, self.lab[:3], panel=[panel[0], panel[0]])
 
     def test_119_wins_and_ties_do_not_pass(self):
         for record in self.lab[119:]:
@@ -87,6 +155,12 @@ class Gate(unittest.TestCase):
         self.lab[-1] = copy.deepcopy(self.lab[0])
         self.assertTrue(any('duplicate' in item for item in self.gate()['candidate_attempt_errors']))
 
+    def test_mixed_candidate_binaries_cannot_complete_the_inventory(self):
+        self.lab[17]['solver_sha256'] = 'e' * 64
+        result = evaluate(self.manifest, self.lab)
+        self.assertFalse(result['completion_gate_passed'])
+        self.assertTrue(any('different solver binaries' in e for e in result['candidate_attempt_errors']))
+
     def test_unresolved_status_never_passes_even_with_reference_incumbent(self):
         for status in ['time_limit', 'node_limit', 'iteration_limit', 'unsupported', 'numerical_failure']:
             with self.subTest(status=status):
@@ -107,6 +181,20 @@ class Gate(unittest.TestCase):
                 manifest, lab, highs, campaign = fixture()
                 lab[0]['checker'][key] = value
                 self.assertFalse(evaluate(manifest, lab, highs, campaign)['completion_gate_passed'])
+
+    def test_reference_matching_point_requires_explicit_milp_checker_scope(self):
+        checker = self.lab[0]['checker']
+        for scope in (True, None, 0):
+            if scope is None:
+                del checker['relaxation']
+            else:
+                checker['relaxation'] = scope
+            with self.subTest(scope=scope):
+                result = self.gate()
+                case = result['candidate_results']['m000']
+                self.assertIn('original_MILP_checker_scope_required', case['reasons'])
+                self.assertFalse(case['checked_feasible'])
+                self.assertFalse(result['completion_gate_passed'])
 
     def test_unresolved_best_reference_is_not_upgraded_to_optimum(self):
         self.manifest['instances'][0]['reference_status'] = '=best='
@@ -157,7 +245,7 @@ class Gate(unittest.TestCase):
         self.manifest['instances'][0].update(reference_status='=inf=', reference_objective='-')
         for records in [self.lab, self.highs]:
             records[0].update(reference_status='=inf=', reference_objective='-', claimed_status='infeasible',
-                              checker={'status': 'valid', 'checked_feasible': False, 'certificate_status': 'valid',
+                              checker={'status': 'valid', 'checked_feasible': False, 'relaxation': False, 'certificate_status': 'valid',
                                        'certifies_infeasibility': True})
         self.assertTrue(self.gate()['passed'])
 

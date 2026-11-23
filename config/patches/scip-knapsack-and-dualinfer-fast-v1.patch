@@ -1,0 +1,495 @@
+--- a/src/scip/cons_knapsack.c
++++ b/src/scip/cons_knapsack.c
+@@ -318,23 +318,151 @@
+  * Local methods
+  */
+ 
+-/** comparison method for two sorting key pairs */
++/** inline lexicographic 3-way quicksort for (key1, key2) paired with an int payload;
++ *  matches compSortkeypairs exactly with zero pointer chasing, zero indirect calls,
++ *  and O(n) partitioning on equal-key blocks (e.g. zero LP solution runs). */
+ static
+-SCIP_DECL_SORTPTRCOMP(compSortkeypairs)
++int cmpKeyPair(
++   SCIP_Real             a1,
++   SCIP_Real             a2,
++   SCIP_Real             b1,
++   SCIP_Real             b2,
++   SCIP_Bool             down
++   )
+ {
+-   SORTKEYPAIR* sortkeypair1 = (SORTKEYPAIR*)elem1;
+-   SORTKEYPAIR* sortkeypair2 = (SORTKEYPAIR*)elem2;
+-
+-   if( sortkeypair1->key1 < sortkeypair2->key1 )
+-      return -1;
+-   else if( sortkeypair1->key1 > sortkeypair2->key1 )
+-      return +1;
+-   else if( sortkeypair1->key2 < sortkeypair2->key2 )
+-      return -1;
+-   else if( sortkeypair1->key2 > sortkeypair2->key2 )
+-      return +1;
++   int c;
++   if( a1 < b1 )
++      c = -1;
++   else if( a1 > b1 )
++      c = 1;
++   else if( a2 < b2 )
++      c = -1;
++   else if( a2 > b2 )
++      c = 1;
+    else
+-      return 0;
++      c = 0;
++   return down ? -c : c;
++}
++
++static
++void sortKeyPairsIntRec(
++   SCIP_Real*            key1,
++   SCIP_Real*            key2,
++   int*                  inds,
++   int                   lo,
++   int                   hi,
++   SCIP_Bool             down
++   )
++{
++   while( hi - lo > 24 )
++   {
++      int mid = lo + ((hi - lo) >> 1);
++      SCIP_Real p1;
++      SCIP_Real p2;
++      int lt;
++      int gt;
++      int i;
++
++      /* median-of-three pivot selection */
++      if( cmpKeyPair(key1[mid], key2[mid], key1[lo], key2[lo], down) < 0 )
++      {
++         SCIP_Real t1 = key1[lo]; key1[lo] = key1[mid]; key1[mid] = t1;
++         SCIP_Real t2 = key2[lo]; key2[lo] = key2[mid]; key2[mid] = t2;
++         int ti = inds[lo]; inds[lo] = inds[mid]; inds[mid] = ti;
++      }
++      if( cmpKeyPair(key1[hi], key2[hi], key1[lo], key2[lo], down) < 0 )
++      {
++         SCIP_Real t1 = key1[lo]; key1[lo] = key1[hi]; key1[hi] = t1;
++         SCIP_Real t2 = key2[lo]; key2[lo] = key2[hi]; key2[hi] = t2;
++         int ti = inds[lo]; inds[lo] = inds[hi]; inds[hi] = ti;
++      }
++      if( cmpKeyPair(key1[hi], key2[hi], key1[mid], key2[mid], down) < 0 )
++      {
++         SCIP_Real t1 = key1[mid]; key1[mid] = key1[hi]; key1[hi] = t1;
++         SCIP_Real t2 = key2[mid]; key2[mid] = key2[hi]; key2[hi] = t2;
++         int ti = inds[mid]; inds[mid] = inds[hi]; inds[hi] = ti;
++      }
++
++      p1 = key1[mid];
++      p2 = key2[mid];
++      lt = lo;
++      i = lo;
++      gt = hi;
++
++      /* 3-way Dutch National Flag partition: [lo..lt-1] < pivot == [lt..gt] < [gt+1..hi] */
++      while( i <= gt )
++      {
++         int c = cmpKeyPair(key1[i], key2[i], p1, p2, down);
++         if( c < 0 )
++         {
++            SCIP_Real t1 = key1[lt]; key1[lt] = key1[i]; key1[i] = t1;
++            SCIP_Real t2 = key2[lt]; key2[lt] = key2[i]; key2[i] = t2;
++            int ti = inds[lt]; inds[lt] = inds[i]; inds[i] = ti;
++            ++lt;
++            ++i;
++         }
++         else if( c > 0 )
++         {
++            SCIP_Real t1 = key1[i]; key1[i] = key1[gt]; key1[gt] = t1;
++            SCIP_Real t2 = key2[i]; key2[i] = key2[gt]; key2[gt] = t2;
++            int ti = inds[i]; inds[i] = inds[gt]; inds[gt] = ti;
++            --gt;
++         }
++         else
++         {
++            ++i;
++         }
++      }
++
++      /* recurse on smaller side, iterate on larger side */
++      if( lt - lo < hi - gt )
++      {
++         if( lo < lt - 1 )
++            sortKeyPairsIntRec(key1, key2, inds, lo, lt - 1, down);
++         lo = gt + 1;
++      }
++      else
++      {
++         if( gt + 1 < hi )
++            sortKeyPairsIntRec(key1, key2, inds, gt + 1, hi, down);
++         hi = lt - 1;
++      }
++   }
++
++   /* insertion sort for small ranges */
++   {
++      int i;
++      for( i = lo + 1; i <= hi; ++i )
++      {
++         SCIP_Real k1 = key1[i];
++         SCIP_Real k2 = key2[i];
++         int idx = inds[i];
++         int j = i - 1;
++         while( j >= lo && cmpKeyPair(k1, k2, key1[j], key2[j], down) < 0 )
++         {
++            key1[j + 1] = key1[j];
++            key2[j + 1] = key2[j];
++            inds[j + 1] = inds[j];
++            --j;
++         }
++         key1[j + 1] = k1;
++         key2[j + 1] = k2;
++         inds[j + 1] = idx;
++      }
++   }
++}
++
++static
++void sortKeyPairsInt(
++   SCIP_Real*            key1,
++   SCIP_Real*            key2,
++   int*                  inds,
++   int                   len,
++   SCIP_Bool             down
++   )
++{
++   if( len > 1 )
++      sortKeyPairsIntRec(key1, key2, inds, 0, len - 1, down);
+ }
+ 
+ /** creates event data */
+@@ -2852,8 +2980,8 @@
+    int                   nvarsR              /**< number of variables in R */
+    )
+ {
+-   SORTKEYPAIR** sortkeypairsF;
+-   SORTKEYPAIR* sortkeypairsFstore;
++   SCIP_Real* sortkeysF1;
++   SCIP_Real* sortkeysF2;
+    SCIP_Real* sortkeysC2;
+    SCIP_Real* sortkeysR;
+    int j;
+@@ -2869,46 +2997,33 @@
+    assert(nvarsR >= 0);
+ 
+    /* allocates temporary memory */
+-   SCIP_CALL( SCIPallocBufferArray(scip, &sortkeypairsF, nvarsF) );
+-   SCIP_CALL( SCIPallocBufferArray(scip, &sortkeypairsFstore, nvarsF) );
++   SCIP_CALL( SCIPallocBufferArray(scip, &sortkeysF1, nvarsF) );
++   SCIP_CALL( SCIPallocBufferArray(scip, &sortkeysF2, nvarsF) );
+    SCIP_CALL( SCIPallocBufferArray(scip, &sortkeysC2, nvarsC2) );
+    SCIP_CALL( SCIPallocBufferArray(scip, &sortkeysR, nvarsR) );
+ 
+-   /* gets sorting key for variables in F corresponding to the following lifting sequence
+-    *  sequence 1: non-increasing absolute difference between x*_j and the value the variable is fixed to, i.e.
+-    *              x*_1 >= x*_2 >= ... >= x*_|F|
+-    * in case of equality uses
+-    *  sequence 4: non-increasing a_j, i.e. a_1 >= a_2 >= ... >= a_|C_2|
+-    */
+    for( j = 0; j < nvarsF; j++ )
+    {
+-      sortkeypairsF[j] = &(sortkeypairsFstore[j]);
+-      sortkeypairsF[j]->key1 = solvals[varsF[j]];
+-      sortkeypairsF[j]->key2 = (SCIP_Real) weights[varsF[j]];
+-   }
+-
+-   /* gets sorting key for variables in C_2 corresponding to the following lifting sequence
+-    *  sequence 4: non-increasing a_j, i.e. a_1 >= a_2 >= ... >= a_|C_2|
+-    */
++      sortkeysF1[j] = solvals[varsF[j]];
++      sortkeysF2[j] = (SCIP_Real) weights[varsF[j]];
++   }
++
+    for( j = 0; j < nvarsC2; j++ )
+       sortkeysC2[j] = (SCIP_Real) weights[varsC2[j]];
+ 
+-   /* gets sorting key for variables in R corresponding to the following lifting sequence
+-    *  sequence 4: non-increasing a_j, i.e. a_1 >= a_2 >= ... >= a_|R|
+-    */
+    for( j = 0; j < nvarsR; j++ )
+       sortkeysR[j] = (SCIP_Real) weights[varsR[j]];
+ 
+    /* sorts F, C2 and R */
+-   if( nvarsF > 0 )
+-   {
+-      SCIPsortDownPtrInt((void**)sortkeypairsF, varsF, compSortkeypairs, nvarsF);
+-   }
+-   if( nvarsC2 > 0 )
++   if( nvarsF > 1 )
++   {
++      sortKeyPairsInt(sortkeysF1, sortkeysF2, varsF, nvarsF, TRUE);
++   }
++   if( nvarsC2 > 1 )
+    {
+       SCIPsortDownRealInt(sortkeysC2, varsC2, nvarsC2);
+    }
+-   if( nvarsR > 0)
++   if( nvarsR > 1 )
+    {
+       SCIPsortDownRealInt(sortkeysR, varsR, nvarsR);
+    }
+@@ -2916,8 +3031,8 @@
+    /* frees temporary memory */
+    SCIPfreeBufferArray(scip, &sortkeysR);
+    SCIPfreeBufferArray(scip, &sortkeysC2);
+-   SCIPfreeBufferArray(scip, &sortkeypairsFstore);
+-   SCIPfreeBufferArray(scip, &sortkeypairsF);
++   SCIPfreeBufferArray(scip, &sortkeysF2);
++   SCIPfreeBufferArray(scip, &sortkeysF1);
+ 
+    return SCIP_OKAY;
+ }
+@@ -3411,9 +3526,21 @@
+ #endif
+ 
+    /* sort GFCI GUBs according to computed sorting keys */
+-   if( (*ngubconsGFC1) > 0 )
+-   {
+-      SCIPsortDownPtrInt((void**)sortkeypairsGFC1, gubconsGFC1, compSortkeypairs, (*ngubconsGFC1));
++   if( (*ngubconsGFC1) > 1 )
++   {
++      SCIP_Real* gfc1k1;
++      SCIP_Real* gfc1k2;
++      int k;
++      SCIP_CALL( SCIPallocBufferArray(scip, &gfc1k1, *ngubconsGFC1) );
++      SCIP_CALL( SCIPallocBufferArray(scip, &gfc1k2, *ngubconsGFC1) );
++      for( k = 0; k < *ngubconsGFC1; ++k )
++      {
++         gfc1k1[k] = sortkeypairsGFC1[k]->key1;
++         gfc1k2[k] = sortkeypairsGFC1[k]->key2;
++      }
++      sortKeyPairsInt(gfc1k1, gfc1k2, gubconsGFC1, *ngubconsGFC1, TRUE);
++      SCIPfreeBufferArray(scip, &gfc1k2);
++      SCIPfreeBufferArray(scip, &gfc1k1);
+    }
+ 
+    /* free temporary memory */
+@@ -5341,41 +5468,34 @@
+    assert(*coverweight > 0);
+    assert(*coverweight > capacity);
+ 
+-   /* allocates temporary memory; we need two arrays for the keypairs in order to be able to free them in the correct
+-    * order */
+-   nsortkeypairs = *ncovervars;
+-   SCIP_CALL( SCIPallocBufferArray(scip, &sortkeypairs, nsortkeypairs) );
+-   SCIP_CALL( SCIPallocBufferArray(scip, &sortkeypairssorted, nsortkeypairs) );
+-
+-   /* sorts C in the reverse order in which the variables were chosen to be in the cover, i.e.
+-    *   such that (1 - x*_1)/a_1 >= ... >= (1 - x*_|C|)/a_|C|,  if          trans separation problem was used to find C
+-    *   such that (1 - x*_1)     >= ... >= (1 - x*_|C|),        if modified trans separation problem was used to find C
+-    * note that all variables with x*_j = 1 are in the end of the sorted C, so they will be removed last from C
+-    */
+-   assert(*ncovervars == nsortkeypairs);
+-   if( modtransused )
+-   {
+-      for( j = 0; j < *ncovervars; j++ )
+-      {
+-         SCIP_CALL( SCIPallocBuffer(scip, &(sortkeypairs[j])) ); /*lint !e866 */
+-         sortkeypairssorted[j] = sortkeypairs[j];
+-
+-         sortkeypairs[j]->key1 = solvals[covervars[j]];
+-         sortkeypairs[j]->key2 = (SCIP_Real) weights[covervars[j]];
+-      }
+-   }
+-   else
+-   {
+-      for( j = 0; j < *ncovervars; j++ )
+-      {
+-         SCIP_CALL( SCIPallocBuffer(scip, &(sortkeypairs[j])) ); /*lint !e866 */
+-         sortkeypairssorted[j] = sortkeypairs[j];
+-
+-         sortkeypairs[j]->key1 = (solvals[covervars[j]] - 1.0) / ((SCIP_Real) weights[covervars[j]]);
+-         sortkeypairs[j]->key2 = (SCIP_Real) (-weights[covervars[j]]);
+-      }
+-   }
+-   SCIPsortPtrInt((void**)sortkeypairssorted, covervars, compSortkeypairs, *ncovervars);
++   {
++      SCIP_Real* covk1;
++      SCIP_Real* covk2;
++      nsortkeypairs = *ncovervars;
++      sortkeypairs = NULL;
++      sortkeypairssorted = NULL;
++      SCIP_CALL( SCIPallocBufferArray(scip, &covk1, nsortkeypairs) );
++      SCIP_CALL( SCIPallocBufferArray(scip, &covk2, nsortkeypairs) );
++      if( modtransused )
++      {
++         for( j = 0; j < nsortkeypairs; j++ )
++         {
++            covk1[j] = solvals[covervars[j]];
++            covk2[j] = (SCIP_Real) weights[covervars[j]];
++         }
++      }
++      else
++      {
++         for( j = 0; j < nsortkeypairs; j++ )
++         {
++            covk1[j] = (solvals[covervars[j]] - 1.0) / ((SCIP_Real) weights[covervars[j]]);
++            covk2[j] = (SCIP_Real) (-weights[covervars[j]]);
++         }
++      }
++      sortKeyPairsInt(covk1, covk2, covervars, nsortkeypairs, FALSE);
++      SCIPfreeBufferArray(scip, &covk2);
++      SCIPfreeBufferArray(scip, &covk1);
++   }
+ 
+    /* gets j' with a_j' = min{ a_j : j in C } */
+    minweightidx = 0;
+@@ -5441,11 +5561,9 @@
+    assert((*coverweight) > capacity);
+    assert((*coverweight) - minweight <= capacity);
+ 
+-   /* frees temporary memory */
+-   for( j = nsortkeypairs-1; j >= 0; j-- )
+-      SCIPfreeBuffer(scip, &(sortkeypairs[j])); /*lint !e866 */
+-   SCIPfreeBufferArray(scip, &sortkeypairssorted);
+-   SCIPfreeBufferArray(scip, &sortkeypairs);
++   (void) nsortkeypairs;
++   (void) sortkeypairssorted;
++   (void) sortkeypairs;
+ 
+    return SCIP_OKAY;
+ }
+@@ -7127,9 +7245,7 @@
+    int* cliquepartition;
+    int ncliques;
+ 
+-   SCIP_VAR*** varpointers;
+-   SCIP_Longint** weightpointers;
+-   int* cliquecount;
++   int* cliquewritepos;
+ 
+    int nextpos;
+    int c;
+@@ -7169,54 +7285,38 @@
+    assert(cliquepartition != NULL);
+    assert(ncliques > 0);
+ 
+-   /* we first count all clique items and alloc temporary memory for a bucket sort */
+-   SCIP_CALL( SCIPallocBufferArray(scip, &cliquecount, ncliques) );
+-   BMSclearMemoryArray(cliquecount, ncliques);
+-
+-   /* first we count for each clique the number of elements */
+-   for( v = norigvars - 1; v >= 0; --v )
++   /* single-array in-place bucket sort (reuses cliquewritepos for counts -> offsets) */
++   SCIP_CALL( SCIPallocBufferArray(scip, &cliquewritepos, ncliques) );
++   BMSclearMemoryArray(cliquewritepos, ncliques);
++
++   for( v = 0; v < norigvars; ++v )
+    {
+       assert(0 <= cliquepartition[v] && cliquepartition[v] < ncliques);
+-      ++(cliquecount[cliquepartition[v]]);
+-   }
+-
+-   /*@todo: maybe it is better to put largest cliques up front */
++      ++cliquewritepos[cliquepartition[v]];
++   }
+ 
+ #ifndef NDEBUG
+    BMSclearMemoryArray(vars, norigvars);
+    BMSclearMemoryArray(weights, norigvars);
+ #endif
+-   SCIP_CALL( SCIPallocBufferArray(scip, &varpointers, ncliques) );
+-   SCIP_CALL( SCIPallocBufferArray(scip, &weightpointers, ncliques) );
+ 
+    nextpos = 0;
+-   /* now we initialize all start pointers for each clique, so they will be ordered */
+    for( c = 0; c < ncliques; ++c )
+    {
+-      /* to reach the goal that all variables of each clique will be standing next to each other we will initialize the
+-       * starting pointers for each clique by adding the number of each clique to the last clique starting pointer
+-       * e.g. clique1 has 4 elements and clique2 has 3 elements the the starting pointer for clique1 will be the pointer
+-       *      to vars[0], the starting pointer to clique2 will be the pointer to vars[4] and to clique3 it will be
+-       *      vars[7]
+-       *
+-       */
+-      varpointers[c] = (SCIP_VAR**) (vars + nextpos);
++      int cnt = cliquewritepos[c];
++      assert(cnt > 0);
+       cliquestartposs[c] = nextpos;
+-      weightpointers[c] = (SCIP_Longint*) (weights + nextpos);
+-      assert(cliquecount[c] > 0);
+-      nextpos += cliquecount[c];
+-      assert(nextpos > 0);
++      cliquewritepos[c] = nextpos;
++      nextpos += cnt;
+    }
+    assert(nextpos == norigvars);
+-   cliquestartposs[c] = nextpos;
+-
+-   /* now we copy all variable and weights to the right order */
++   cliquestartposs[ncliques] = nextpos;
++
+    for( v = 0; v < norigvars; ++v )
+    {
+-      *(varpointers[cliquepartition[v]]) = origvars[v];  /*lint !e613*/
+-      ++(varpointers[cliquepartition[v]]);
+-      *(weightpointers[cliquepartition[v]]) = origweights[v];  /*lint !e613*/
+-      ++(weightpointers[cliquepartition[v]]);
++      int pos = cliquewritepos[cliquepartition[v]]++;
++      vars[pos] = origvars[v];
++      weights[pos] = origweights[v];
+    }
+ #ifndef NDEBUG
+    for( v = 0; v < norigvars; ++v )
+@@ -7226,10 +7326,7 @@
+    }
+ #endif
+ 
+-   /* free temporary memory */
+-   SCIPfreeBufferArray(scip, &weightpointers);
+-   SCIPfreeBufferArray(scip, &varpointers);
+-   SCIPfreeBufferArray(scip, &cliquecount);
++   SCIPfreeBufferArray(scip, &cliquewritepos);
+ 
+    return SCIP_OKAY;
+ }
+@@ -7545,9 +7642,9 @@
+             break;
+          }
+ 
+-         /* allocate temporary memory and initialize it */
+-         SCIP_CALL( SCIPduplicateBufferArray(scip, &myvars, consdata->vars, nvars) );
+-         SCIP_CALL( SCIPduplicateBufferArray(scip, &myweights, consdata->weights, nvars) ) ;
++         /* allocate temporary memory (stableSort fills all entries directly) */
++         SCIP_CALL( SCIPallocBufferArray(scip, &myvars, nvars) );
++         SCIP_CALL( SCIPallocBufferArray(scip, &myweights, nvars) );
+          SCIP_CALL( SCIPallocBufferArray(scip, &cliquestartposs, nnegcliques + 1) );
+          SCIP_CALL( SCIPallocBufferArray(scip, &cliqueendposs, nnegcliques) );
+          SCIP_CALL( SCIPallocBufferArray(scip, &secondmaxweights, nnegcliques) );
+--- a/src/scip/presol_dualinfer.c
++++ b/src/scip/presol_dualinfer.c
+@@ -1707,7 +1707,7 @@
+ 
+       for( i = 0; i < nimplubvars; i++)
+       {
+-         if( ((SCIP_Longint)pospp) + posmm + pospm + posmp > maxhashes )
++         if( ((SCIP_Longint)pospp) + posmm + pospm + posmp > maxhashes || ((i & 63) == 0 && SCIPisStopped(scip)) )
+             break;
+ 
+          colvalptr = SCIPmatrixGetColValPtr(matrix, implubvars[i]);
+@@ -1786,7 +1786,7 @@
+ 
+          // same as in the rworowbnd presolver - both while loops to basically the same with one using pp and mm and the other pm and mp
+          // I would write an additional function and remove the code duplication
+-         while( !finished )
++         while( !finished && !SCIPisStopped(scip) )
+          {
+             if( hashlistpp[block1start] == hashlistmm[block2start] )
+             {
+@@ -1886,7 +1886,7 @@
+          SCIPdebugMsg(scip, "processing pm and mp\n");
+ #endif
+ 
+-         while( !finished )
++         while( !finished && !SCIPisStopped(scip) )
+          {
+             if( hashlistpm[block1start] == hashlistmp[block2start] )
+             {

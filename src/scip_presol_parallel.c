@@ -1,14 +1,13 @@
 #include "scip_presol_parallel.h"
 #include "scip/cons_linear.h"
 #include "scip/pub_matrix.h"
+#include <float.h>
 #include <math.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
 #define PARROW_MAX_ROWS 300000
-#define PARROW_RATIO_TOL 1e-11
-#define PARROW_SIDE_TOL 1e-9
 
 static uint64_t mix64(uint64_t x) {
     x ^= x >> 30;
@@ -34,6 +33,17 @@ static uint64_t hash_row_support(const int *cols, const SCIP_Real *vals, int len
     return h ? h : 1;
 }
 
+/* fma rounds the product difference only once. Away from underflow,
+ * a nonzero difference between binary64 products cannot round to zero. */
+static int exact_product(double a, double b, double value) {
+    if (!isfinite(a) || !isfinite(b) || !isfinite(value))
+        return 0;
+    if (value == 0.0)
+        return a == 0.0 || b == 0.0;
+    return fabs(value) >= DBL_MIN / (DBL_EPSILON * DBL_EPSILON) &&
+           fma(a, b, -value) == 0.0;
+}
+
 static int rows_proportional(const int *c1, const SCIP_Real *v1, const int *c2,
                              const SCIP_Real *v2, int len, double *out_alpha) {
     if (fabs(v1[0]) <= 1e-15 || fabs(v2[0]) <= 1e-15)
@@ -44,9 +54,8 @@ static int rows_proportional(const int *c1, const SCIP_Real *v1, const int *c2,
     double alpha = v2[0] / v1[0];
     if (!isfinite(alpha) || fabs(alpha) < 1e-9 || fabs(alpha) > 1e9)
         return 0;
-    for (int k = 1; k < len; ++k) {
-        double diff = fabs(v2[k] - alpha * v1[k]);
-        if (diff > PARROW_RATIO_TOL * (1.0 + fabs(v2[k])))
+    for (int k = 0; k < len; ++k) {
+        if (!exact_product(alpha, v1[k], v2[k]))
             return 0;
     }
     *out_alpha = alpha;
@@ -79,9 +88,9 @@ static int is_linear_exact_sides(SCIP *scip, SCIP_CONS *cons, int len, double ml
     double clhs = SCIPgetLhsLinear(scip, cons);
     double crhs = SCIPgetRhsLinear(scip, cons);
     int lhs_ok = (clhs <= -inf && mlhs <= -inf) ||
-                 (clhs > -inf && mlhs > -inf && fabs(clhs - mlhs) <= 1e-11 * (1.0 + fabs(clhs)));
+                 (clhs > -inf && mlhs > -inf && clhs == mlhs);
     int rhs_ok = (crhs >= inf && mrhs >= inf) ||
-                 (crhs < inf && mrhs < inf && fabs(crhs - mrhs) <= 1e-11 * (1.0 + fabs(crhs)));
+                 (crhs < inf && mrhs < inf && crhs == mrhs);
     return lhs_ok && rhs_ok;
 }
 
@@ -232,6 +241,11 @@ static SCIP_DECL_PRESOLEXEC(presolExecParallel) {
                     u2 = (l2_raw > -inf) ? (l2_raw / alpha) : inf;
                 }
 
+                if ((l2_raw > -inf && (fabs(l2_raw / alpha) >= inf ||
+                        !exact_product(l2_raw / alpha, alpha, l2_raw))) ||
+                    (u2_raw < inf && (fabs(u2_raw / alpha) >= inf ||
+                        !exact_product(u2_raw / alpha, alpha, u2_raw))))
+                    continue;
                 double l1 = cur_lhs[r1];
                 double u1 = cur_rhs[r1];
                 double new_l = (l1 > l2) ? l1 : l2;
@@ -242,9 +256,11 @@ static SCIP_DECL_PRESOLEXEC(presolExecParallel) {
                     break;
                 }
 
+                if (new_l > new_u)
+                    continue;
                 /* Case 1: r1 already dominates r2 (no side change needed on r1) */
-                int l1_dom = (l2 <= -inf) || (l1 > -inf && l1 >= l2 - PARROW_SIDE_TOL);
-                int u1_dom = (u2 >= inf) || (u1 < inf && u1 <= u2 + PARROW_SIDE_TOL);
+                int l1_dom = (l2 <= -inf) || (l1 > -inf && l1 >= l2);
+                int u1_dom = (u2 >= inf) || (u1 < inf && u1 <= u2);
                 if (l1_dom && u1_dom && flags_dominate(c1, c2)) {
                     SCIP_CALL(SCIPdelCons(scip, c2));
                     deleted[r2] = 1;
@@ -253,8 +269,8 @@ static SCIP_DECL_PRESOLEXEC(presolExecParallel) {
                 }
 
                 /* Case 2: r2 dominates r1 */
-                int l2_dom = (l1 <= -inf) || (l2 > -inf && l2 >= l1 - PARROW_SIDE_TOL);
-                int u2_dom = (u1 >= inf) || (u2 < inf && u2 <= u1 + PARROW_SIDE_TOL);
+                int l2_dom = (l1 <= -inf) || (l2 > -inf && l2 >= l1);
+                int u2_dom = (u1 >= inf) || (u2 < inf && u2 <= u1);
                 if (l2_dom && u2_dom && flags_dominate(c2, c1)) {
                     SCIP_CALL(SCIPdelCons(scip, c1));
                     deleted[r1] = 1;
@@ -265,21 +281,23 @@ static SCIP_DECL_PRESOLEXEC(presolExecParallel) {
                 /* Case 3: merge strict sides into linear c1 and delete c2 */
                 if (c1_lin && flags_dominate(c1, c2)) {
                     int changed = 0;
-                    if (new_l > -inf && (l1 <= -inf || new_l > l1 + PARROW_SIDE_TOL)) {
+                    if (new_l > -inf && (l1 <= -inf || new_l > l1)) {
                         SCIP_CALL(SCIPchgLhsLinear(scip, c1, new_l));
-                        cur_lhs[r1] = new_l;
+                        cur_lhs[r1] = SCIPgetLhsLinear(scip, c1);
                         changed = 1;
                     }
-                    if (new_u < inf && (u1 >= inf || new_u < u1 - PARROW_SIDE_TOL)) {
+                    if (new_u < inf && (u1 >= inf || new_u < u1)) {
                         SCIP_CALL(SCIPchgRhsLinear(scip, c1, new_u));
-                        cur_rhs[r1] = new_u;
+                        cur_rhs[r1] = SCIPgetRhsLinear(scip, c1);
                         changed = 1;
                     }
-                    SCIP_CALL(SCIPdelCons(scip, c2));
-                    deleted[r2] = 1;
-                    local_del++;
                     if (changed)
                         local_chg++;
+                    if (cur_lhs[r1] == new_l && cur_rhs[r1] == new_u) {
+                        SCIP_CALL(SCIPdelCons(scip, c2));
+                        deleted[r2] = 1;
+                        local_del++;
+                    }
                 }
             }
         }

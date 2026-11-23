@@ -17,6 +17,7 @@
 #include "partition.h"
 #include "common.h"
 #include "exact.h"
+#include "dependency.h"
 #include "presolve.h"
 #include "search.h"
 #include "augment.h"
@@ -42,9 +43,9 @@ typedef struct Node {
 typedef struct {
     const LabModel *model;
     LabModel lp_model;
-    LabModel augmented;
     LabRootCutBatch cuts;
     double *lp_row_lower, *lp_row_upper;
+    LabSearchBound frontier;
     LabSearch branching;
     const LabBbOptions *options;
     LabBbResult *result;
@@ -65,10 +66,29 @@ typedef struct {
 #endif
 } Search;
 
-static void outcome(Search *s, const char *status, const char *message) {
-    s->result->status = status;
-    snprintf(s->result->message, sizeof s->result->message, "%s", message);
+/* The search owns the primal storage. Only terminal observations may publish
+ * a global bound, and all public bounds are in original objective units. */
+static void publish(Search *s, LabSearchResult verdict, const char *message) {
+    LabBbResult *r = s->result;
+    verdict.point = r->has_primal ? r->primal : NULL;
+    r->search = verdict;
+    r->status = lab_mip_status_name(verdict.status);
+    r->has_bound = verdict.bound.origin != LAB_BOUND_NONE;
+    r->best_bound = verdict.bound.value;
+    if (message)
+        snprintf(r->message, sizeof r->message, "%s", message);
 }
+
+static void outcome(Search *s, LabMipStatus status, const char *message) {
+    publish(s, (LabSearchResult){.route = "native", .status = status}, message);
+}
+
+static void close_at_incumbent(Search *s, const char *route, LabClosure closure,
+                               LabBoundOrigin origin, const char *message) {
+    publish(s, (LabSearchResult){.route = route, .status = LAB_MIP_OPTIMAL, .closure = closure,
+                                 .bound = {origin, s->result->objective}}, message);
+}
+
 static void release(Node *node) {
     while (node && --node->references == 0) {
         Node *parent = node->parent;
@@ -313,21 +333,20 @@ static void global_bound(Search *s, const Node *current) {
         if (s->result->has_primal)
             bound = fminl(bound, s->incumbent);
         double published = (double)(s->constant + s->sense * bound);
-        s->result->has_bound = isfinite(published);
-        if (s->result->has_bound)
-            s->result->best_bound = published;
+        s->frontier = isfinite(published) ? (LabSearchBound){LAB_BOUND_FRONTIER, published}
+                                          : (LabSearchBound){0};
     } else {
-        s->result->has_bound = 0;
+        s->frontier = (LabSearchBound){0};
     }
 }
 static int call_lp(Search *s, const double *lower, const double *upper, LabLpResult *lp) {
     memset(lp, 0, sizeof *lp);
     if (remaining(s) <= 0) {
-        outcome(s, "time_limit", "MILP time budget exhausted");
+        outcome(s, LAB_MIP_TIME_LIMIT, "MILP time budget exhausted");
         return -1;
     }
     if (s->cuts.count && !cut_box_contains(s, &s->cuts, lower, upper)) {
-        outcome(s, "numerical_failure", "LP bounds leave the certified root-cut box");
+        outcome(s, LAB_MIP_NUMERICAL_FAILURE, "LP bounds leave the certified root-cut box");
         return -1;
     }
     LabLpOptions opt = s->options->lp;
@@ -339,7 +358,7 @@ static int call_lp(Search *s, const double *lower, const double *upper, LabLpRes
         s->session_initialized = 1;
         s->session = lab_lp_session_create(&s->lp_model, &opt);
     }
-    int warm = s->session != NULL;
+    int warm = s->session && (!s->options->cold || !s->result->root_cut_attempts);
     if (warm) {
         for (size_t j = 0; j < s->model->cols; j++)
             if (lab_lp_session_set_bounds(s->session, j, lower[j], upper[j])) {
@@ -470,7 +489,7 @@ static int call_lp(Search *s, const double *lower, const double *upper, LabLpRes
         fputs("}\n", s->trace);
     }
     if (remaining(s) <= 0) {
-        outcome(s, "time_limit", "MILP time budget exhausted during an LP solve");
+        outcome(s, LAB_MIP_TIME_LIMIT, "MILP time budget exhausted during an LP solve");
         return -1;
     }
     return 0;
@@ -492,7 +511,7 @@ static int root_cuts(Search *s) {
     s->result->root_cut_status = lab_root_cut_status_name(status);
     if (remaining(s) <= 0) {
         lab_root_cut_batch_free(&candidate);
-        outcome(s, "time_limit", "MILP time budget exhausted deriving root cuts");
+        outcome(s, LAB_MIP_TIME_LIMIT, "MILP time budget exhausted deriving root cuts");
         return -1;
     }
     if (status != LAB_ROOT_CUT_OK || !candidate.count) {
@@ -523,8 +542,7 @@ static int root_cuts(Search *s) {
     }
     LabAugmentLimits limits = {.max_rows = 8000000, .max_nonzeros = 128000000,
                                .max_added_rows = 4};
-    LabAugmentStatus augmented = lab_model_append_rows(&s->lp_model, candidate.count,
-                                                       rows, &limits, &s->augmented);
+    LabAugmentStatus augmented = lab_lp_session_append_dense_rows(s->session, candidate.count, rows, &limits);
     for (size_t r = 0; r < candidate.count; r++)
         free(names[r]);
     free(names);
@@ -535,22 +553,7 @@ static int root_cuts(Search *s) {
         lab_root_cut_batch_free(&candidate);
         return 0;
     }
-    LabLpSession *next = NULL;
-    if (!s->options->cold) {
-        LabLpOptions options = s->options->lp;
-        options.basis_in = options.basis_out = NULL;
-        options.time_limit = fmin(options.time_limit, remaining(s));
-        next = lab_lp_session_create(&s->augmented, &options);
-        if (!next) {
-            s->result->root_cut_status = "augmented_session_unavailable";
-            lab_model_free(&s->augmented);
-            lab_root_cut_batch_free(&candidate);
-            return 0;
-        }
-    }
-    lab_lp_session_free(s->session);
-    s->session = next;
-    s->lp_model = s->augmented;
+    s->lp_model = *lab_lp_session_domain(s->session);
     s->cuts = candidate;
     s->result->root_cuts = candidate.count;
     s->result->root_cut_status = "applied";
@@ -571,19 +574,19 @@ static int unresolved(Search *s, const LabLpResult *lp) {
         for (size_t j = 0; j < s->model->cols; j++)
             if (s->model->integer[j] && isfinite(lp->primal[j]) &&
                 fabs(lp->primal[j]) > 9007199254740991.0) {
-                outcome(s, "unsupported", "Integer values exceed the exactly spaced double range");
+                outcome(s, LAB_MIP_UNSUPPORTED, "Integer values exceed the exactly spaced double range");
                 return -1;
             }
     if (!strcmp(lp->status, "unbounded"))
-        outcome(s, "lp_unbounded", "An LP relaxation is unbounded; MILP unboundedness is unproved");
+        outcome(s, LAB_MIP_LP_UNBOUNDED, "An LP relaxation is unbounded; MILP unboundedness is unproved");
     else if (!strcmp(lp->status, "time_limit"))
-        outcome(s, "time_limit", "LP solve exhausted the remaining MILP time budget");
+        outcome(s, LAB_MIP_TIME_LIMIT, "LP solve exhausted the remaining MILP time budget");
     else if (!strcmp(lp->status, "iteration_limit"))
-        outcome(s, "iteration_limit", "A node LP exhausted its pivot budget");
+        outcome(s, LAB_MIP_ITERATION_LIMIT, "A node LP exhausted its pivot budget");
     else if (!strcmp(lp->status, "unsupported"))
-        outcome(s, "unsupported", lp->message);
+        outcome(s, LAB_MIP_UNSUPPORTED, lp->message);
     else
-        outcome(s, "numerical_failure", lp->message[0] ? lp->message : "Unresolved node LP");
+        outcome(s, LAB_MIP_NUMERICAL_FAILURE, lp->message[0] ? lp->message : "Unresolved node LP");
     return -1;
 }
 static int valid_candidate(Search *s, const double *value, int require_integer, double *objective) {
@@ -619,17 +622,23 @@ static void retain_search_incumbent(Search *s, const Node *node) {
     trace(s, node, "incumbent", SIZE_MAX, objective, 1);
 }
 #endif
-static int complete_point_search(Search *s, const Node *node, const char *message, const char *event) {
+static int store_terminal_point(Search *s) {
     double objective;
     if (!valid_candidate(s, s->repair_lower, 1, &objective) || remaining(s) <= 0) return 0;
     size_t n = s->model->cols;
     if (!s->result->primal)
         s->result->primal = lab_alloc(n, sizeof(double));
     memcpy(s->result->primal, s->repair_lower, n * sizeof(double));
-    s->result->has_primal = s->result->has_bound = 1;
-    s->result->best_bound = s->result->objective = objective;
-    outcome(s, "optimal", message);
-    trace(s, node, event, SIZE_MAX, objective, 1);
+    s->result->has_primal = 1;
+    s->result->objective = objective;
+    return 1;
+}
+static int complete_point_search(Search *s, const Node *node, const char *route, LabClosure closure,
+                                 const char *message, const char *event) {
+    if (!store_terminal_point(s)) return 0;
+    close_at_incumbent(s, route, closure,
+                       closure == LAB_CLOSE_EXHAUSTED ? LAB_BOUND_EXHAUSTION : LAB_BOUND_STRUCTURAL, message);
+    trace(s, node, event, SIZE_MAX, s->result->objective, 1);
     return 1;
 }
 #define LAB_PHASE(sp, name) do { if (getenv("LAB_PHASE_TRACE")) \
@@ -640,49 +649,52 @@ static int run_scip_mip(Search *s, const Node *node) {
     const LabModel *model = s->model;
     const LabBbOptions *options = s->options;
     LabBbResult *result = s->result;
-    if (options->trace_path || model->cols < 32 ||
+    if (model->cols < 32 ||
         remaining(s) <= 0.05 || result->nodes >= options->node_limit)
         return 0;
+    result->scip_route = "general";
+    trace(s, node, "scip_mip_start", SIZE_MAX, 0, 0);
     LabScipMipStats sstats;
-    int sfound = lab_scip_mip(model, s->base_lower, s->base_upper,
+    LabSearchResult attempt = lab_scip_mip(model, s->base_lower, s->base_upper,
                               s->lp_row_lower, s->lp_row_upper,
                               result->has_primal ? result->primal : NULL,
                               lab_now() + remaining(s),
                               options->node_limit - result->nodes,
                               options->lp.iteration_limit, s->repair_lower, &sstats);
+    result->scip_path_cliques += sstats.path_cliques;
     result->nodes += sstats.nodes;
     result->lp_solves += sstats.lp_solves;
     result->lp_iterations += sstats.lp_iterations;
-    if (sfound == 2 && complete_point_search(s, node,
-            "SCIP branch-and-cut reported optimality; original witness checked",
-            "scip_mip_optimum"))
-        return 1;
-    if (sfound == -2 && remaining(s) > 0) {
-        outcome(s, "infeasible",
-                "SCIP branch-and-cut reported infeasibility; no independent tree proof");
+    if (attempt.status == LAB_MIP_INFEASIBLE && remaining(s) > 0) {
+        publish(s, attempt, "SCIP branch-and-cut reported infeasibility; no independent tree proof");
         return 1;
     }
-    if (sfound == 1)
-        retain_search_incumbent(s, node);
-    if (sstats.has_bound) {
-        result->has_bound = 1;
-        result->best_bound = sstats.best_bound;
-        if (result->has_primal) {
-            if (model->maximize)
-                result->best_bound = fmax(result->best_bound, result->objective);
-            else
-                result->best_bound = fmin(result->best_bound, result->objective);
+    const char *message;
+    if (attempt.status == LAB_MIP_OPTIMAL && store_terminal_point(s)) {
+        message = "SCIP branch-and-cut reported optimality; original witness checked";
+        trace(s, node, "scip_mip_optimum", SIZE_MAX, result->objective, 1);
+    } else {
+        if (attempt.point)
+            retain_search_incumbent(s, node);
+        attempt.closure = LAB_CLOSE_NONE;
+        if (attempt.status == LAB_MIP_GAP_LIMIT) {
+            message = "SCIP reached its configured MIP gap limit";
+        } else if (attempt.status == LAB_MIP_TIME_LIMIT || remaining(s) <= 0.05) {
+            attempt.status = LAB_MIP_TIME_LIMIT;
+            message = "MILP time budget exhausted during branch-and-cut";
+        } else if (attempt.status == LAB_MIP_NODE_LIMIT || (sstats.nodes && result->nodes >= options->node_limit)) {
+            attempt.status = LAB_MIP_NODE_LIMIT;
+            message = "MILP node budget exhausted during branch-and-cut";
+        } else {
+            result->scip_route = "general_fallback";
+            result->scip_fallback_reason = sstats.fallback_reason ? sstats.fallback_reason :
+                attempt.point ? "incumbent_only" : "no_verified_completion";
+            trace(s, node, "scip_mip_fallback", SIZE_MAX, 0, 0);
+            return 0;
         }
     }
-    if (sstats.status == 1 || remaining(s) <= 0.05) {
-        outcome(s, "time_limit", "MILP time budget exhausted during branch-and-cut");
-        return 1;
-    }
-    if (sstats.status == 2 || (sstats.nodes && result->nodes >= options->node_limit)) {
-        outcome(s, "node_limit", "MILP node budget exhausted during branch-and-cut");
-        return 1;
-    }
-    return 0;
+    publish(s, attempt, message);
+    return 1;
 }
 #endif
 /* Fix and resolve integer values. Simply rounding the LP vector can violate
@@ -699,7 +711,15 @@ static int repair(Search *s, const LabLpResult *lp, const Node *node) {
             s->repair_lower[j] = s->repair_upper[j] = rounded;
         }
     LabLpResult fixed;
-    if (call_lp(s, s->repair_lower, s->repair_upper, &fixed)) {
+    int probe = s->session && !s->options->cold;
+    if (probe && lab_lp_session_begin_probe(s->session)) {
+        outcome(s, LAB_MIP_NUMERICAL_FAILURE, "Could not start fixed-integer LP probe");
+        return -1;
+    }
+    int failed = call_lp(s, s->repair_lower, s->repair_upper, &fixed);
+    if (probe)
+        lab_lp_session_rollback_probe(s->session);
+    if (failed) {
         lab_lp_result_free(&fixed);
         return -1;
     }
@@ -712,7 +732,7 @@ static int repair(Search *s, const LabLpResult *lp, const Node *node) {
         return 0;
     }
     if (!fixed.has_primal) {
-        outcome(s, "numerical_failure", "Fixed-integer LP returned no primal witness");
+        outcome(s, LAB_MIP_NUMERICAL_FAILURE, "Fixed-integer LP returned no primal witness");
         lab_lp_result_free(&fixed);
         return -1;
     }
@@ -721,7 +741,7 @@ static int repair(Search *s, const LabLpResult *lp, const Node *node) {
             fixed.primal[j] = s->repair_lower[j];
     double objective;
     if (!valid_candidate(s, fixed.primal, 1, &objective)) {
-        outcome(s, "numerical_failure", "Repaired integer witness fails original-model checks");
+        outcome(s, LAB_MIP_NUMERICAL_FAILURE, "Repaired integer witness fails original-model checks");
         lab_lp_result_free(&fixed);
         return -1;
     }
@@ -729,7 +749,7 @@ static int repair(Search *s, const LabLpResult *lp, const Node *node) {
     long double delta = s->result->has_primal ? difference(s, fixed.primal, s->result->primal) : 0;
     long double repair_gap = difference(s, fixed.primal, lp->primal);
     if (!isfinite(normalized) || !isfinite(delta) || !isfinite(repair_gap)) {
-        outcome(s, "numerical_failure", "Objective comparison overflow");
+        outcome(s, LAB_MIP_NUMERICAL_FAILURE, "Objective comparison overflow");
         lab_lp_result_free(&fixed);
         return -1;
     }
@@ -791,9 +811,8 @@ static int root_partition(Search *s, const LabLpResult *lp, const Node *node) {
         trace(s, node, "incumbent", SIZE_MAX, objective, 1);
         return 0;
     }
-    s->result->has_bound = 1;
-    s->result->best_bound = objective;
-    outcome(s, "optimal", "Set-partitioning search exhausted; original witness checked");
+    close_at_incumbent(s, "partition", LAB_CLOSE_EXHAUSTED, LAB_BOUND_EXHAUSTION,
+                       "Set-partitioning search exhausted; original witness checked");
     trace(s, node, "partition_search_optimum", SIZE_MAX, objective, 1);
     return 1;
 }
@@ -865,7 +884,7 @@ static int branches(Search *s, Node *node, size_t j, double x, long double lp_sc
     int has_right = right <= s->upper[j] && right > s->lower[j];
     if (!isfinite(x) || fabs(x) > 9007199254740991.0 || left == right ||
         (!has_left && !has_right)) {
-        outcome(s, "numerical_failure", "Cannot make a progressing integer branch");
+        outcome(s, LAB_MIP_NUMERICAL_FAILURE, "Cannot make a progressing integer branch");
         return -1;
     }
     /* Hybrid best-bound + plunging: plunge down the closer child immediately
@@ -917,21 +936,26 @@ void lab_bb_solve(const LabModel *model, const LabBbOptions *options, LabBbResul
     s.sense = model->maximize ? -1 : 1;
     s.incumbent = INFINITY;
     s.started = lab_now();
+#ifdef LAB_SCIP_INTEGER
+    result->scip_route = options->no_scip ? "disabled" : "not_dispatched";
+#else
+    result->scip_route = "unavailable";
+#endif
     result->root_cut_status = options->no_root_cuts ? "disabled" : "not_attempted";
     result->root_dive_status = options->no_root_diving ? "disabled" : "not_attempted";
-    outcome(&s, "numerical_failure", "MILP search did not complete");
+    outcome(&s, LAB_MIP_NUMERICAL_FAILURE, "MILP search did not complete");
     if (!isfinite(options->time_limit) || !options->node_limit) {
-        outcome(&s, "input_error", "Positive finite time and node limits are required");
+        outcome(&s, LAB_MIP_INPUT_ERROR, "Positive finite time and node limits are required");
         goto cleanup;
     }
     if (options->time_limit <= 0) {
-        outcome(&s, "time_limit", "MILP time budget exhausted before search");
+        outcome(&s, LAB_MIP_TIME_LIMIT, "MILP time budget exhausted before search");
         goto cleanup;
     }
     if (options->trace_path) {
         s.trace = fopen(options->trace_path, "wx");
         if (!s.trace) {
-            outcome(&s, "input_error", "Cannot create fresh search trace");
+            outcome(&s, LAB_MIP_INPUT_ERROR, "Cannot create fresh search trace");
             goto cleanup;
         }
     }
@@ -948,18 +972,19 @@ void lab_bb_solve(const LabModel *model, const LabBbOptions *options, LabBbResul
         if (model->integer[j]) {
             if ((isfinite(lo) && fabs(lo) > 9007199254740991.0) ||
                 (isfinite(hi) && fabs(hi) > 9007199254740991.0)) {
-                outcome(&s, "unsupported", "Integer bounds exceed the exactly spaced double range");
+                outcome(&s, LAB_MIP_UNSUPPORTED, "Integer bounds exceed the exactly spaced double range");
                 goto cleanup;
             }
             lo = ceil(lo);
             hi = floor(hi);
         }
         if (isnan(lo) || isnan(hi)) {
-            outcome(&s, "input_error", "Nonfinite column-bound encoding");
+            outcome(&s, LAB_MIP_INPUT_ERROR, "Nonfinite column-bound encoding");
             goto cleanup;
         }
         if (lo > hi) {
-            outcome(&s, "infeasible", "A column has no permitted integer or continuous value");
+            publish(&s, (LabSearchResult){.route = "domain", .status = LAB_MIP_INFEASIBLE, .closure = LAB_CLOSE_DOMAIN},
+                    "A column has no permitted integer or continuous value");
             goto cleanup;
         }
         s.base_lower[j] = lo;
@@ -968,7 +993,7 @@ void lab_bb_solve(const LabModel *model, const LabBbOptions *options, LabBbResul
     if (!options->no_presolve) {
         double available = remaining(&s);
         if (available <= 0) {
-            outcome(&s, "time_limit", "MILP time budget exhausted before presolve");
+            outcome(&s, LAB_MIP_TIME_LIMIT, "MILP time budget exhausted before presolve");
             goto cleanup;
         }
         LabPresolveOptions opt = {.time_limit = fmin(2, .05 * available),
@@ -980,12 +1005,15 @@ void lab_bb_solve(const LabModel *model, const LabBbOptions *options, LabBbResul
         result->presolve_fixed = presolved.fixed;
         result->presolve_rows = presolved.redundant_rows;
         if (remaining(&s) <= 0) {
-            outcome(&s, "time_limit", "MILP time budget exhausted during root presolve");
+            outcome(&s, LAB_MIP_TIME_LIMIT, "MILP time budget exhausted during root presolve");
             lab_presolve_result_free(&presolved);
             goto cleanup;
         }
         if (!strcmp(presolved.status, "input_error") || !strcmp(presolved.status, "infeasible")) {
-            outcome(&s, presolved.status, presolved.message);
+            int infeasible = !strcmp(presolved.status, "infeasible");
+            publish(&s, (LabSearchResult){.route = "presolve",
+                    .status = infeasible ? LAB_MIP_INFEASIBLE : LAB_MIP_INPUT_ERROR,
+                    .closure = infeasible ? LAB_CLOSE_DOMAIN : LAB_CLOSE_NONE}, presolved.message);
             lab_presolve_result_free(&presolved);
             goto cleanup;
         }
@@ -1013,14 +1041,14 @@ void lab_bb_solve(const LabModel *model, const LabBbOptions *options, LabBbResul
         if (model->integer[j] &&
             ((isfinite(lo) && fabs(lo) > 9007199254740991.0) ||
              (isfinite(hi) && fabs(hi) > 9007199254740991.0))) {
-            outcome(&s, "unsupported", "Integer bounds exceed the exactly spaced double range");
+            outcome(&s, LAB_MIP_UNSUPPORTED, "Integer bounds exceed the exactly spaced double range");
             goto cleanup;
         }
         s.reference[j] = isfinite(lo) ? lo : isfinite(hi) ? hi : 0;
     }
     double source_constant;
     if (lab_source_objective_value(model, s.reference, &source_constant)) {
-        outcome(&s, "numerical_failure", "Source objective reference unavailable");
+        outcome(&s, LAB_MIP_NUMERICAL_FAILURE, "Source objective reference unavailable");
         goto cleanup;
     }
     s.constant = source_constant;
@@ -1030,12 +1058,12 @@ void lab_bb_solve(const LabModel *model, const LabBbOptions *options, LabBbResul
     while (s.plunge || s.heap_size) {
         if (remaining(&s) <= 0) {
             global_bound(&s, NULL);
-            outcome(&s, "time_limit", "MILP time budget exhausted");
+            outcome(&s, LAB_MIP_TIME_LIMIT, "MILP time budget exhausted");
             goto cleanup;
         }
         if (result->nodes >= options->node_limit) {
             global_bound(&s, NULL);
-            outcome(&s, "node_limit", "MILP node budget exhausted");
+            outcome(&s, LAB_MIP_NODE_LIMIT, "MILP node budget exhausted");
             goto cleanup;
         }
         Node *node = next_node(&s);
@@ -1057,7 +1085,7 @@ void lab_bb_solve(const LabModel *model, const LabBbOptions *options, LabBbResul
                                              (options->node_limit - result->nodes) / 2,
                                              s.repair_lower, &pair_nodes);
             result->nodes += pair_nodes;
-            if (paired && complete_point_search(&s, node,
+            if (paired && complete_point_search(&s, node, "pair_assignment", LAB_CLOSE_EXHAUSTED,
                     "Pair assignment search exhausted; original witness checked",
                     "pair_assignment_optimum")) {
                 release(node);
@@ -1070,7 +1098,7 @@ void lab_bb_solve(const LabModel *model, const LabBbOptions *options, LabBbResul
                               (options->node_limit - result->nodes) / 2, s.repair_lower,
                               &decimal, &trials);
             result->nodes += trials;
-            if (matched && complete_point_search(&s, node,
+            if (matched && complete_point_search(&s, node, "assignment", LAB_CLOSE_MATCHING_BOUND,
                     "Assignment met an exact matching bound with feasible source potentials",
                     "assignment_optimum")) {
                 result->primal_decimal = decimal;
@@ -1079,11 +1107,41 @@ void lab_bb_solve(const LabModel *model, const LabBbOptions *options, LabBbResul
                 goto cleanup;
             }
             lab_assignment_free_decimals(decimal, model->cols);
+#ifdef LAB_SCIP_INTEGER
+            if (trials && !options->no_scip && !options->first_fractional &&
+                result->nodes < options->node_limit && remaining(&s) > 0.1) {
+                LabScipMipStats compact;
+                double cut_off = lab_now() + fmin(5.0, 0.35 * remaining(&s));
+                int solved_compact = lab_assignment_quotient(model, s.base_lower, s.base_upper, cut_off,
+                    (options->node_limit - result->nodes) / 2, options->lp.iteration_limit,
+                    s.repair_lower, &decimal, &compact);
+                result->nodes += compact.nodes;
+                result->lp_solves += compact.lp_solves;
+                result->lp_iterations += compact.lp_iterations;
+                result->scip_path_cliques += compact.path_cliques;
+                if (solved_compact && store_terminal_point(&s)) {
+                    /* The quotient preserves objective coefficients, sense and offset. */
+                    LabSearchResult quotient = {.route = "assignment_quotient", .status = LAB_MIP_OPTIMAL,
+                                                .closure = LAB_CLOSE_BACKEND};
+                    if (compact.has_bound)
+                        quotient.bound = (LabSearchBound){LAB_BOUND_BACKEND, compact.best_bound};
+                    publish(&s, quotient, "Assignment quotient reported optimality; lifted source witness checked");
+                    trace(&s, node, "assignment_quotient_optimum", SIZE_MAX, result->objective, 1);
+                    result->primal_decimal = decimal;
+                    result->primal_columns = model->cols;
+                    result->scip_route = "assignment_quotient";
+                    release(node);
+                    goto cleanup;
+                }
+                lab_assignment_free_decimals(decimal, model->cols);
+            }
+#endif
             int solved = lab_fixed_charge_flow(model, lab_now() + fmin(2, .5 * remaining(&s)),
                               (options->node_limit - result->nodes) / 2, s.repair_lower,
                               &result->flow_eliminations, &result->flow_terminal_states);
             result->nodes += result->flow_eliminations + result->flow_terminal_states;
-            if (solved && complete_point_search(&s, node, "Fixed-charge network search exhausted; original witness checked", "flow_optimum")) {
+            if (solved && complete_point_search(&s, node, "flow", LAB_CLOSE_EXHAUSTED,
+                    "Fixed-charge network search exhausted; original witness checked", "flow_optimum")) {
                 release(node);
                 goto cleanup;
             }
@@ -1092,8 +1150,8 @@ void lab_bb_solve(const LabModel *model, const LabBbOptions *options, LabBbResul
                                     (options->node_limit - result->nodes) / 2,
                                     s.repair_lower, &lot_nodes);
             result->nodes += lot_nodes;
-            if (solved && complete_point_search(&s, node,
-                        "Line production and shared opening search exhausted; original witness checked",
+            if (solved && complete_point_search(&s, node, "lot_sizing", LAB_CLOSE_EXHAUSTED,
+                    "Line production and shared opening search exhausted; original witness checked",
                         "lot_sizing_optimum")) {
                 release(node);
                 goto cleanup;
@@ -1102,25 +1160,26 @@ void lab_bb_solve(const LabModel *model, const LabBbOptions *options, LabBbResul
                                           (options->node_limit - result->nodes) / 2, s.repair_lower,
                                           &result->packing_attempts);
             result->nodes += result->packing_attempts;
-            if (solved && complete_point_search(&s, node, "Resource packing met the capacity lower bound; original witness checked", "packing_optimum")) {
+            if (solved && complete_point_search(&s, node, "packing", LAB_CLOSE_MATCHING_BOUND,
+                    "Resource packing met the capacity lower bound; original witness checked", "packing_optimum")) {
                 release(node);
                 goto cleanup;
             }
 #ifdef LAB_GLPK_BASIS
             LabPooledStats pool_stats;
-            int pooled = lab_pooled_assignment(model, lab_now() + fmin(2, .4 * remaining(&s)),
+            LabSearchResult pooled = lab_pooled_assignment(model, lab_now() + fmin(2, .4 * remaining(&s)),
                              (options->node_limit - result->nodes) / 2,
                              options->lp.iteration_limit, s.repair_lower, &pool_stats);
             result->nodes += pool_stats.nodes;
             result->lp_solves += pool_stats.lp_solves;
             result->lp_iterations += pool_stats.iterations;
-            if (pooled == 2 && complete_point_search(&s, node,
+            if (pooled.status == LAB_MIP_OPTIMAL && complete_point_search(&s, node, pooled.route, pooled.closure,
                     "Pooled assignment search closed with exact network bounds and an original witness",
                     "pooled_assignment_optimum")) {
                 release(node);
                 goto cleanup;
             }
-            if (pooled)
+            if (pooled.point)
                 retain_search_incumbent(&s, node);
             size_t cover_iterations = 0;
             solved = result->nodes < options->node_limit &&
@@ -1129,7 +1188,7 @@ void lab_bb_solve(const LabModel *model, const LabBbOptions *options, LabBbResul
                                           &cover_iterations);
             result->lp_solves += solved || cover_iterations > 0;
             result->lp_iterations += cover_iterations;
-            if (solved && complete_point_search(&s, node,
+            if (solved && complete_point_search(&s, node, "activation_cover", LAB_CLOSE_MATCHING_BOUND,
                     "Activated covering met a verified integer lower bound; original witness checked",
                     "activation_cover_optimum")) {
                 release(node);
@@ -1141,14 +1200,16 @@ void lab_bb_solve(const LabModel *model, const LabBbOptions *options, LabBbResul
                                           s.repair_lower, &pattern_work);
             result->packing_attempts += pattern_work;
             result->nodes += pattern_work;
-            if (solved && complete_point_search(&s, node, "Integer packing met its pattern lower bound; original witness checked", "pattern_optimum")) {
+            if (solved && complete_point_search(&s, node, "pattern", LAB_CLOSE_MATCHING_BOUND,
+                    "Integer packing met its pattern lower bound; original witness checked", "pattern_optimum")) {
                 release(node);
                 goto cleanup;
             }
 #endif
             if (lab_binary_search(model, lab_now() + fmin(2, .5 * remaining(&s)), options->node_limit,
                                 s.repair_lower, &result->binary_search_queries) &&
-                complete_point_search(&s, node, "Binary assignment search exhausted; original witness checked", "binary_search_optimum")) {
+                complete_point_search(&s, node, "binary_search", LAB_CLOSE_EXHAUSTED,
+                    "Binary assignment search exhausted; original witness checked", "binary_search_optimum")) {
                 release(node);
                 goto cleanup;
             }
@@ -1160,25 +1221,23 @@ void lab_bb_solve(const LabModel *model, const LabBbOptions *options, LabBbResul
             /* SAT either closes quickly or not at all on the benchmark corpus; cap its
              * share so a stalled encoding cannot starve the branch-and-cut engine. */
             double sat_budget = fmin(.85 * remaining(&s), fmax(25.0, .25 * remaining(&s)));
-            int sat = lab_binary_sat(model, s.lower, s.upper, lab_now() + sat_budget,
+            LabSearchResult sat = lab_binary_sat(model, s.lower, s.upper, lab_now() + sat_budget,
                                      options->sat_decision_limit ? options->sat_decision_limit : options->node_limit,
                                      s.repair_lower, &result->sat_calls);
             double objective;
-            if (sat < 0 && remaining(&s) > 0) {
-                outcome(&s, "infeasible", "Exact binary constraint encoding reported unsatisfiable");
+            if (sat.status == LAB_MIP_INFEASIBLE && remaining(&s) > 0) {
+                publish(&s, sat, "Exact binary constraint encoding reported unsatisfiable");
                 release(node);
                 goto cleanup;
             }
-            if (sat > 0 && valid_candidate(&s, s.repair_lower, 1, &objective) && remaining(&s) > 0) {
+            if (sat.point && valid_candidate(&s, s.repair_lower, 1, &objective) && remaining(&s) > 0) {
                 result->primal = lab_alloc(n, sizeof(double));
                 memcpy(result->primal, s.repair_lower, n * sizeof(double));
                 result->has_primal = 1;
                 result->objective = objective;
                 s.incumbent = score(&s,result->primal);
-                if (sat == 1) {
-                    result->has_bound = 1;
-                    result->best_bound = objective;
-                    outcome(&s, "optimal", "Exact binary constraint search closed; original witness checked");
+                if (sat.status == LAB_MIP_OPTIMAL) {
+                    close_at_incumbent(&s, sat.route, sat.closure, LAB_BOUND_STRUCTURAL, "Exact binary constraint search closed; original witness checked");
                     trace(&s, node, "binary_sat_optimum", SIZE_MAX, objective, 1);
                     release(node);
                     goto cleanup;
@@ -1189,27 +1248,29 @@ void lab_bb_solve(const LabModel *model, const LabBbOptions *options, LabBbResul
 #endif
 #ifdef LAB_SCIP_INTEGER
         if (!node->parent && !options->no_presolve && !options->lp.no_exact && !options->cold &&
-            !options->first_fractional && !options->no_root_cuts && !options->no_root_diving) {
+            !options->first_fractional && !options->no_scip) {
             LAB_PHASE(&s, "integer_mip");
             LabIntegerMipStats stats;
-            int found = lab_integer_mip(model, s.base_lower, s.base_upper,
+            LabSearchResult contracted = lab_integer_mip(model, s.base_lower, s.base_upper,
                                         lab_now() + .75 * remaining(&s),
                                         options->node_limit - result->nodes,
                                         options->lp.iteration_limit, s.repair_lower, &stats);
             result->nodes += stats.nodes;
             result->lp_solves += stats.lp_solves;
             result->lp_iterations += stats.lp_iterations;
-            if (found == 2 && complete_point_search(&s, node,
-                    "SCIP reported optimality after exact integer equality contraction",
-                    "integer_search_optimum")) {
+            if (contracted.status == LAB_MIP_OPTIMAL && store_terminal_point(&s)) {
+                close_at_incumbent(&s, contracted.route, contracted.closure, LAB_BOUND_INTEGER_LATTICE,
+                                   "SCIP reported optimality after exact integer equality contraction");
+                trace(&s, node, "integer_search_optimum", SIZE_MAX, result->objective, 1);
+                result->scip_route = "contracted";
                 release(node);
                 goto cleanup;
             }
-            if (found)
+            if (contracted.point)
                 retain_search_incumbent(&s, node);
             if (stats.nodes && result->nodes >= options->node_limit) {
                 global_bound(&s, node);
-                outcome(&s, "node_limit", "MILP node budget exhausted during integer search");
+                outcome(&s, LAB_MIP_NODE_LIMIT, "MILP node budget exhausted during integer search");
                 release(node);
                 goto cleanup;
             }
@@ -1234,8 +1295,9 @@ node_lp_ready:
         trace(&s, node, lp.status, SIZE_MAX, lp.objective, lp.has_primal);
 #ifdef LAB_SCIP_INTEGER
         if (!node->parent && !options->no_presolve && !options->lp.no_exact && !options->cold &&
-            !options->first_fractional && !options->no_root_cuts && !options->no_root_diving &&
-            model->cols >= 32 && strcmp(lp.status, "optimal") && strcmp(lp.status, "infeasible") &&
+            !options->first_fractional && !options->no_scip &&
+            model->cols >= 32 && strcmp(result->scip_route, "general_fallback") &&
+            strcmp(lp.status, "optimal") && strcmp(lp.status, "infeasible") &&
             strcmp(lp.status, "time_limit") && strcmp(lp.status, "unsupported") &&
             run_scip_mip(&s, node)) {
             lab_lp_result_free(&lp);
@@ -1255,7 +1317,7 @@ node_lp_ready:
             continue;
         }
         if (!lp.has_primal || !isfinite(lp.objective)) {
-            outcome(&s, "numerical_failure", "Node LP returned no finite primal objective");
+            outcome(&s, LAB_MIP_NUMERICAL_FAILURE, "Node LP returned no finite primal objective");
             global_bound(&s, node);
             lab_lp_result_free(&lp);
             release(node);
@@ -1264,7 +1326,7 @@ node_lp_ready:
         double recomputed;
         if (!valid_candidate(&s, lp.primal, 0, &recomputed) ||
             fabs(recomputed - lp.objective) > 1e-7 * (1 + fabs(recomputed))) {
-            outcome(&s, "numerical_failure", "Node LP witness fails original-model checks");
+            outcome(&s, LAB_MIP_NUMERICAL_FAILURE, "Node LP witness fails original-model checks");
             global_bound(&s, node);
             lab_lp_result_free(&lp);
             release(node);
@@ -1276,7 +1338,7 @@ node_lp_ready:
             if (model->integer[j] && fabs(lp.primal[j]) > 9007199254740991.0)
                 huge_integer = 1;
         if (huge_integer) {
-            outcome(&s, "unsupported", "Integer LP values exceed the exactly spaced double range");
+            outcome(&s, LAB_MIP_UNSUPPORTED, "Integer LP values exceed the exactly spaced double range");
             global_bound(&s, node);
             lab_lp_result_free(&lp);
             release(node);
@@ -1298,10 +1360,6 @@ node_lp_ready:
                 lab_lp_result_free(&lp);
                 release(node);
                 goto cleanup;
-            }
-            if (options->cold) {
-                lab_lp_session_free(s.session);
-                s.session = NULL;
             }
             if (added) {
                 lab_lp_result_free(&lp);
@@ -1326,7 +1384,7 @@ node_lp_ready:
         long double normalized = score(&s, lp.primal);
         long double lower = normalized - 1e-7L * (1 + fabsl(normalized));
         if (!isfinite(normalized) || !isfinite(lower)) {
-            outcome(&s, "numerical_failure", "Node objective comparison overflow");
+            outcome(&s, LAB_MIP_NUMERICAL_FAILURE, "Node objective comparison overflow");
             global_bound(&s, node);
             lab_lp_result_free(&lp);
             release(node);
@@ -1349,7 +1407,7 @@ node_lp_ready:
         size_t variable = SIZE_MAX;
         LabSearchChoice selection = branch_variable(&s, lp.primal, 1e-7, &variable);
         if (selection < 0) {
-            outcome(&s, selection == LAB_SEARCH_UNSUPPORTED ? "unsupported" : "numerical_failure",
+            outcome(&s, selection == LAB_SEARCH_UNSUPPORTED ? LAB_MIP_UNSUPPORTED : LAB_MIP_NUMERICAL_FAILURE,
                     "Cannot select a progressing integer branch");
             global_bound(&s, node);
             lab_lp_result_free(&lp);
@@ -1373,7 +1431,7 @@ node_lp_ready:
              * infeasibility. Branch on any remaining exact fraction or stop. */
             selection = branch_variable(&s, lp.primal, 0, &variable);
             if (selection != LAB_SEARCH_CHOSEN) {
-                outcome(&s, selection == LAB_SEARCH_UNSUPPORTED ? "unsupported" : "numerical_failure",
+                outcome(&s, selection == LAB_SEARCH_UNSUPPORTED ? LAB_MIP_UNSUPPORTED : LAB_MIP_NUMERICAL_FAILURE,
                         "Integral node failed fixed-integer repair");
                 global_bound(&s, node);
                 lab_lp_result_free(&lp);
@@ -1391,14 +1449,39 @@ node_lp_ready:
         release(node);
     }
     if (result->has_primal) {
-        outcome(&s, "optimal",
-                "Numerical branch-and-bound tree exhausted; no independent tree proof");
-        result->has_bound = 1;
-        result->best_bound = result->objective;
+        close_at_incumbent(&s, "native", LAB_CLOSE_EXHAUSTED, LAB_BOUND_EXHAUSTION,
+                           "Numerical branch-and-bound tree exhausted; no independent tree proof");
     } else {
-        outcome(&s, "infeasible", "Numerical branch-and-bound tree exhausted without an incumbent");
+        publish(&s, (LabSearchResult){.route = "native", .status = LAB_MIP_INFEASIBLE, .closure = LAB_CLOSE_EXHAUSTED},
+                "Numerical branch-and-bound tree exhausted without an incumbent");
     }
 cleanup:
+    if (s.frontier.origin && result->search.route && !strcmp(result->search.route, "native") &&
+        result->search.status != LAB_MIP_OPTIMAL && result->search.status != LAB_MIP_INFEASIBLE) {
+        LabSearchResult stopped = result->search;
+        stopped.bound = s.frontier;
+        /* The stop reason can be set before the frontier is evaluated. */
+        publish(&s, stopped, NULL);
+    }
+    if (!options->lp.no_exact && !result->has_primal && s.repair_lower &&
+        (!strcmp(result->status, "infeasible") || !strcmp(result->status, "numerical_failure"))) {
+        double objective;
+        int recovered = lab_recover_square_equalities(model, s.repair_lower, &objective,
+                                                      s.started + options->time_limit);
+        if (recovered > 0) {
+            free(result->primal);
+            result->primal = s.repair_lower;
+            s.repair_lower = NULL;
+            result->has_primal = 1;
+            result->objective = objective;
+            result->exact_primal_recoveries++;
+            close_at_incumbent(&s, "equality_recovery", LAB_CLOSE_UNIQUE_POINT, LAB_BOUND_UNIQUE_POINT,
+                               "Recovered a unique source equality solution and checked its witness");
+            trace(&s, &(Node){0}, "exact_equality_recovery", SIZE_MAX, objective, 1);
+        } else if (recovered < 0) {
+            outcome(&s, LAB_MIP_NUMERICAL_FAILURE, "Exact equality solution is feasible but its witness cannot be exported");
+        }
+    }
     if (s.plunge) {
         release(s.plunge);
         s.plunge = NULL;
@@ -1409,7 +1492,6 @@ cleanup:
 #ifdef LAB_LP_SESSION_API
     lab_lp_session_free(s.session);
 #endif
-    lab_model_free(&s.augmented);
     lab_root_cut_batch_free(&s.cuts);
     lab_search_free(&s.branching);
     if (s.trace) {
@@ -1417,7 +1499,7 @@ cleanup:
         if (fclose(s.trace))
             failed = 1;
         if (failed)
-            outcome(&s, "input_error", "Cannot write search trace");
+            outcome(&s, LAB_MIP_INPUT_ERROR, "Cannot write search trace");
     }
     free(s.base_lower);
     free(s.base_upper);

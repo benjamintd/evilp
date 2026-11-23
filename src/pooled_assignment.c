@@ -427,15 +427,16 @@ static void explore_network(Network *s) {
     explore_network(s);
     s->lower[branch] = lo;
 }
-int lab_pooled_assignment(const LabModel *m, double deadline, size_t node_limit,
+LabSearchResult lab_pooled_assignment(const LabModel *m, double deadline, size_t node_limit,
                           size_t iteration_limit, double *point, LabPooledStats *stats) {
+    LabSearchResult result = {.route = "pooled_assignment"};
     if (!stats)
-        return 0;
+        return result;
     *stats = (LabPooledStats){0};
     if (!m || !m->integer || !m->rows || !m->cols || m->rows > 8192 ||
         m->cols > MAX_EDGES + MAX_SITES || m->nnz != 2 * m->cols || !point || !node_limit ||
         !iteration_limit || !isfinite(deadline) || deadline <= lab_now())
-        return 0;
+        return result;
     Problem p = {.m = m, .deadline = deadline};
     Network s = {.p = &p,
                  .deadline = deadline,
@@ -444,13 +445,16 @@ int lab_pooled_assignment(const LabModel *m, double deadline, size_t node_limit,
                  .iteration_limit = iteration_limit};
     mpq_t q;
     mpq_init(q);
-    int result = 0;
     if (extract(&p, q) && build_network(&s)) {
         explore_network(&s);
         if (s.incumbent != INT64_MAX) {
             for (size_t j = 0; j < m->cols; j++)
                 point[j] = s.best[j];
-            result = s.stopped || lab_now() >= deadline ? 1 : 2;
+            result.point = point;
+            if (!s.stopped && lab_now() < deadline) {
+                result.status = LAB_MIP_OPTIMAL;
+                result.closure = LAB_CLOSE_EXHAUSTED;
+            }
         }
     }
     stats->nodes = s.nodes;

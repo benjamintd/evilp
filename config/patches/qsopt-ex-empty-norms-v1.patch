@@ -1,0 +1,15 @@
+--- a/qsopt_ex/price.c
++++ b/qsopt_ex/price.c
+@@ -1561,6 +1561,12 @@
+ 
+ 	for (j = 0; j < nelems; j++)
+ 	{
++		/* An empty projected row/column has squared edge norm one. */
++		if (matcnt[j] == 0)
++		{
++			EGLPNUM_TYPENAME_EGlpNumOne (norms[j]);
++			continue;
++		}
+ 		a.nzcnt = matcnt[j];
+ 		a.indx = &(matind[matbeg[j]]);
+ 		a.coef = &(matval[matbeg[j]]);

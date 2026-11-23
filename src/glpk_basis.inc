@@ -132,7 +132,7 @@ static int accept_simplex_proposal(Work *w, glp_prob *p, const size_t *source_ro
     }
     double obj, residual;
     int available = 0;
-    if (lab_exact_evaluate(m, x, &obj, &residual) || residual > 1e-7 ||
+    if (lab_exact_evaluate(m, x, &obj, &residual) || residual > w->options->primal_tolerance ||
         source_support_interval_gap(w, x, y, deadline, &available) || available != 1 ||
         lab_now() >= deadline) {
         free(x);
