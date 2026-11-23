@@ -1,0 +1,11 @@
+--- a/src/scip/cons_logicor.c
++++ b/src/scip/cons_logicor.c
+@@ -3284,7 +3284,7 @@
+    SCIP_CALL( SCIPallocBufferArray(scip, &boundtypes, nbinprobvars) );
+    SCIP_CALL( SCIPallocCleanBufferArray(scip, &redundants, nbinprobvars) );
+ 
+-   for( c = nconss - 1; c >= 0; --c )
++   for( c = nconss - 1; c >= 0 && !SCIPisStopped(scip); --c )
+    {
+       SCIP_Bool redundant = FALSE;
+       SCIP_CONS* cons = conss[c];

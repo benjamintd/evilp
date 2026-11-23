@@ -1,1 +1,1 @@
-config/scip-integer-v27-activity-v2.lock.json
+config/scip-integer-v31-logicor-stop.lock.json
