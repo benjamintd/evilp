@@ -2458,7 +2458,7 @@ LabSearchResult lab_binary_sat(const LabModel *m, const double *lo, const double
         break;
     }
     r.point = point;
-    if (lab_source_objective_value(m, point, &r.bound.value)) {
+    if (lab_source_closing_bound(m, point, &r.bound.value)) {
         r.bound = (LabSearchBound){0};
         return r;
     }

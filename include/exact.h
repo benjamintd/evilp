@@ -86,6 +86,9 @@ void lab_source_objective_free(LabSourceObjective *source);
 int lab_source_exact_objective(const LabModel *, size_t column, mpq_t out);
 int lab_source_exact_offset(const LabModel *, mpq_t out);
 int lab_source_objective_value(const LabModel *, const double *, double *out);
+/* Conservative in the model sense, including the public %.17g spelling.
+ * Only use after a search has established that the point closes its bound. */
+int lab_source_closing_bound(const LabModel *, const double *point, double *out);
 int lab_source_objective_difference(const LabModel *, const double *, const double *, double *out);
 /* Conservative: source cost differs from, or cannot be verified equal to, its
  * binary representative. Offset is excluded from reduced-cost decisions. */

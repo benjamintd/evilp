@@ -11,6 +11,7 @@ import sys
 import tempfile
 import unittest
 
+from test_lp_solver import decimal
 from test_mip_solver import integer_mps, mip_oracle
 
 SOLVER, CHECKER = map(lambda p: str(Path(p).resolve()), sys.argv[1:3])
@@ -209,43 +210,69 @@ class BinarySAT(unittest.TestCase):
                 for i in range(n) for j in range(i)]
         data = model([-1] * n, rows)
         optimum = mip_oracle(data)
+        for limit in (2, 4):
+            with self.subTest(limit=limit):
+                record, cli = self.run_in_runner(data, optimum, ['--node-limit', str(limit)])
+                self.assertEqual(record['claimed_status'], cli['status'])
+                for field in ('search_route', 'closure_reason', 'bound_origin'):
+                    self.assertEqual(record[field], cli[field])
+                self.assertTrue(record['checker']['checked_feasible'])
+                self.assertEqual(F(record['checker']['objective']), optimum)
+                self.assertFalse(record['checker']['certifies_optimality'])
+                if limit == 2:
+                    self.assertEqual((cli['status'], cli['search_route'], cli['closure_reason'],
+                                      cli['bound_origin']), ('node_limit', 'native', 'none', 'open_nodes'))
+                    self.assertLess(cli['best_bound'], optimum)
+                else:
+                    self.assertEqual((cli['status'], cli['search_route'], cli['closure_reason'],
+                                      cli['bound_origin']), ('optimal', 'binary_sat', 'matching_bound', 'sat_cutoff_unsat'))
+                    self.assertEqual(cli['best_bound'], optimum)
+
+    def run_in_runner(self, data, optimum, options=()):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            source = root / 'clique.mps'
+            source = root / 'model.mps'
             source.write_text(integer_mps(data))
             digest = hashlib.sha256(source.read_bytes()).hexdigest()
             suite = root / 'suite.tsv'
             suite.write_text('id\tpath\tsha256\treference_status\treference_objective\n'
-                             f'clique\t{source}\t{digest}\t=opt=\t{float(optimum)}\n')
-            for limit in (2, 4):
-                with self.subTest(limit=limit):
-                    wrapper = root / f'solver-{limit}'
-                    wrapper.write_text(f'#!/bin/sh\nexec {shlex.quote(SOLVER)} "$@" --binary-sat --node-limit {limit}\n')
-                    wrapper.chmod(0o755)
-                    sha = hashlib.sha256(wrapper.read_bytes()).hexdigest()
-                    solvers = root / f'solvers-{limit}.tsv'
-                    solvers.write_text('solver\tbinary\tsha256\tversion\n'
-                                       f'lab\t{wrapper}\t{sha}\ttest\n')
-                    out = root / f'runs-{limit}'
-                    subprocess.run([Path(SOLVER).with_name('milpbench'), '--suite', suite,
-                                    '--solvers', solvers, '--checker', CHECKER, '--mip',
-                                    '--out', out, '--limit', '10'], check=True, capture_output=True)
-                    record = json.loads((out / 'runs.jsonl').read_text())
-                    cli = json.loads((out / 'clique/lab/seed-1/solver.log').read_text())
-                    self.assertEqual(record['claimed_status'], cli['status'])
-                    for field in ('search_route', 'closure_reason', 'bound_origin'):
-                        self.assertEqual(record[field], cli[field])
-                    self.assertTrue(record['checker']['checked_feasible'])
+                             f'case\t{source}\t{digest}\t=opt=\t{decimal(optimum)}\n')
+            wrapper = root / 'solver'
+            args = ' '.join(shlex.quote(arg) for arg in options)
+            wrapper.write_text(f'#!/bin/sh\nexec {shlex.quote(SOLVER)} "$@" --binary-sat {args}\n')
+            wrapper.chmod(0o755)
+            sha = hashlib.sha256(wrapper.read_bytes()).hexdigest()
+            solvers = root / 'solvers.tsv'
+            solvers.write_text('solver\tbinary\tsha256\tversion\n'
+                               f'lab\t{wrapper}\t{sha}\ttest\n')
+            out = root / 'runs'
+            subprocess.run([Path(SOLVER).with_name('milpbench'), '--suite', suite,
+                            '--solvers', solvers, '--checker', CHECKER, '--mip',
+                            '--out', out, '--limit', '10'], check=True, capture_output=True)
+            record = json.loads((out / 'runs.jsonl').read_text())
+            cli = json.loads((out / 'case/lab/seed-1/solver.log').read_text(), parse_float=F)
+            return record, cli
+
+    def test_closing_bound_encloses_exact_witness_after_serialization(self):
+        for maximize in (False, True):
+            for optimum in (F(21, 10), F(-21, 10), F(2**53 + 1), F(-2**53 - 1), F(25, 8)):
+                data = model([1] * 5, [([1] * 5, 2, 2)], maximize=maximize)
+                data['offset'] = optimum - 2
+                with self.subTest(maximize=maximize, optimum=optimum):
+                    record, cli = self.run_in_runner(data, optimum)
+                    self.assertEqual((cli['status'], cli['bound_origin']), ('optimal', 'source_equalities'))
                     self.assertEqual(F(record['checker']['objective']), optimum)
+                    self.assertTrue(record['checker']['checked_feasible'])
                     self.assertFalse(record['checker']['certifies_optimality'])
-                    if limit == 2:
-                        self.assertEqual((cli['status'], cli['search_route'], cli['closure_reason'],
-                                          cli['bound_origin']), ('node_limit', 'native', 'none', 'open_nodes'))
-                        self.assertLess(cli['best_bound'], optimum)
-                    else:
-                        self.assertEqual((cli['status'], cli['search_route'], cli['closure_reason'],
-                                          cli['bound_origin']), ('optimal', 'binary_sat', 'matching_bound', 'sat_cutoff_unsat'))
-                        self.assertEqual(cli['best_bound'], optimum)
+                    bound = F(record['reported_dual_bound'])
+                    self.assertEqual(bound, cli['best_bound'])
+                    for published in (bound, F.from_float(float(bound))):
+                        if maximize:
+                            self.assertGreaterEqual(published, optimum)
+                        else:
+                            self.assertLessEqual(published, optimum)
+                    if optimum == F(25, 8):
+                        self.assertEqual(bound, optimum)
 
     def test_short_budget(self):
         n = 7

@@ -664,9 +664,36 @@ int lab_source_objective_needs_exact(const LabModel *m) {
     }
     mpq_clears(q,d,NULL);return needed;
 }
-static int source_scalar(const LabModel *m,const double *left,const double *right,double *out) {
+/* A global bound must enclose the source objective both as a double and
+ * as the decimal number emitted by the CLI and retained by the runner. */
+static int objective_bound_double(mpq_srcptr exact, int maximize, double *out) {
+    double value;
+    if (rational_double(exact, &value, 0))
+        return -1;
+    char text[64];
+    snprintf(text, sizeof text, "%.17g", value);
+    mpq_t serialized, binary;
+    mpq_inits(serialized, binary, NULL);
+    mpq_set_d(binary, value);
+    int bad = lab_exact_decimal(serialized, text);
+    if (!bad) {
+        int bin = mpq_cmp(binary, exact);
+        int dec = mpq_cmp(serialized, exact);
+        if (maximize ? (bin < 0 || dec < 0) : (bin > 0 || dec > 0))
+            value = nextafter(value, maximize ? INFINITY : -INFINITY);
+        bad = !isfinite(value);
+    }
+    mpq_clears(serialized, binary, NULL);
+    if (bad)
+        return -1;
+    *out = value;
+    return 0;
+}
+
+static int source_scalar(const LabModel *m,const double *left,const double *right,double *out,
+                         int closing_bound) {
     if(!m||!out||(m->cols&&!left))return -1;
-    int fast=!lab_source_objective_needs_exact(m);
+    int fast=!closing_bound && !lab_source_objective_needs_exact(m);
     if(fast&&!right) {
         mpq_t q,d;mpq_inits(q,d,NULL);
         if(lab_source_exact_offset(m,q))fast=0;
@@ -716,12 +743,18 @@ static int source_scalar(const LabModel *m,const double *left,const double *righ
         mpq_mul(term,c,x);mpq_add(total,total,term);
         if(mpz_sizeinbase(mpq_numref(total),2)>16384||mpz_sizeinbase(mpq_denref(total),2)>16384)bad=1;
     }
-    double value=0;if(!bad)bad=rational_double(total,&value,0);
+    double value=0;
+    if (!bad)
+        bad = closing_bound ? objective_bound_double(total, m->maximize, &value)
+                            : rational_double(total, &value, 0);
     mpq_clears(total,c,x,y,term,NULL);if(bad)return -1;*out=value==0?0:value;return 0;
 }
-int lab_source_objective_value(const LabModel *m,const double *x,double *out) {return source_scalar(m,x,NULL,out);}
+int lab_source_objective_value(const LabModel *m,const double *x,double *out) {return source_scalar(m,x,NULL,out,0);}
+int lab_source_closing_bound(const LabModel *m, const double *point, double *out) {
+    return source_scalar(m, point, NULL, out, 1);
+}
 int lab_source_objective_difference(const LabModel *m,const double *x,const double *y,double *out) {
-    if(!y)return -1;return source_scalar(m,x,y,out);
+    if(!y)return -1;return source_scalar(m,x,y,out,0);
 }
 
 /* Evaluate all source enclosures first. Only ambiguous row scalars are rebuilt

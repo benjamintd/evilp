@@ -228,3 +228,9 @@ objective values. The same origin applies when an earlier unsatisfiable cutoff
 raised the bound and a later witness attained it. A limited probe can supply a
 witness. A subsequent route reports its own bound if it establishes one.
 Independent proof status comes from the checker.
+
+SAT closing bounds round outward in the model’s objective sense. The internal
+double and its JSON decimal spelling must both enclose the exact source
+objective. When that objective cannot be represented exactly, an optimal SAT
+claim may therefore have a small positive reported gap against the checked
+rational witness.
