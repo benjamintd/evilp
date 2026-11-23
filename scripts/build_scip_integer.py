@@ -18,6 +18,15 @@ def sha(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def locked_patch(root, name, digest):
+    # Some historical manifests name different contents at the same path.
+    # Resolve those by digest without changing either experiment's lock.
+    for path in (root/name, root/'config/patches/by-sha256'/f'{digest}.patch'):
+        if path.is_file() and sha(path) == digest:
+            return path
+    raise ValueError(f'Unexpected patch digest: {name} (expected {digest})')
+
+
 def unpack(archive, digest, target):
     if sha(archive) != digest:
         raise ValueError(f'Unexpected archive digest: {archive}')
@@ -93,9 +102,7 @@ def main():
     out.mkdir(parents=True, exist_ok=False)
     lock_path = args.lock.resolve()
     config = json.loads(lock_path.read_text())
-    for name, digest in config['patches'].items():
-        if sha(ROOT/name) != digest:
-            raise ValueError(f'Unexpected patch digest: {name}')
+    patches = {name: locked_patch(ROOT, name, digest) for name, digest in config['patches'].items()}
     scip_spec, qs_spec = config['sources']
     scip = unpack(args.scip_archive, scip_spec['sha256'], out/'upstream-scip')
     qs = unpack(args.qsopt_archive, qs_spec['sha256'], out/'upstream-qsopt')
@@ -108,7 +115,7 @@ def main():
         for patch in [base, *overlays.get(spec['name'], [])]:
             if patch not in config['patches']:
                 raise ValueError(f'Overlay missing digest: {patch}')
-            subprocess.run(['patch', '-p1', '-i', ROOT/patch], cwd=tree, check=True)
+            subprocess.run(['patch', '-p1', '-i', patches[patch]], cwd=tree, check=True)
     # The disabled PaPILO and symmetry implementations consist entirely of C.
     for base in ['scip/presol_milp','symmetry/compute_symmetry_none']:
         shutil.copy2(scip/'src'/(base+'.cpp'), scip/'src'/(base+'.c'))

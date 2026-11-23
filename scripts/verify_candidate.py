@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import subprocess
 from xml.etree import ElementTree
+from build_scip_integer import locked_patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -29,6 +30,9 @@ def identity(build):
     record = json.loads(backend.read_text())
     if record['lock_sha256'] != sha(lock):
         raise ValueError('SCIP build does not match the designated candidate lock')
+    source = Path(cache['CMAKE_HOME_DIRECTORY'])
+    for patch, expected in json.loads(lock.read_text())['patches'].items():
+        locked_patch(source, patch, expected)
     libraries = {}
     for key in ('SCIP_C17_LIBRARY', 'QSOPT_C17_LIBRARY', 'GLPK_LIBRARY', 'KISSAT_LIBRARY'):
         path = Path(cache[key]).resolve()

@@ -1,0 +1,1259 @@
+--- a/qsopt_ex/lpdefs.h
++++ b/qsopt_ex/lpdefs.h
+@@ -212,6 +212,19 @@
+ 	int inv_structmap_cap;
+ 	int inv_structmap_valid;
+ 	int sb_fast_start;
++	int sb_row;
++	int sb_col;
++	int sb_clean_lp;
++	int sb_snap_valid;
++	int sb_snap_basisid;
++	int sb_dnorms_valid;
++	const EGLPNUM_TYPE *sb_dnorms_src;
++	EGLPNUM_TYPE sb_dobjval;
++	EGLPNUM_TYPE *sb_dnorms;
++	EGLPNUM_TYPE *sb_pscale;
++	EGLPNUM_TYPENAME_svector wz_buf;
++	EGLPNUM_TYPENAME_svector updz_buf;
++	int wz_cap;
+ 	int *sb_baz;
+ 	int *sb_nbaz;
+ 	int *sb_vindex;
+--- a/qsopt_ex/price.c
++++ b/qsopt_ex/price.c
+@@ -229,8 +229,12 @@
+ 				p_price == QS_PRICE_PSTEEP)
+ 		{
+ 			pinf->p_strategy = COMPLETE_PRICING;
+-			EGLPNUM_TYPENAME_EGlpNumFreeArray (pinf->d_scaleinf);
+-			pinf->d_scaleinf = EGLPNUM_TYPENAME_EGlpNumAllocArray (lp->nnbasic);
++			if (pinf->d_scaleinf == NULL ||
++					__EGlpNumArraySize (pinf->d_scaleinf) < (size_t) lp->nnbasic)
++			{
++				EGLPNUM_TYPENAME_EGlpNumFreeArray (pinf->d_scaleinf);
++				pinf->d_scaleinf = EGLPNUM_TYPENAME_EGlpNumAllocArray (lp->nnbasic);
++			}
+ 		}
+ 		else if (p_price == QS_PRICE_PMULTPARTIAL)
+ 			pinf->p_strategy = MULTI_PART_PRICING;
+@@ -263,8 +267,12 @@
+ 				d_price == QS_PRICE_DDEVEX)
+ 		{
+ 			pinf->d_strategy = COMPLETE_PRICING;
+-			EGLPNUM_TYPENAME_EGlpNumFreeArray (pinf->p_scaleinf);
+-			pinf->p_scaleinf = EGLPNUM_TYPENAME_EGlpNumAllocArray (lp->nrows);
++			if (pinf->p_scaleinf == NULL ||
++					__EGlpNumArraySize (pinf->p_scaleinf) < (size_t) lp->nrows)
++			{
++				EGLPNUM_TYPENAME_EGlpNumFreeArray (pinf->p_scaleinf);
++				pinf->p_scaleinf = EGLPNUM_TYPENAME_EGlpNumAllocArray (lp->nrows);
++			}
+ 		}
+ 		else if (d_price == QS_PRICE_DMULTPARTIAL)
+ 			pinf->d_strategy = MULTI_PART_PRICING;
+--- a/qsopt_ex/qsopt.c
++++ b/qsopt_ex/qsopt.c
+@@ -535,6 +535,8 @@
+ 
+ 	if (ncand == 0)
+ 	{
++		p->lp->sb_snap_valid = 0;
++		p->lp->sb_dnorms_valid = 0;
+ 		if (p->lp->basisid != -1 && p->pricing != 0)
+ 		{
+ 			rval = grab_basis (p);
+@@ -882,6 +884,9 @@
+ 		if(newsense == QS_MAX) EGLPNUM_TYPENAME_ILLsimplex_set_bound(p->lp,(const EGLPNUM_TYPE *)(&(p->lobjlim)), newsense);
+ 		else EGLPNUM_TYPENAME_ILLsimplex_set_bound(p->lp,(const EGLPNUM_TYPE*)(&(p->uobjlim)), newsense);
+ 		p->qslp->objsense = newsense;
++		p->lp->sb_clean_lp = 0;
++		p->lp->sb_snap_valid = 0;
++		p->lp->sb_dnorms_valid = 0;
+ 		free_cache (p);
+ 	}
+ 
+--- a/qsopt_ex/simplex.c
++++ b/qsopt_ex/simplex.c
+@@ -114,6 +114,20 @@
+ 	lp->inv_structmap_cap = 0;
+ 	lp->inv_structmap_valid = 0;
+ 	lp->sb_fast_start = 0;
++	lp->sb_row = -1;
++	lp->sb_col = -1;
++	lp->sb_clean_lp = 0;
++	lp->sb_snap_valid = 0;
++	lp->sb_snap_basisid = -1;
++	lp->sb_dnorms_valid = 0;
++	lp->sb_dnorms_src = 0;
++	EGLPNUM_TYPENAME_EGlpNumInitVar (lp->sb_dobjval);
++	EGLPNUM_TYPENAME_EGlpNumZero (lp->sb_dobjval);
++	lp->sb_dnorms = 0;
++	lp->sb_pscale = 0;
++	EGLPNUM_TYPENAME_ILLsvector_init (&(lp->wz_buf));
++	EGLPNUM_TYPENAME_ILLsvector_init (&(lp->updz_buf));
++	lp->wz_cap = 0;
+ 	lp->sb_baz = 0;
+ 	lp->sb_nbaz = 0;
+ 	lp->sb_vindex = 0;
+@@ -143,6 +157,19 @@
+ 		ILL_IFFREE(lp->sb_nbaz);
+ 		ILL_IFFREE(lp->sb_vindex);
+ 		ILL_IFFREE(lp->sb_vstat);
++		EGLPNUM_TYPENAME_EGlpNumClearVar (lp->sb_dobjval);
++		EGLPNUM_TYPENAME_EGlpNumFreeArray (lp->sb_dnorms);
++		EGLPNUM_TYPENAME_EGlpNumFreeArray (lp->sb_pscale);
++		EGLPNUM_TYPENAME_ILLsvector_free (&(lp->wz_buf));
++		EGLPNUM_TYPENAME_ILLsvector_free (&(lp->updz_buf));
++		lp->wz_cap = 0;
++		lp->sb_row = -1;
++		lp->sb_col = -1;
++		lp->sb_clean_lp = 0;
++		lp->sb_snap_valid = 0;
++		lp->sb_snap_basisid = -1;
++		lp->sb_dnorms_valid = 0;
++		lp->sb_dnorms_src = 0;
+ 		EGLPNUM_TYPENAME_EGlpNumFreeArray (lp->sb_xbz);
+ 		EGLPNUM_TYPENAME_EGlpNumFreeArray (lp->sb_piz);
+ 		EGLPNUM_TYPENAME_EGlpNumFreeArray (lp->sb_dz);
+@@ -232,6 +259,9 @@
+ 	lp->localrows = 0;
+ 	lp->internal_valid = 0;
+ 	lp->inv_structmap_valid = 0;
++	lp->sb_clean_lp = 0;
++	lp->sb_snap_valid = 0;
++	lp->sb_dnorms_valid = 0;
+ 	lp->cap_nrows = 0;
+ 	lp->cap_ncols = 0;
+ 	lp->cap_nnbasic = 0;
+@@ -305,6 +335,9 @@
+ 	}
+ 	lp->internal_valid = 0;
+ 	lp->inv_structmap_valid = 0;
++	lp->sb_clean_lp = 0;
++	lp->sb_snap_valid = 0;
++	lp->sb_dnorms_valid = 0;
+ 	lp->cap_nrows = 0;
+ 	lp->cap_ncols = 0;
+ 	lp->cap_nnbasic = 0;
+@@ -485,6 +518,65 @@
+ 	return 0;
+ }
+ 
++static void sb_set_single_vtype (
++	EGLPNUM_TYPENAME_lpinfo * lp,
++	int j)
++{
++	if (lp->matcnt[j] == 1 && lp->O->rowmap[lp->matind[lp->matbeg[j]]] == j)
++		lp->vclass[j] = CLASS_LOGICAL;
++	else
++		lp->vclass[j] = CLASS_STRUCT;
++	switch ((EGLPNUM_TYPENAME_EGlpNumIsEqqual (lp->uz[j], EGLPNUM_TYPENAME_INFTY) ? 1U : 0U) |
++					(EGLPNUM_TYPENAME_EGlpNumIsEqqual (lp->lz[j], EGLPNUM_TYPENAME_NINFTY) ? 2U : 0U))
++	{
++	case 0:
++		if (EGLPNUM_TYPENAME_EGlpNumIsLess (lp->lz[j], lp->uz[j]))
++			lp->vtype[j] = VBOUNDED;
++		else if (!EGLPNUM_TYPENAME_EGlpNumIsNeqqZero (lp->lz[j]) &&
++						 (lp->vclass[j] == CLASS_LOGICAL))
++			lp->vtype[j] = VARTIFICIAL;
++		else
++			lp->vtype[j] = VFIXED;
++		break;
++	case 3:
++		lp->vtype[j] = VFREE;
++		break;
++	case 1:
++		lp->vtype[j] = VLOWER;
++		break;
++	case 2:
++		lp->vtype[j] = VUPPER;
++		break;
++	}
++}
++
++static void reuse_internal_lpinfo_sb_fast (
++	EGLPNUM_TYPENAME_lpinfo * lp,
++	int col)
++{
++	EGLPNUM_TYPENAME_ILLlpdata *qslp = lp->O;
++
++	init_lp_status_info (&(lp->probstat));
++	init_lp_status_info (&(lp->basisstat));
++	lp->nbchange = 0;
++	lp->ncchange = 0;
++	lp->cperturb_level = 0;
++	lp->bz = qslp->rhs;
++	EGLPNUM_TYPENAME_EGlpNumCopy (lp->lz[col], qslp->lower[col]);
++	EGLPNUM_TYPENAME_EGlpNumCopy (lp->uz[col], qslp->upper[col]);
++	sb_set_single_vtype (lp, col);
++	lp->final_phase = -1;
++	lp->infub_ix = -1;
++	init_simplex_tols (lp);
++	EGLPNUM_TYPENAME_ILLfct_init_counts (lp);
++	lp->pIratio = RATIOTEST_HARRIS;
++	lp->pIIratio = RATIOTEST_HARRIS;
++	lp->dIratio = RATIOTEST_HARRIS;
++	lp->dIIratio = RATIOTEST_HARRIS;
++	lp->starttime = ILLutil_deadline_zeit ();
++	ILLutil_sprand (1, &(lp->rstate));
++}
++
+ static int rebuild_internal_lpinfo_cached (
+ 	EGLPNUM_TYPENAME_lpinfo * lp)
+ {
+@@ -1040,13 +1132,11 @@
+ 	int singular = -1;
+ 	int rval = 0;
+ 	int new_price = -1;
+-	EGLPNUM_TYPENAME_svector wz;
+-	EGLPNUM_TYPENAME_svector updz;
++	EGLPNUM_TYPENAME_svector *wz_ptr = NULL;
++	EGLPNUM_TYPENAME_svector *updz_ptr = NULL;
++	int sb_fast_setup = 0;
+ 	EGLPNUM_TYPENAME_feas_info fi;
+ 	EGLPNUM_TYPENAME_iter_info it;
+-
+-	EGLPNUM_TYPENAME_ILLsvector_init (&wz);
+-	EGLPNUM_TYPENAME_ILLsvector_init (&updz);
+ 
+ 	EGLPNUM_TYPENAME_EGlpNumInitVar (fi.totinfeas);
+ 	EGLPNUM_TYPENAME_EGlpNumInitVar (it.prevobj);
+@@ -1087,12 +1177,31 @@
+ 			lp->lz != 0 && lp->uz != 0 && lp->cz != 0 && lp->iwork != 0 &&
+ 			lp->tol != 0 && lp->cnts != 0)
+ 	{
+-		rval = reuse_internal_lpinfo (lp);
+-		CHECKRVALG (rval, CLEANUP);
++		if (lp->sb_fast_start && lp->sb_clean_lp && B == NULL &&
++				it.algorithm == DUAL_SIMPLEX &&
++				lp->sb_col >= 0 && lp->sb_col < lp->ncols &&
++				lp->bchanges == 0 && lp->cchanges == 0 &&
++				lp->nbchange == 0 && lp->ncchange == 0 &&
++				lp->pIpiz == 0 && lp->pIdz == 0 && lp->pIxbz == 0 &&
++				lp->work.nzcnt == 0 && lp->vclass != 0 && lp->vtype != 0)
++		{
++			reuse_internal_lpinfo_sb_fast (lp, lp->sb_col);
++			sb_fast_setup = 1;
++		}
++		else
++		{
++			rval = reuse_internal_lpinfo (lp);
++			CHECKRVALG (rval, CLEANUP);
++			lp->sb_snap_valid = 0;
++			lp->sb_dnorms_valid = 0;
++		}
+ 	}
+ 	else
+ 	{
+ 		int can_cached_rebuild = 0;
++		lp->sb_clean_lp = 0;
++		lp->sb_snap_valid = 0;
++		lp->sb_dnorms_valid = 0;
+ 		if (lp->O->sinfo == 0 && lp->O->rA == 0 && lp->localrows &&
+ 				lp->lz != 0 && lp->uz != 0 && lp->cz != 0 && lp->iwork != 0 &&
+ 				lp->tol != 0 && lp->cnts != 0 && lp->rowval != 0 &&
+@@ -1127,10 +1236,22 @@
+ 		}
+ 	}
+ 
+-	rval = EGLPNUM_TYPENAME_ILLsvector_alloc (&wz, lp->nrows);
+-	CHECKRVALG (rval, CLEANUP);
+-	rval = EGLPNUM_TYPENAME_ILLsvector_alloc (&updz, lp->nrows);
+-	CHECKRVALG (rval, CLEANUP);
++	if (lp->nrows > lp->wz_cap)
++	{
++		int cap = lp->nrows + (lp->nrows >> 2) + 32;
++		EGLPNUM_TYPENAME_ILLsvector_free (&(lp->wz_buf));
++		EGLPNUM_TYPENAME_ILLsvector_free (&(lp->updz_buf));
++		lp->wz_cap = 0;
++		rval = EGLPNUM_TYPENAME_ILLsvector_alloc (&(lp->wz_buf), cap);
++		CHECKRVALG (rval, CLEANUP);
++		rval = EGLPNUM_TYPENAME_ILLsvector_alloc (&(lp->updz_buf), cap);
++		CHECKRVALG (rval, CLEANUP);
++		lp->wz_cap = cap;
++	}
++	lp->wz_buf.nzcnt = 0;
++	lp->updz_buf.nzcnt = 0;
++	wz_ptr = &(lp->wz_buf);
++	updz_ptr = &(lp->updz_buf);
+ 
+ 	if (it.sdisplay)
+ 	{
+@@ -1148,7 +1269,11 @@
+ 		QSlog("Problem has %d rows and %d cols and %d nonzeros", lp->nrows,
+ 								lp->ncols, nonzero);
+ 	}
+-	EGLPNUM_TYPENAME_ILLfct_set_variable_type (lp);
++	if (!sb_fast_setup)
++	{
++		EGLPNUM_TYPENAME_ILLfct_set_variable_type (lp);
++		lp->sb_clean_lp = lp->internal_valid ? 1 : 0;
++	}
+ 
+ 	if (B != 0)
+ 	{
+@@ -1221,47 +1346,101 @@
+ 		goto TERMINATE;
+ 	}
+ 
+-	if (lp->sb_fast_start && B == NULL && it.resumeid == -1 && it.algorithm == DUAL_SIMPLEX)
+-	{
++	{
++		int sb_fast = (lp->sb_fast_start && B == NULL && it.resumeid == -1 &&
++		               it.algorithm == DUAL_SIMPLEX &&
++		               lp->sb_row >= 0 && lp->sb_row < lp->nrows);
+ 		lp->sb_fast_start = 0;
+-	}
+-	else
+-	{
+-		lp->sb_fast_start = 0;
+-		EGLPNUM_TYPENAME_ILLfct_compute_piz (lp);
+-		EGLPNUM_TYPENAME_ILLfct_compute_dz (lp);
+-		if (it.algorithm == DUAL_SIMPLEX)
+-		{
+-			if (B != NULL || it.resumeid == SIMPLEX_RESUME_UNSHIFT)
+-				EGLPNUM_TYPENAME_ILLfct_dual_adjust (lp, lp->tol->dfeas_tol);
+-			else
+-				EGLPNUM_TYPENAME_ILLfct_dual_adjust (lp, EGLPNUM_TYPENAME_zeroLpNum);
+-		}
+-		EGLPNUM_TYPENAME_ILLfct_compute_xbz (lp);
+-	}
+-
+-	EGLPNUM_TYPENAME_ILLfct_check_pfeasible (lp, &fi, lp->tol->pfeas_tol);
+-	EGLPNUM_TYPENAME_ILLfct_check_dfeasible (lp, &fi, lp->tol->dfeas_tol);
+-	EGLPNUM_TYPENAME_ILLfct_set_status_values (lp, fi.pstatus, fi.dstatus, PHASEII, PHASEII);
+-
+-	if (fi.dstatus == DUAL_FEASIBLE && EGLPNUM_TYPENAME_EGlpNumIsNeqq (lp->objbound, EGLPNUM_TYPENAME_INFTY))
+-	{
+-		EGLPNUM_TYPENAME_ILLfct_compute_dobj (lp);
+-		if (EGLPNUM_TYPENAME_EGlpNumIsLess (lp->objbound, lp->dobjval))
+-		{
+-			it.solstatus = ILL_BND_REACHED;
+-			if (it.sdisplay)
+-				QSlog("solstatus = ILL_BND_REACHED = 5 %lf %lf",
++		if (sb_fast)
++		{
++			int sbr = lp->sb_row;
++			int sbcol = lp->baz[sbr];
++			EGLPNUM_TYPE err1, err2;
++			EGLPNUM_TYPENAME_EGlpNumInitVar (err1);
++			EGLPNUM_TYPENAME_EGlpNumInitVar (err2);
++			fi.dstatus = DUAL_FEASIBLE;
++			fi.pstatus = PRIMAL_FEASIBLE;
++			EGLPNUM_TYPENAME_EGlpNumZero (fi.totinfeas);
++			EGLPNUM_TYPENAME_EGlpNumZero (lp->dinfeas);
++			EGLPNUM_TYPENAME_EGlpNumZero (lp->pinfeas);
++			EGLPNUM_TYPENAME_EGlpNumCopyDiff (err1, lp->xbz[sbr], lp->uz[sbcol]);
++			EGLPNUM_TYPENAME_EGlpNumCopyDiff (err2, lp->lz[sbcol], lp->xbz[sbr]);
++			if (EGLPNUM_TYPENAME_EGlpNumIsLess (lp->tol->pfeas_tol, err1) &&
++					EGLPNUM_TYPENAME_EGlpNumIsNeq (lp->uz[sbcol], EGLPNUM_TYPENAME_INFTY, EGLPNUM_TYPENAME_oneLpNum))
++			{
++				fi.pstatus = PRIMAL_INFEASIBLE;
++				EGLPNUM_TYPENAME_EGlpNumCopy (lp->pinfeas, err1);
++				EGLPNUM_TYPENAME_EGlpNumCopy (fi.totinfeas, err1);
++			}
++			else if (EGLPNUM_TYPENAME_EGlpNumIsLess (lp->tol->pfeas_tol, err2) &&
++					EGLPNUM_TYPENAME_EGlpNumIsNeq (lp->lz[sbcol], EGLPNUM_TYPENAME_NINFTY, EGLPNUM_TYPENAME_oneLpNum))
++			{
++				fi.pstatus = PRIMAL_INFEASIBLE;
++				EGLPNUM_TYPENAME_EGlpNumCopy (lp->pinfeas, err2);
++				EGLPNUM_TYPENAME_EGlpNumCopy (fi.totinfeas, err2);
++			}
++			EGLPNUM_TYPENAME_EGlpNumClearVar (err1);
++			EGLPNUM_TYPENAME_EGlpNumClearVar (err2);
++			EGLPNUM_TYPENAME_ILLfct_set_status_values (lp, fi.pstatus, fi.dstatus, PHASEII, PHASEII);
++			if (EGLPNUM_TYPENAME_EGlpNumIsNeqq (lp->objbound, EGLPNUM_TYPENAME_INFTY))
++			{
++				if (EGLPNUM_TYPENAME_EGlpNumIsLess (lp->objbound, lp->dobjval))
++				{
++					it.solstatus = ILL_BND_REACHED;
++					if (it.sdisplay)
++						QSlog("solstatus = ILL_BND_REACHED = 5 %lf %lf",
+ 									EGLPNUM_TYPENAME_EGlpNumToLf (lp->objbound),
+ 									EGLPNUM_TYPENAME_EGlpNumToLf (lp->dobjval));
+-			goto TERMINATE;
+-		}
+-	}
+-	if (fi.pstatus == PRIMAL_FEASIBLE && fi.dstatus == DUAL_FEASIBLE)
+-	{
+-		it.solstatus = ILL_LP_SOLVED;
+-		EGLPNUM_TYPENAME_ILLfct_compute_pobj (lp);
+-		goto TERMINATE;
++					goto TERMINATE;
++				}
++			}
++			if (fi.pstatus == PRIMAL_FEASIBLE)
++			{
++				it.solstatus = ILL_LP_SOLVED;
++				EGLPNUM_TYPENAME_EGlpNumCopy (lp->pobjval, lp->dobjval);
++				EGLPNUM_TYPENAME_EGlpNumCopy (lp->objval, lp->dobjval);
++				goto TERMINATE;
++			}
++		}
++		else
++		{
++			lp->sb_row = -1;
++			EGLPNUM_TYPENAME_ILLfct_compute_piz (lp);
++			EGLPNUM_TYPENAME_ILLfct_compute_dz (lp);
++			if (it.algorithm == DUAL_SIMPLEX)
++			{
++				if (B != NULL || it.resumeid == SIMPLEX_RESUME_UNSHIFT)
++					EGLPNUM_TYPENAME_ILLfct_dual_adjust (lp, lp->tol->dfeas_tol);
++				else
++					EGLPNUM_TYPENAME_ILLfct_dual_adjust (lp, EGLPNUM_TYPENAME_zeroLpNum);
++			}
++			EGLPNUM_TYPENAME_ILLfct_compute_xbz (lp);
++
++			EGLPNUM_TYPENAME_ILLfct_check_pfeasible (lp, &fi, lp->tol->pfeas_tol);
++			EGLPNUM_TYPENAME_ILLfct_check_dfeasible (lp, &fi, lp->tol->dfeas_tol);
++			EGLPNUM_TYPENAME_ILLfct_set_status_values (lp, fi.pstatus, fi.dstatus, PHASEII, PHASEII);
++
++			if (fi.dstatus == DUAL_FEASIBLE && EGLPNUM_TYPENAME_EGlpNumIsNeqq (lp->objbound, EGLPNUM_TYPENAME_INFTY))
++			{
++				EGLPNUM_TYPENAME_ILLfct_compute_dobj (lp);
++				if (EGLPNUM_TYPENAME_EGlpNumIsLess (lp->objbound, lp->dobjval))
++				{
++					it.solstatus = ILL_BND_REACHED;
++					if (it.sdisplay)
++						QSlog("solstatus = ILL_BND_REACHED = 5 %lf %lf",
++									EGLPNUM_TYPENAME_EGlpNumToLf (lp->objbound),
++									EGLPNUM_TYPENAME_EGlpNumToLf (lp->dobjval));
++					goto TERMINATE;
++				}
++			}
++			if (fi.pstatus == PRIMAL_FEASIBLE && fi.dstatus == DUAL_FEASIBLE)
++			{
++				it.solstatus = ILL_LP_SOLVED;
++				EGLPNUM_TYPENAME_ILLfct_compute_pobj (lp);
++				EGLPNUM_TYPENAME_EGlpNumCopy (lp->dobjval, lp->pobjval);
++				goto TERMINATE;
++			}
++		}
+ 	}
+ 
+ 	if (it.algorithm == PRIMAL_OR_DUAL)
+@@ -1303,29 +1482,33 @@
+ 
+ 		if (phase == PRIMAL_PHASEI)
+ 		{
+-			rval = primal_phaseI_step (lp, pinf, &updz, &wz, &it);
++			rval = primal_phaseI_step (lp, pinf, updz_ptr, wz_ptr, &it);
+ 			CHECKRVALG (rval, CLEANUP);
+ 		}
+ 
+ 		else if (phase == PRIMAL_PHASEII)
+ 		{
+-			rval = primal_phaseII_step (lp, pinf, &updz, &wz, &it);
++			rval = primal_phaseII_step (lp, pinf, updz_ptr, wz_ptr, &it);
+ 			CHECKRVALG (rval, CLEANUP);
+ 		}
+ 
+ 		else if (phase == DUAL_PHASEI)
+ 		{
+-			rval = dual_phaseI_step (lp, pinf, &updz, &wz, &it);
++			rval = dual_phaseI_step (lp, pinf, updz_ptr, wz_ptr, &it);
+ 			CHECKRVALG (rval, CLEANUP);
+ 		}
+ 
+ 		else if (phase == DUAL_PHASEII)
+ 		{
+-			rval = dual_phaseII_step (lp, pinf, &updz, &wz, &it);
++			rval = dual_phaseII_step (lp, pinf, updz_ptr, wz_ptr, &it);
+ 			CHECKRVALG (rval, CLEANUP);
+ 		}
+ 		if (it.nextstep == SIMPLEX_RESUME)
+ 		{
++			lp->sb_clean_lp = 0;
++			lp->sb_snap_valid = 0;
++			lp->sb_dnorms_valid = 0;
++			lp->sb_row = -1;
+ 			//ILL_IFTRACE("\t%s:%s:%d\n",__func__,__FILE__,__LINE__);
+ 			EGLPNUM_TYPENAME_ILLprice_free_pricing_info (pinf);
+ 			if (it.resumeid == SIMPLEX_RESUME_UNSHIFT)
+@@ -1530,8 +1713,16 @@
+ 	}
+ 
+ CLEANUP:
+-	EGLPNUM_TYPENAME_ILLsvector_free (&wz);
+-	EGLPNUM_TYPENAME_ILLsvector_free (&updz);
++	lp->sb_fast_start = 0;
++	lp->sb_row = -1;
++	lp->sb_col = -1;
++	if (rval != 0 || lp->nbchange != 0 || lp->ncchange != 0 ||
++			lp->bchanges != 0 || lp->cchanges != 0 || it.n_restart != 0)
++	{
++		lp->sb_clean_lp = 0;
++		lp->sb_snap_valid = 0;
++		lp->sb_dnorms_valid = 0;
++	}
+ 	EGLPNUM_TYPENAME_EGlpNumClearVar (it.prevobj);
+ 	EGLPNUM_TYPENAME_EGlpNumClearVar (it.objtol);
+ 	EGLPNUM_TYPENAME_EGlpNumClearVar (fi.totinfeas);
+@@ -2723,35 +2914,68 @@
+ 
+ 	if (it->newphase != 0)
+ 	{
+-		EGLPNUM_TYPENAME_ILLfct_compute_dobj (lp);
+-		if (it->newphase == SIMPLEX_PHASE_NEW)
++		if (it->newphase == SIMPLEX_PHASE_NEW && lp->sb_row >= 0 && lp->sb_row < lp->nrows &&
++				pinf->d_strategy == COMPLETE_PRICING)
+ 		{
+ 			it->noprog = 0;
+ 			if (it->sdisplay)
+ 			{
+ 				QSlog("starting dual phase II, nosolve %d", it->nosolve);
+ 			}
+-		}
+-		it->newphase = 0;
+-		it->nosolve = 0;
+-		EGLPNUM_TYPENAME_EGlpNumCopy (it->prevobj, lp->dobjval);
+-		EGLPNUM_TYPENAME_ILLfct_compute_xbz (lp);
+-
+-		if (pinf->d_strategy == COMPLETE_PRICING)
+-		{
++			it->newphase = 0;
++			it->nosolve = 0;
++			EGLPNUM_TYPENAME_EGlpNumCopy (it->prevobj, lp->dobjval);
+ #if USEHEAP > 0
+ 			EGLPNUM_TYPENAME_ILLprice_free_heap (pinf);
++			pinf->hineff = 0;
+ #endif
+-			EGLPNUM_TYPENAME_ILLprice_compute_primal_inf (lp, pinf, NULL, 0, DUAL_PHASEII);
++			{
++#define EGLPNUM_TYPENAME_SB_IS_PREC
++#ifdef dbl_SB_IS_PREC
++				if (lp->nrows > 0)
++					memset (pinf->p_scaleinf, 0, (size_t) lp->nrows * sizeof (double));
++#else
++				int zi;
++				for (zi = 0; zi < lp->nrows; zi++)
++					EGLPNUM_TYPENAME_EGlpNumZero (pinf->p_scaleinf[zi]);
++#endif
++#undef EGLPNUM_TYPENAME_SB_IS_PREC
++			}
++			EGLPNUM_TYPENAME_ILLprice_compute_primal_inf (lp, pinf, &(lp->sb_row), 1, DUAL_PHASEII);
++		}
++		else
++		{
++			lp->sb_row = -1;
++			EGLPNUM_TYPENAME_ILLfct_compute_dobj (lp);
++			if (it->newphase == SIMPLEX_PHASE_NEW)
++			{
++				it->noprog = 0;
++				if (it->sdisplay)
++				{
++					QSlog("starting dual phase II, nosolve %d", it->nosolve);
++				}
++			}
++			it->newphase = 0;
++			it->nosolve = 0;
++			EGLPNUM_TYPENAME_EGlpNumCopy (it->prevobj, lp->dobjval);
++			EGLPNUM_TYPENAME_ILLfct_compute_xbz (lp);
++
++			if (pinf->d_strategy == COMPLETE_PRICING)
++			{
+ #if USEHEAP > 0
+-			rval = EGLPNUM_TYPENAME_ILLprice_test_for_heap (lp, pinf, lp->nrows, pinf->p_scaleinf,
+-																		 DUAL_SIMPLEX, 0);
+-			CHECKRVALG (rval, CLEANUP);
++				EGLPNUM_TYPENAME_ILLprice_free_heap (pinf);
+ #endif
+-		}
+-		else if (pinf->d_strategy == MULTI_PART_PRICING)
+-		{
+-			EGLPNUM_TYPENAME_ILLprice_init_mpartial_price (lp, pinf, cphase, ROW_PRICING);
++				EGLPNUM_TYPENAME_ILLprice_compute_primal_inf (lp, pinf, NULL, 0, DUAL_PHASEII);
++#if USEHEAP > 0
++				rval = EGLPNUM_TYPENAME_ILLprice_test_for_heap (lp, pinf, lp->nrows, pinf->p_scaleinf,
++																			 DUAL_SIMPLEX, 0);
++				CHECKRVALG (rval, CLEANUP);
++#endif
++			}
++			else if (pinf->d_strategy == MULTI_PART_PRICING)
++			{
++				EGLPNUM_TYPENAME_ILLprice_init_mpartial_price (lp, pinf, cphase, ROW_PRICING);
++			}
+ 		}
+ 	}
+ 
+@@ -2760,7 +2984,26 @@
+ 			it->newphase != 0)
+ 		ILL_CLEANUP;
+ 
+-	EGLPNUM_TYPENAME_ILLprice_dual (lp, pinf, cphase, &pr);
++	if (lp->sb_row >= 0 && lp->sb_row < lp->nrows &&
++			pinf->d_strategy == COMPLETE_PRICING &&
++			EGLPNUM_TYPENAME_EGlpNumIsGreatZero (pinf->p_scaleinf[lp->sb_row]))
++	{
++		int sbr = lp->sb_row;
++		int sbcol = lp->baz[sbr];
++		lp->sb_row = -1;
++		pr.lindex = sbr;
++		pr.price_stat = NONOPTIMAL;
++		if (EGLPNUM_TYPENAME_EGlpNumIsNeqq (lp->uz[sbcol], EGLPNUM_TYPENAME_INFTY) &&
++				EGLPNUM_TYPENAME_EGlpNumIsSumLess (lp->tol->pfeas_tol, lp->uz[sbcol], lp->xbz[sbr]))
++			pr.lvstat = STAT_UPPER;
++		else
++			pr.lvstat = STAT_LOWER;
++	}
++	else
++	{
++		lp->sb_row = -1;
++		EGLPNUM_TYPENAME_ILLprice_dual (lp, pinf, cphase, &pr);
++	}
+ 
+ 	if (pr.price_stat == PRICE_OPTIMAL)
+ 	{
+--- a/qsopt_ex/lib.c
++++ b/qsopt_ex/lib.c
+@@ -724,6 +724,9 @@
+ 		ILL_IFFREE(lp->O->sinfo);
+ 	}
+ 
++	lp->sb_clean_lp = 0;
++	lp->sb_snap_valid = 0;
++	lp->sb_dnorms_valid = 0;
+ 	col = lp->O->structmap[indx];
+ 
+ 	switch (lu)
+@@ -1071,6 +1074,218 @@
+ 		EGLPNUM_TYPENAME_EGlpNumFreeArray (myx);
+ 	EGLPNUM_TYPENAME_EGlpNumClearVar (lpinf.htrigger);
+ 	EG_RETURN (rval);
++}
++
++static void sb_copy_num_array (
++	EGLPNUM_TYPE * dst,
++	const EGLPNUM_TYPE * src,
++	int n)
++{
++	if (n <= 0)
++		return;
++#define EGLPNUM_TYPENAME_SB_IS_PREC
++#ifdef dbl_SB_IS_PREC
++	memcpy (dst, src, (size_t) n * sizeof (double));
++#else
++	{
++		int j;
++		for (j = 0; j < n; j++)
++			EGLPNUM_TYPENAME_EGlpNumCopy (dst[j], src[j]);
++	}
++#endif
++#undef EGLPNUM_TYPENAME_SB_IS_PREC
++}
++
++static void sb_load_clamped_norms (
++	EGLPNUM_TYPE * dst,
++	const EGLPNUM_TYPE * src,
++	int nr)
++{
++	int j;
++	sb_copy_num_array (dst, src, nr);
++	for (j = 0; j < nr; j++)
++	{
++		if (EGLPNUM_TYPENAME_EGlpNumIsLess (dst[j], EGLPNUM_TYPENAME_PARAM_MIN_DNORM))
++			EGLPNUM_TYPENAME_EGlpNumCopy (dst[j], EGLPNUM_TYPENAME_PARAM_MIN_DNORM);
++	}
++}
++
++static void sb_update_col_vtype (
++	EGLPNUM_TYPENAME_lpinfo * lp,
++	int j)
++{
++	if (lp->matcnt[j] == 1 && lp->O->rowmap[lp->matind[lp->matbeg[j]]] == j)
++		lp->vclass[j] = CLASS_LOGICAL;
++	else
++		lp->vclass[j] = CLASS_STRUCT;
++	switch ((EGLPNUM_TYPENAME_EGlpNumIsEqqual (lp->uz[j], EGLPNUM_TYPENAME_INFTY) ? 1U : 0U) |
++					(EGLPNUM_TYPENAME_EGlpNumIsEqqual (lp->lz[j], EGLPNUM_TYPENAME_NINFTY) ? 2U : 0U))
++	{
++	case 0:
++		if (EGLPNUM_TYPENAME_EGlpNumIsLess (lp->lz[j], lp->uz[j]))
++			lp->vtype[j] = VBOUNDED;
++		else if (!EGLPNUM_TYPENAME_EGlpNumIsNeqqZero (lp->lz[j]) &&
++						 (lp->vclass[j] == CLASS_LOGICAL))
++			lp->vtype[j] = VARTIFICIAL;
++		else
++			lp->vtype[j] = VFIXED;
++		break;
++	case 3:
++		lp->vtype[j] = VFREE;
++		break;
++	case 1:
++		lp->vtype[j] = VLOWER;
++		break;
++	case 2:
++		lp->vtype[j] = VUPPER;
++		break;
++	}
++}
++
++static int sb_chgbnd_preserve (
++	EGLPNUM_TYPENAME_lpinfo * lp,
++	int k,
++	int col_internal,
++	int lu,
++	const EGLPNUM_TYPE bnd)
++{
++	int saved_clean = lp->sb_clean_lp;
++	int saved_snap = lp->sb_snap_valid;
++	int saved_dnorms = lp->sb_dnorms_valid;
++	int rval = EGLPNUM_TYPENAME_ILLlib_chgbnd (lp, k, lu, bnd);
++	if (rval == 0)
++	{
++		lp->sb_clean_lp = saved_clean;
++		lp->sb_snap_valid = saved_snap;
++		lp->sb_dnorms_valid = saved_dnorms;
++		if (saved_clean && lp->lz != 0 && lp->uz != 0 && lp->vclass != 0 && lp->vtype != 0)
++		{
++			if (lu == 'U')
++				EGLPNUM_TYPENAME_EGlpNumCopy (lp->uz[col_internal], bnd);
++			else if (lu == 'L')
++				EGLPNUM_TYPENAME_EGlpNumCopy (lp->lz[col_internal], bnd);
++			sb_update_col_vtype (lp, col_internal);
++		}
++	}
++	return rval;
++}
++
++static int sb_run_branch (
++	EGLPNUM_TYPENAME_lpinfo * lp,
++	EGLPNUM_TYPENAME_ILLlp_basis * B,
++	EGLPNUM_TYPENAME_price_info * lpinf,
++	int nr,
++	int nc,
++	int nnb,
++	int col_internal,
++	int *base_ready,
++	int snap_saved,
++	int *snap_sol_ok,
++	int *snap_basisid,
++	int *status,
++	itcnt_t *itcnt)
++{
++	int rval = 0;
++	EGLPNUM_TYPENAME_ILLlp_basis *useB;
++	int used_fast_start = 0;
++
++	if (!(*base_ready) && B != 0 && snap_saved && lp->internal_valid &&
++		lp->nrows == nr && lp->ncols == nc && lp->nnbasic == nnb &&
++		lp->matbeg == lp->O->A.matbeg && lp->matcnt == lp->O->A.matcnt &&
++		lp->matind == lp->O->A.matind && lp->matval == lp->O->A.matval)
++	{
++		int singular = 0;
++		if (EGLPNUM_TYPENAME_ILLbasis_load (lp, B) == 0 &&
++			EGLPNUM_TYPENAME_ILLbasis_factor (lp, &singular) == 0 && !singular)
++		{
++			lp->fbasisid = lp->basisid;
++			*snap_basisid = lp->basisid;
++			memcpy (lp->sb_baz, lp->baz, (size_t) nr * sizeof (int));
++			if (nnb > 0)
++				memcpy (lp->sb_nbaz, lp->nbaz, (size_t) nnb * sizeof (int));
++			memcpy (lp->sb_vindex, lp->vindex, (size_t) nc * sizeof (int));
++			memcpy (lp->sb_vstat, lp->vstat, (size_t) nc * sizeof (int));
++			if (B->rownorms && lpinf->dsinfo.norms)
++			{
++				sb_load_clamped_norms (lpinf->dsinfo.norms, B->rownorms, nr);
++				lp->sb_dnorms_valid = 1;
++				lp->sb_dnorms_src = B->rownorms;
++			}
++			*snap_sol_ok = 0;
++			lp->sb_snap_valid = 0;
++			*base_ready = 1;
++		}
++	}
++	useB = (*base_ready) ? 0 : B;
++	if (*base_ready && snap_saved && lp->f != 0)
++	{
++		lp->f->pf_mode = 1;
++		lp->f->pf_cnt = 0;
++		lp->f->pf_freebeg = 0;
++		if (*snap_sol_ok && lp->vstat[col_internal] == STAT_BASIC)
++		{
++			lp->sb_fast_start = 1;
++			lp->sb_row = lp->vindex[col_internal];
++			lp->sb_col = col_internal;
++			EGLPNUM_TYPENAME_EGlpNumCopy (lp->dobjval, lp->sb_dobjval);
++			EGLPNUM_TYPENAME_EGlpNumCopy (lp->objval, lp->sb_dobjval);
++			used_fast_start = 1;
++		}
++		else
++		{
++			lp->sb_fast_start = 0;
++			lp->sb_row = -1;
++			lp->sb_col = -1;
++		}
++	}
++	rval = EGLPNUM_TYPENAME_ILLlib_optimize (lp, useB, lpinf, DUAL_SIMPLEX, status, 0, itcnt);
++	lp->sb_fast_start = 0;
++	lp->sb_row = -1;
++	lp->sb_col = -1;
++	if (useB == 0 && snap_saved && lp->f != 0 && lp->f->pf_mode == 1)
++	{
++		int pivoted = (lp->f->pf_cnt != 0 || lp->basisid != *snap_basisid ||
++		               !used_fast_start || lp->nbchange != 0 || lp->ncchange != 0);
++		lp->f->pf_cnt = 0;
++		lp->f->pf_freebeg = 0;
++		lp->f->pf_mode = 0;
++		if (pivoted)
++		{
++			memcpy (lp->baz, lp->sb_baz, (size_t) nr * sizeof (int));
++			if (nnb > 0)
++				memcpy (lp->nbaz, lp->sb_nbaz, (size_t) nnb * sizeof (int));
++			memcpy (lp->vindex, lp->sb_vindex, (size_t) nc * sizeof (int));
++			memcpy (lp->vstat, lp->sb_vstat, (size_t) nc * sizeof (int));
++			lp->basisid = *snap_basisid;
++			lp->fbasisid = *snap_basisid;
++			if (*snap_sol_ok)
++			{
++				sb_copy_num_array (lp->xbz, lp->sb_xbz, nr);
++				sb_copy_num_array (lp->piz, lp->sb_piz, nr);
++				sb_copy_num_array (lp->dz, lp->sb_dz, nnb);
++			}
++			if (B->rownorms && lpinf->dsinfo.norms)
++			{
++				sb_load_clamped_norms (lpinf->dsinfo.norms, B->rownorms, nr);
++				lp->sb_dnorms_valid = 1;
++				lp->sb_dnorms_src = B->rownorms;
++			}
++		}
++		*base_ready = 1;
++	}
++	else
++	{
++		if (lp->f != 0)
++		{
++			lp->f->pf_mode = 0;
++			lp->f->pf_cnt = 0;
++			lp->f->pf_freebeg = 0;
++		}
++		lp->sb_snap_valid = 0;
++		lp->sb_dnorms_valid = 0;
++		*base_ready = 0;
++	}
++	return rval;
+ }
+ 
+ int EGLPNUM_TYPENAME_ILLlib_strongbranch_cached (
+@@ -1133,68 +1348,126 @@
+ 			base_ready = 1;
+ 		}
+ 	}
++
++	/* Transfer reusable p_scaleinf and dsteep norms into lpinf (zero per-call malloc). */
++	if (lp->sb_pscale != 0 && __EGlpNumArraySize (lp->sb_pscale) >= (size_t) nr)
++	{
++		lpinf.p_scaleinf = lp->sb_pscale;
++		lp->sb_pscale = 0;
++	}
+ 	if (base_ready && B->rownorms)
+ 	{
+-		rval = EGLPNUM_TYPENAME_ILLprice_load_rownorms (lp, B->rownorms, &lpinf);
+-		CHECKRVALG (rval, CLEANUP);
+-	}
++		if (lp->sb_dnorms != 0 && __EGlpNumArraySize (lp->sb_dnorms) >= (size_t) nr)
++		{
++			lpinf.dsinfo.norms = lp->sb_dnorms;
++			lp->sb_dnorms = 0;
++			if (!(from_fresh && lp->sb_dnorms_valid && lp->sb_dnorms_src == B->rownorms))
++			{
++				sb_load_clamped_norms (lpinf.dsinfo.norms, B->rownorms, nr);
++				lp->sb_dnorms_valid = 1;
++				lp->sb_dnorms_src = B->rownorms;
++			}
++		}
++		else
++		{
++			rval = EGLPNUM_TYPENAME_ILLprice_load_rownorms (lp, B->rownorms, &lpinf);
++			CHECKRVALG (rval, CLEANUP);
++			lp->sb_dnorms_valid = 1;
++			lp->sb_dnorms_src = B->rownorms;
++		}
++	}
++
+ 	if (base_ready && nr > 0 && nc > 0 && nnb >= 0)
+ 	{
+-		if (nr > lp->sb_cap_r)
+-		{
+-			int cap = nr + (nr >> 2) + 32;
+-			ILL_IFFREE(lp->sb_baz);
+-			EGLPNUM_TYPENAME_EGlpNumFreeArray (lp->sb_xbz);
+-			EGLPNUM_TYPENAME_EGlpNumFreeArray (lp->sb_piz);
+-			lp->sb_cap_r = 0;
+-			ILL_SAFE_MALLOC (lp->sb_baz, cap, int);
+-			lp->sb_xbz = EGLPNUM_TYPENAME_EGlpNumAllocArray (cap);
+-			lp->sb_piz = EGLPNUM_TYPENAME_EGlpNumAllocArray (cap);
+-			lp->sb_cap_r = cap;
+-		}
+-		if (nc > lp->sb_cap_c)
+-		{
+-			int cap = nc + (nc >> 2) + 32;
+-			ILL_IFFREE(lp->sb_vindex);
+-			ILL_IFFREE(lp->sb_vstat);
+-			lp->sb_cap_c = 0;
+-			ILL_SAFE_MALLOC (lp->sb_vindex, cap, int);
+-			ILL_SAFE_MALLOC (lp->sb_vstat, cap, int);
+-			lp->sb_cap_c = cap;
+-		}
+-		if (nnb > lp->sb_cap_nb)
+-		{
+-			int cap = nnb + (nnb >> 2) + 32;
+-			ILL_IFFREE(lp->sb_nbaz);
+-			EGLPNUM_TYPENAME_EGlpNumFreeArray (lp->sb_dz);
+-			lp->sb_cap_nb = 0;
+-			ILL_SAFE_MALLOC (lp->sb_nbaz, cap, int);
+-			lp->sb_dz = EGLPNUM_TYPENAME_EGlpNumAllocArray (cap);
+-			lp->sb_cap_nb = cap;
+-		}
+-		if (lp->sb_baz && lp->sb_vindex && lp->sb_vstat && (nnb == 0 || lp->sb_nbaz))
+-		{
+-			memcpy (lp->sb_baz, lp->baz, (size_t) nr * sizeof (int));
+-			if (nnb > 0)
+-				memcpy (lp->sb_nbaz, lp->nbaz, (size_t) nnb * sizeof (int));
+-			memcpy (lp->sb_vindex, lp->vindex, (size_t) nc * sizeof (int));
+-			memcpy (lp->sb_vstat, lp->vstat, (size_t) nc * sizeof (int));
++		if (from_fresh && lp->sb_snap_valid && lp->sb_snap_basisid == lp->basisid &&
++			lp->sb_clean_lp && nr <= lp->sb_cap_r && nc <= lp->sb_cap_c && nnb <= lp->sb_cap_nb &&
++			lp->sb_baz && lp->sb_vindex && lp->sb_vstat && (nnb == 0 || lp->sb_nbaz) &&
++			lp->basisstat.dual_feasible && lp->basisstat.primal_feasible &&
++			lp->nbchange == 0 && lp->ncchange == 0)
++		{
+ 			snap_basisid = lp->basisid;
+ 			snap_bstat = lp->basisstat;
+ 			snap_saved = 1;
+-			if (from_fresh && lp->internal_valid && lp->xbz && lp->piz && (nnb == 0 || lp->dz) &&
+-				lp->basisstat.dual_feasible && lp->basisstat.primal_feasible &&
+-				lp->nbchange == 0 && lp->ncchange == 0)
+-			{
+-				int j;
+-				for (j = 0; j < nr; j++)
++			snap_sol_ok = 1;
++		}
++		else
++		{
++			lp->sb_snap_valid = 0;
++			if (nr > lp->sb_cap_r)
++			{
++				int cap = nr + (nr >> 2) + 32;
++				ILL_IFFREE(lp->sb_baz);
++				EGLPNUM_TYPENAME_EGlpNumFreeArray (lp->sb_xbz);
++				EGLPNUM_TYPENAME_EGlpNumFreeArray (lp->sb_piz);
++				lp->sb_cap_r = 0;
++				ILL_SAFE_MALLOC (lp->sb_baz, cap, int);
++				lp->sb_xbz = EGLPNUM_TYPENAME_EGlpNumAllocArray (cap);
++				lp->sb_piz = EGLPNUM_TYPENAME_EGlpNumAllocArray (cap);
++				lp->sb_cap_r = cap;
++			}
++			if (nc > lp->sb_cap_c)
++			{
++				int cap = nc + (nc >> 2) + 32;
++				ILL_IFFREE(lp->sb_vindex);
++				ILL_IFFREE(lp->sb_vstat);
++				lp->sb_cap_c = 0;
++				ILL_SAFE_MALLOC (lp->sb_vindex, cap, int);
++				ILL_SAFE_MALLOC (lp->sb_vstat, cap, int);
++				lp->sb_cap_c = cap;
++			}
++			if (nnb > lp->sb_cap_nb)
++			{
++				int cap = nnb + (nnb >> 2) + 32;
++				ILL_IFFREE(lp->sb_nbaz);
++				EGLPNUM_TYPENAME_EGlpNumFreeArray (lp->sb_dz);
++				lp->sb_cap_nb = 0;
++				ILL_SAFE_MALLOC (lp->sb_nbaz, cap, int);
++				lp->sb_dz = EGLPNUM_TYPENAME_EGlpNumAllocArray (cap);
++				lp->sb_cap_nb = cap;
++			}
++			if (lp->sb_baz && lp->sb_vindex && lp->sb_vstat && (nnb == 0 || lp->sb_nbaz))
++			{
++				memcpy (lp->sb_baz, lp->baz, (size_t) nr * sizeof (int));
++				if (nnb > 0)
++					memcpy (lp->sb_nbaz, lp->nbaz, (size_t) nnb * sizeof (int));
++				memcpy (lp->sb_vindex, lp->vindex, (size_t) nc * sizeof (int));
++				memcpy (lp->sb_vstat, lp->vstat, (size_t) nc * sizeof (int));
++				snap_basisid = lp->basisid;
++				snap_bstat = lp->basisstat;
++				snap_saved = 1;
++				if (from_fresh && lp->internal_valid && lp->sb_clean_lp &&
++					lp->xbz && lp->piz && (nnb == 0 || lp->dz) && lp->tol != 0 &&
++					lp->basisstat.dual_feasible && lp->basisstat.primal_feasible &&
++					lp->nbchange == 0 && lp->ncchange == 0)
+ 				{
+-					EGLPNUM_TYPENAME_EGlpNumCopy (lp->sb_xbz[j], lp->xbz[j]);
+-					EGLPNUM_TYPENAME_EGlpNumCopy (lp->sb_piz[j], lp->piz[j]);
++					EGLPNUM_TYPE base_ptol, base_dtol;
++					int tols_ok;
++					EGLPNUM_TYPENAME_EGlpNumInitVar (base_ptol);
++					EGLPNUM_TYPENAME_EGlpNumInitVar (base_dtol);
++					if (lp->custom_pfeas_tol > 0.0)
++						EGLPNUM_TYPENAME_EGlpNumSet (base_ptol, lp->custom_pfeas_tol);
++					else
++						EGLPNUM_TYPENAME_EGlpNumCopy (base_ptol, EGLPNUM_TYPENAME_PFEAS_TOLER);
++					if (lp->custom_dfeas_tol > 0.0)
++						EGLPNUM_TYPENAME_EGlpNumSet (base_dtol, lp->custom_dfeas_tol);
++					else
++						EGLPNUM_TYPENAME_EGlpNumCopy (base_dtol, EGLPNUM_TYPENAME_DFEAS_TOLER);
++					tols_ok = EGLPNUM_TYPENAME_EGlpNumIsLeq (lp->tol->pfeas_tol, base_ptol) &&
++					          EGLPNUM_TYPENAME_EGlpNumIsLeq (lp->tol->dfeas_tol, base_dtol);
++					EGLPNUM_TYPENAME_EGlpNumClearVar (base_ptol);
++					EGLPNUM_TYPENAME_EGlpNumClearVar (base_dtol);
++					if (tols_ok)
++					{
++						sb_copy_num_array (lp->sb_xbz, lp->xbz, nr);
++						sb_copy_num_array (lp->sb_piz, lp->piz, nr);
++						sb_copy_num_array (lp->sb_dz, lp->dz, nnb);
++						EGLPNUM_TYPENAME_ILLfct_compute_dobj (lp);
++						EGLPNUM_TYPENAME_EGlpNumCopy (lp->sb_dobjval, lp->dobjval);
++						snap_sol_ok = 1;
++						lp->sb_snap_valid = 1;
++						lp->sb_snap_basisid = snap_basisid;
++					}
+ 				}
+-				for (j = 0; j < nnb; j++)
+-					EGLPNUM_TYPENAME_EGlpNumCopy (lp->sb_dz[j], lp->dz[j]);
+-				snap_sol_ok = 1;
+ 			}
+ 		}
+ 	}
+@@ -1213,89 +1486,13 @@
+ 		if (EGLPNUM_TYPENAME_EGlpNumIsLessDbl (t, 0.1) && EGLPNUM_TYPENAME_EGlpNumIsGreaDbl (t, -0.1))
+ 			EGLPNUM_TYPENAME_EGlpNumZero (t);
+ 
+-		rval = EGLPNUM_TYPENAME_ILLlib_chgbnd (lp, k, 'U', t);
++		rval = sb_chgbnd_preserve (lp, k, col_internal, 'U', t);
+ 		CHECKRVALG (rval, CLEANUP);
+ 
+-		{
+-			EGLPNUM_TYPENAME_ILLlp_basis *useB;
+-			if (!base_ready && B != 0 && snap_saved && lp->internal_valid &&
+-				lp->nrows == nr && lp->ncols == nc && lp->nnbasic == nnb &&
+-				lp->matbeg == lp->O->A.matbeg && lp->matcnt == lp->O->A.matcnt &&
+-				lp->matind == lp->O->A.matind && lp->matval == lp->O->A.matval)
+-			{
+-				int singular = 0;
+-				if (EGLPNUM_TYPENAME_ILLbasis_load (lp, B) == 0 &&
+-					EGLPNUM_TYPENAME_ILLbasis_factor (lp, &singular) == 0 && !singular)
+-				{
+-					lp->fbasisid = lp->basisid;
+-					snap_basisid = lp->basisid;
+-					memcpy (lp->sb_baz, lp->baz, (size_t) nr * sizeof (int));
+-					if (nnb > 0)
+-						memcpy (lp->sb_nbaz, lp->nbaz, (size_t) nnb * sizeof (int));
+-					memcpy (lp->sb_vindex, lp->vindex, (size_t) nc * sizeof (int));
+-					memcpy (lp->sb_vstat, lp->vstat, (size_t) nc * sizeof (int));
+-					if (B->rownorms && lpinf.dsinfo.norms)
+-					{
+-						int j;
+-						for (j = 0; j < nr; j++)
+-							EGLPNUM_TYPENAME_EGlpNumCopy (lpinf.dsinfo.norms[j], B->rownorms[j]);
+-					}
+-					snap_sol_ok = 0;
+-					base_ready = 1;
+-				}
+-			}
+-			useB = base_ready ? 0 : B;
+-			if (base_ready && snap_saved && lp->f != 0)
+-			{
+-				lp->f->pf_mode = 1;
+-				lp->f->pf_cnt = 0;
+-				lp->f->pf_freebeg = 0;
+-				lp->sb_fast_start = (snap_sol_ok && lp->vstat[col_internal] == STAT_BASIC) ? 1 : 0;
+-			}
+-			rval = EGLPNUM_TYPENAME_ILLlib_optimize (lp, useB, &lpinf, DUAL_SIMPLEX, &status, 0, itcnt);
+-			lp->sb_fast_start = 0;
+-			if (useB == 0 && snap_saved && lp->f != 0 && lp->f->pf_mode == 1)
+-			{
+-				int j;
+-				lp->f->pf_cnt = 0;
+-				lp->f->pf_freebeg = 0;
+-				lp->f->pf_mode = 0;
+-				memcpy (lp->baz, lp->sb_baz, (size_t) nr * sizeof (int));
+-				if (nnb > 0)
+-					memcpy (lp->nbaz, lp->sb_nbaz, (size_t) nnb * sizeof (int));
+-				memcpy (lp->vindex, lp->sb_vindex, (size_t) nc * sizeof (int));
+-				memcpy (lp->vstat, lp->sb_vstat, (size_t) nc * sizeof (int));
+-				lp->basisid = snap_basisid;
+-				lp->fbasisid = snap_basisid;
+-				if (snap_sol_ok)
+-				{
+-					for (j = 0; j < nr; j++)
+-					{
+-						EGLPNUM_TYPENAME_EGlpNumCopy (lp->xbz[j], lp->sb_xbz[j]);
+-						EGLPNUM_TYPENAME_EGlpNumCopy (lp->piz[j], lp->sb_piz[j]);
+-					}
+-					for (j = 0; j < nnb; j++)
+-						EGLPNUM_TYPENAME_EGlpNumCopy (lp->dz[j], lp->sb_dz[j]);
+-				}
+-				if (B->rownorms && lpinf.dsinfo.norms)
+-				{
+-					for (j = 0; j < nr; j++)
+-						EGLPNUM_TYPENAME_EGlpNumCopy (lpinf.dsinfo.norms[j], B->rownorms[j]);
+-				}
+-				base_ready = 1;
+-			}
+-			else
+-			{
+-				if (lp->f != 0)
+-				{
+-					lp->f->pf_mode = 0;
+-					lp->f->pf_cnt = 0;
+-					lp->f->pf_freebeg = 0;
+-				}
+-				base_ready = 0;
+-			}
+-		}
+-		EGLPNUM_TYPENAME_ILLlib_chgbnd (lp, k, 'U', oldbnd);
++		rval = sb_run_branch (lp, B, &lpinf, nr, nc, nnb, col_internal,
++		                      &base_ready, snap_saved, &snap_sol_ok, &snap_basisid,
++		                      &status, itcnt);
++		sb_chgbnd_preserve (lp, k, col_internal, 'U', oldbnd);
+ 		CHECKRVALG (rval, CLEANUP);
+ 
+ 		if (status == QS_LP_INFEASIBLE)
+@@ -1320,89 +1517,13 @@
+ 		EGLPNUM_TYPENAME_EGlpNumCeil (t, xi);
+ 		if (EGLPNUM_TYPENAME_EGlpNumIsLessDbl (t, 1.1) && EGLPNUM_TYPENAME_EGlpNumIsGreaDbl (t, 0.9))
+ 			EGLPNUM_TYPENAME_EGlpNumOne (t);
+-		rval = EGLPNUM_TYPENAME_ILLlib_chgbnd (lp, k, 'L', t);
++		rval = sb_chgbnd_preserve (lp, k, col_internal, 'L', t);
+ 		CHECKRVALG (rval, CLEANUP);
+ 
+-		{
+-			EGLPNUM_TYPENAME_ILLlp_basis *useB;
+-			if (!base_ready && B != 0 && snap_saved && lp->internal_valid &&
+-				lp->nrows == nr && lp->ncols == nc && lp->nnbasic == nnb &&
+-				lp->matbeg == lp->O->A.matbeg && lp->matcnt == lp->O->A.matcnt &&
+-				lp->matind == lp->O->A.matind && lp->matval == lp->O->A.matval)
+-			{
+-				int singular = 0;
+-				if (EGLPNUM_TYPENAME_ILLbasis_load (lp, B) == 0 &&
+-					EGLPNUM_TYPENAME_ILLbasis_factor (lp, &singular) == 0 && !singular)
+-				{
+-					lp->fbasisid = lp->basisid;
+-					snap_basisid = lp->basisid;
+-					memcpy (lp->sb_baz, lp->baz, (size_t) nr * sizeof (int));
+-					if (nnb > 0)
+-						memcpy (lp->sb_nbaz, lp->nbaz, (size_t) nnb * sizeof (int));
+-					memcpy (lp->sb_vindex, lp->vindex, (size_t) nc * sizeof (int));
+-					memcpy (lp->sb_vstat, lp->vstat, (size_t) nc * sizeof (int));
+-					if (B->rownorms && lpinf.dsinfo.norms)
+-					{
+-						int j;
+-						for (j = 0; j < nr; j++)
+-							EGLPNUM_TYPENAME_EGlpNumCopy (lpinf.dsinfo.norms[j], B->rownorms[j]);
+-					}
+-					snap_sol_ok = 0;
+-					base_ready = 1;
+-				}
+-			}
+-			useB = base_ready ? 0 : B;
+-			if (base_ready && snap_saved && lp->f != 0)
+-			{
+-				lp->f->pf_mode = 1;
+-				lp->f->pf_cnt = 0;
+-				lp->f->pf_freebeg = 0;
+-				lp->sb_fast_start = (snap_sol_ok && lp->vstat[col_internal] == STAT_BASIC) ? 1 : 0;
+-			}
+-			rval = EGLPNUM_TYPENAME_ILLlib_optimize (lp, useB, &lpinf, DUAL_SIMPLEX, &status, 0, itcnt);
+-			lp->sb_fast_start = 0;
+-			if (useB == 0 && snap_saved && lp->f != 0 && lp->f->pf_mode == 1)
+-			{
+-				int j;
+-				lp->f->pf_cnt = 0;
+-				lp->f->pf_freebeg = 0;
+-				lp->f->pf_mode = 0;
+-				memcpy (lp->baz, lp->sb_baz, (size_t) nr * sizeof (int));
+-				if (nnb > 0)
+-					memcpy (lp->nbaz, lp->sb_nbaz, (size_t) nnb * sizeof (int));
+-				memcpy (lp->vindex, lp->sb_vindex, (size_t) nc * sizeof (int));
+-				memcpy (lp->vstat, lp->sb_vstat, (size_t) nc * sizeof (int));
+-				lp->basisid = snap_basisid;
+-				lp->fbasisid = snap_basisid;
+-				if (snap_sol_ok)
+-				{
+-					for (j = 0; j < nr; j++)
+-					{
+-						EGLPNUM_TYPENAME_EGlpNumCopy (lp->xbz[j], lp->sb_xbz[j]);
+-						EGLPNUM_TYPENAME_EGlpNumCopy (lp->piz[j], lp->sb_piz[j]);
+-					}
+-					for (j = 0; j < nnb; j++)
+-						EGLPNUM_TYPENAME_EGlpNumCopy (lp->dz[j], lp->sb_dz[j]);
+-				}
+-				if (B->rownorms && lpinf.dsinfo.norms)
+-				{
+-					for (j = 0; j < nr; j++)
+-						EGLPNUM_TYPENAME_EGlpNumCopy (lpinf.dsinfo.norms[j], B->rownorms[j]);
+-				}
+-				base_ready = 1;
+-			}
+-			else
+-			{
+-				if (lp->f != 0)
+-				{
+-					lp->f->pf_mode = 0;
+-					lp->f->pf_cnt = 0;
+-					lp->f->pf_freebeg = 0;
+-				}
+-				base_ready = 0;
+-			}
+-		}
+-		EGLPNUM_TYPENAME_ILLlib_chgbnd (lp, k, 'L', oldbnd);
++		rval = sb_run_branch (lp, B, &lpinf, nr, nc, nnb, col_internal,
++		                      &base_ready, snap_saved, &snap_sol_ok, &snap_basisid,
++		                      &status, itcnt);
++		sb_chgbnd_preserve (lp, k, col_internal, 'L', oldbnd);
+ 		CHECKRVALG (rval, CLEANUP);
+ 
+ 		if (status == QS_LP_INFEASIBLE)
+@@ -1444,8 +1565,30 @@
+ 	}
+ 	if (base_ready && snap_saved)
+ 		lp->basisstat = snap_bstat;
++	else
++	{
++		lp->sb_snap_valid = 0;
++		lp->sb_dnorms_valid = 0;
++	}
+ 	if (factorok != 0)
+ 		*factorok = base_ready ? 1 : 0;
++	/* Transfer reusable pricing arrays back to lpinfo before freeing lpinf. */
++	if (lpinf.dsinfo.norms != 0)
++	{
++		EGLPNUM_TYPENAME_EGlpNumFreeArray (lp->sb_dnorms);
++		lp->sb_dnorms = lpinf.dsinfo.norms;
++		lpinf.dsinfo.norms = 0;
++	}
++	else
++	{
++		lp->sb_dnorms_valid = 0;
++	}
++	if (lpinf.p_scaleinf != 0)
++	{
++		EGLPNUM_TYPENAME_EGlpNumFreeArray (lp->sb_pscale);
++		lp->sb_pscale = lpinf.p_scaleinf;
++		lpinf.p_scaleinf = 0;
++	}
+ 	EGLPNUM_TYPENAME_EGlpNumClearVar (xi);
+ 	EGLPNUM_TYPENAME_EGlpNumClearVar (t);
+ 	EGLPNUM_TYPENAME_EGlpNumClearVar (oldbnd);
+@@ -3888,6 +4031,9 @@
+ 		ILL_IFFREE(lp->O->sinfo);
+ 	}
+ 
++	lp->sb_clean_lp = 0;
++	lp->sb_snap_valid = 0;
++	lp->sb_dnorms_valid = 0;
+ 	col = lp->O->structmap[indx];
+ 	EGLPNUM_TYPENAME_EGlpNumCopy (lp->O->obj[col], coef);
+ 
+@@ -4006,6 +4152,9 @@
+ 		ILL_IFFREE(lp->O->sinfo);
+ 	}
+ 
++	lp->sb_clean_lp = 0;
++	lp->sb_snap_valid = 0;
++	lp->sb_dnorms_valid = 0;
+ 	EGLPNUM_TYPENAME_EGlpNumCopy (lp->O->rhs[indx], coef);
+ 
+ CLEANUP:
